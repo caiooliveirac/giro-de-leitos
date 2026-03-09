@@ -1,0 +1,65 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: giro-de-leitos-db-local
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-giro_de_leitos}
+      POSTGRES_USER: ${POSTGRES_USER:-giro}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-giro_seguro_2026}
+    volumes:
+      - giro_db_data_local:/var/lib/postgresql/data
+
+  parser-api:
+    build: .
+    container_name: giro-de-leitos-api
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    networks:
+      - default
+      - repo_default
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://mnrs.com.br}
+      PUBLIC_WEBHOOK_PATH: ${PUBLIC_WEBHOOK_PATH:-/giro/api/webhook/telegram}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://giro:giro_seguro_2026@postgres:5432/giro_de_leitos}
+      ADMIN_USER: ${ADMIN_USER:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    ports:
+      - "8000:8000"
+
+  whatsapp-bridge:
+    build: ./whatsapp-bridge
+    container_name: giro-whatsapp-bridge
+    restart: unless-stopped
+    depends_on:
+      - parser-api
+    environment:
+      WHATSAPP_GROUP_IDS: ${WHATSAPP_GROUP_IDS:-}
+      API_BASE_URL: http://parser-api:8000
+      API_INGEST_PATH: /api/ingest/whatsapp-bridge
+      LOG_LEVEL: ${WA_LOG_LEVEL:-warn}
+      DRY_RUN: ${WA_DRY_RUN:-false}
+      LIST_GROUPS: ${WA_LIST_GROUPS:-false}
+      STALE_ALERTS_ENABLED: ${WA_STALE_ALERTS_ENABLED:-true}
+      STALE_CHECK_INTERVAL_MIN: ${WA_STALE_CHECK_INTERVAL_MIN:-120}
+      STALE_THRESHOLD_HOURS: ${WA_STALE_THRESHOLD_HOURS:-6}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ADMIN_CHAT_ID: ${TELEGRAM_ADMIN_CHAT_ID:-1438288563}
+      WHATSAPP_PHONE_NUMBER: ${WHATSAPP_PHONE_NUMBER:-557181619480}
+    volumes:
+      - wa_auth_info:/app/auth_info
+    # Para ver o QR code na primeira execução:
+    #   docker compose logs -f whatsapp-bridge
+    tty: true
+    stdin_open: true
+
+volumes:
+  giro_db_data_local:
+  wa_auth_info:
+
+networks:
+  repo_default:
+    external: true

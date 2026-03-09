@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: giro-de-leitos-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-giro_de_leitos}
+      POSTGRES_USER: ${POSTGRES_USER:-giro}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-giro_seguro_2026}
+    volumes:
+      - giro_db_data:/var/lib/postgresql/data
+
+  parser-api:
+    build: .
+    container_name: giro-de-leitos-api
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://mnrs.com.br}
+      PUBLIC_WEBHOOK_PATH: ${PUBLIC_WEBHOOK_PATH:-/giro/api/webhook/telegram}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://giro:giro_seguro_2026@postgres:5432/giro_de_leitos}
+    networks:
+      - default
+      - shared_proxy
+
+networks:
+  shared_proxy:
+    external: true
+    name: perguntas_default
+
+volumes:
+  giro_db_data:
