@@ -136,6 +136,7 @@ app.add_middleware(
 manager = ConnectionManager()
 app.state.last_dashboard_event = None
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://mnrs.com.br").rstrip("/")
 PUBLIC_WEBHOOK_PATH = os.getenv("PUBLIC_WEBHOOK_PATH", "/giro/api/webhook/telegram").strip() or "/giro/api/webhook/telegram"
@@ -165,8 +166,41 @@ def build_dashboard_event(
     unit_identified_by_text = bool(reported_name_match or raw_text_match)
     unit_identified_by_hint = bool(not unit_identified_by_text and hinted_match)
     effective_reported_at = official_at.isoformat() if official_at else parsed.get("reported_at") or ingested_at.isoformat()
+
+    # Sanity check: se o horário digitado está muito longe do horário real,
+    # substituir pelo horário de ingestão e marcar anomalia.
+    _time_anomaly: dict[str, Any] | None = None
+    if not official_at and effective_reported_at:
+        try:
+            _parsed_dt = datetime.fromisoformat(effective_reported_at.replace("Z", "+00:00"))
+            if _parsed_dt.tzinfo is None:
+                _parsed_dt = _parsed_dt.replace(tzinfo=timezone.utc)
+            _drift_seconds = (ingested_at - _parsed_dt).total_seconds()
+            _drift_hours = abs(_drift_seconds) / 3600
+            if _drift_hours > 6:
+                # Horário delirante — substituir pelo horário real
+                _time_anomaly = {
+                    "type": "absurd_time",
+                    "typed_time": effective_reported_at,
+                    "system_time": ingested_at.isoformat(),
+                    "drift_hours": round(_drift_hours, 1),
+                }
+                effective_reported_at = ingested_at.isoformat()
+            elif _drift_hours > 2:
+                # Drift moderado — manter digitado mas alertar
+                _time_anomaly = {
+                    "type": "suspect_time",
+                    "typed_time": effective_reported_at,
+                    "system_time": ingested_at.isoformat(),
+                    "drift_hours": round(_drift_hours, 1),
+                }
+        except (ValueError, TypeError):
+            pass
+
     parsed["reported_at"] = effective_reported_at
     parsed["ingested_at"] = ingested_at.isoformat()
+    if _time_anomaly:
+        parsed["_time_anomaly"] = _time_anomaly
 
     if reported_upa_name:
         parsed["reported_upa_name"] = reported_upa_name
@@ -210,10 +244,73 @@ def build_dashboard_event(
 
 async def publish_event(event: dict[str, Any]) -> dict[str, Any]:
     app.state.last_dashboard_event = event
+    save_result: dict[str, Any] | None = None
     if is_database_configured():
-        await run_in_threadpool(save_event, event)
+        save_result = await run_in_threadpool(save_event, event)
     await manager.broadcast_json(event)
+
+    # Notificar admin via Telegram sobre anomalias de horário
+    data = event.get("data", {})
+    unit_name = data.get("upa_name") or data.get("unit_code") or "?"
+    time_anomaly = data.get("_time_anomaly")
+
+    if time_anomaly and time_anomaly["type"] == "absurd_time":
+        _notify_admin_telegram(
+            f"⚠️ <b>Horário delirante substituído</b>\n"
+            f"🏥 {unit_name}\n"
+            f"✏️ Digitado: {time_anomaly['typed_time']}\n"
+            f"🕐 Usado: {time_anomaly['system_time']}\n"
+            f"📏 Drift: {time_anomaly['drift_hours']}h\n\n"
+            f"O horário digitado no giro estava {time_anomaly['drift_hours']}h "
+            f"fora do horário real. Foi publicado com o horário de recebimento."
+        )
+    elif time_anomaly and time_anomaly["type"] == "suspect_time":
+        _notify_admin_telegram(
+            f"🔶 <b>Horário suspeito mantido</b>\n"
+            f"🏥 {unit_name}\n"
+            f"✏️ Digitado: {time_anomaly['typed_time']}\n"
+            f"🕐 Sistema: {time_anomaly['system_time']}\n"
+            f"📏 Drift: {time_anomaly['drift_hours']}h\n\n"
+            f"O horário digitado está {time_anomaly['drift_hours']}h fora do real. "
+            f"Mantido como digitado — verifique se precisa corrigir no admin."
+        )
+
+    if save_result and save_result.get("time_regression"):
+        _notify_admin_telegram(
+            f"🔙 <b>Regressão temporal detectada</b>\n"
+            f"🏥 {save_result.get('unit_name', '?')}\n"
+            f"⏮️ Anterior: {save_result['previous_received_at']}\n"
+            f"⏭️ Novo: {save_result['new_received_at']}\n"
+            f"📝 Evento #{save_result.get('new_event_id', '?')} "
+            f"(substituiu #{save_result.get('previous_event_id', '?')})\n\n"
+            f"O giro mais recente tem horário anterior ao que estava publicado. "
+            f"O conteúdo foi atualizado normalmente — verifique no admin se o horário está correto."
+        )
+
     return event
+
+
+def _notify_admin_telegram(message: str) -> None:
+    """Envia alerta para o chat do admin no Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_CHAT_ID:
+        return
+    try:
+        payload = json.dumps({
+            "chat_id": TELEGRAM_ADMIN_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML",
+        }).encode("utf-8")
+        req = request.Request(
+            url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with request.urlopen(req, timeout=15) as response:
+            response.read()
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Falha ao notificar admin Telegram: %s", exc)
 
 
 def _format_room_line(label: str, room: dict[str, Any] | None) -> str:

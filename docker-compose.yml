@@ -21,6 +21,7 @@ services:
       - repo_default
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ADMIN_CHAT_ID: ${TELEGRAM_ADMIN_CHAT_ID:-1438288563}
       TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://mnrs.com.br}
       PUBLIC_WEBHOOK_PATH: ${PUBLIC_WEBHOOK_PATH:-/giro/api/webhook/telegram}

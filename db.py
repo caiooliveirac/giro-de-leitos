@@ -530,9 +530,10 @@ def _emit_transition_alerts(
         )
 
 
-def save_event(event: dict[str, Any]) -> None:
+def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Salva evento e retorna info de anomalias detectadas (ou None)."""
     if not DATABASE_URL:
-        return
+        return None
 
     data = event.get("data", {})
     rooms = data.get("rooms", {})
@@ -790,7 +791,28 @@ def save_event(event: dict[str, Any]) -> None:
                     has_psychiatrist=bool(specialists.get("has_psychiatrist")),
                     current_rooms=rooms,
                 )
+
+            # Detectar regressão temporal
+            save_result: dict[str, Any] | None = None
+            if previous_status and unit_code:
+                prev_received = previous_status.get("received_at")
+                new_received = event.get("received_at")
+                if prev_received and new_received:
+                    prev_str = str(prev_received)
+                    new_str = str(new_received)
+                    if new_str < prev_str:
+                        save_result = {
+                            "time_regression": True,
+                            "unit_code": unit_code,
+                            "unit_name": displayed_name,
+                            "previous_received_at": prev_str,
+                            "new_received_at": new_str,
+                            "previous_event_id": previous_status.get("last_event_id"),
+                            "new_event_id": event_id,
+                        }
+
         conn.commit()
+    return save_result
 
 
 def get_latest_events(limit: int = 50) -> list[dict[str, Any]]:
