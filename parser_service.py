@@ -354,6 +354,16 @@ def _extract_reported_datetime(text: str, fallback: datetime | None = None) -> d
     except ValueError:
         return fallback
 
+    # Sanity check: se a data+hora extraída do texto ficou mais de 18h no
+    # passado em relação ao momento atual, o remetente provavelmente esqueceu
+    # de trocar a data após a meia-noite.  Ajusta +1 dia se isso resolver.
+    now_local = datetime.now(LOCAL_TIMEZONE)
+    drift = (now_local - local_dt).total_seconds()
+    if drift > 18 * 3600:
+        adjusted = local_dt + timedelta(days=1)
+        if abs((now_local - adjusted).total_seconds()) < 18 * 3600:
+            local_dt = adjusted
+
     return local_dt.astimezone(timezone.utc)
 
 
