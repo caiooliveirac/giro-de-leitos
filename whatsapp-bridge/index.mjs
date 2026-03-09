@@ -520,19 +520,15 @@ async function checkAndAlertStaleUnits(sock) {
             return;
         }
         const data = await res.json();
-        const stale = data.stale_units || [];
+        let stale = data.stale_units || [];
 
         if (stale.length === 0) {
             return;
         }
 
-        // À noite, só dispara se pelo menos uma unidade ultrapassou 12h
-        if (triggerThreshold > 6) {
-            const hasOverThreshold = stale.some(
-                (u) => u.hours_ago >= triggerThreshold
-            );
-            if (!hasOverThreshold) return;
-        }
+        // Filtrar: só incluir unidades acima do threshold ativo
+        stale = stale.filter((u) => u.hours_ago >= triggerThreshold);
+        if (stale.length === 0) return;
 
         // Construir mensagem natural com @mentions
         const mentions = [];

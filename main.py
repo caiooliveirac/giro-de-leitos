@@ -1144,7 +1144,9 @@ async def telegram_webhook(
 
 @app.get("/api/stale-units", summary="UPAs com mais de N horas sem atualização")
 async def get_stale_units(hours: float = 6.0) -> dict[str, Any]:
-    """Retorna unidades que não enviaram giro nas últimas `hours` horas."""
+    """Retorna unidades que não enviaram giro nas últimas `hours` horas.
+    Usa updated_at (quando a mensagem foi recebida pelo sistema) e não received_at
+    (horário extraído do texto da mensagem) para evitar falsos positivos."""
     if not is_database_configured():
         return {"status": "disabled", "stale_units": []}
 
@@ -1154,8 +1156,9 @@ async def get_stale_units(hours: float = 6.0) -> dict[str, Any]:
 
     stale: list[dict[str, Any]] = []
     for u in units:
-        received_raw = u.get("received_at")
-        if not received_raw:
+        # Usar updated_at (momento real de recebimento) em vez de received_at (horário do texto)
+        ts_raw = u.get("updated_at") or u.get("received_at")
+        if not ts_raw:
             # Unidade nunca enviou giro — considerar como muito atrasada
             stale.append({
                 "unit_code": u.get("unit_code"),
@@ -1164,21 +1167,21 @@ async def get_stale_units(hours: float = 6.0) -> dict[str, Any]:
                 "hours_ago": 999.0,
             })
             continue
-        if isinstance(received_raw, str):
+        if isinstance(ts_raw, str):
             try:
-                received_dt = datetime.fromisoformat(received_raw.replace("Z", "+00:00"))
+                ts_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
             except ValueError:
                 continue
         else:
-            received_dt = received_raw
-        if received_dt.tzinfo is None:
-            received_dt = received_dt.replace(tzinfo=timezone.utc)
-        if received_dt < threshold:
-            hours_ago = round((now - received_dt).total_seconds() / 3600, 1)
+            ts_dt = ts_raw
+        if ts_dt.tzinfo is None:
+            ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+        if ts_dt < threshold:
+            hours_ago = round((now - ts_dt).total_seconds() / 3600, 1)
             stale.append({
                 "unit_code": u.get("unit_code"),
                 "displayed_name": u.get("displayed_name"),
-                "received_at": received_raw,
+                "received_at": ts_raw,
                 "hours_ago": hours_ago,
             })
 

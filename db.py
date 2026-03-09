@@ -1133,6 +1133,7 @@ def get_latest_status_by_unit() -> list[dict[str, Any]]:
                     displayed_name,
                     source,
                     received_at,
+                    updated_at,
                     last_event_id AS id,
                     canonical_name AS upa_name,
                     is_critical,
