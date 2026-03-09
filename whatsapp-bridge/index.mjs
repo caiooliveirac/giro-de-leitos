@@ -71,6 +71,7 @@ const DRY_RUN = process.env.DRY_RUN === "true";
 
 // ── Config de alerta de UPAs inativas ───────────────────────────────────
 const STALE_CHECK_INTERVAL_MIN = parseInt(process.env.STALE_CHECK_INTERVAL_MIN || "120", 10);
+const STALE_CHECK_INTERVAL_NIGHT_MIN = parseInt(process.env.STALE_CHECK_INTERVAL_NIGHT_MIN || "180", 10);
 const STALE_THRESHOLD_HOURS = parseFloat(process.env.STALE_THRESHOLD_HOURS || "6");
 const STALE_ALERTS_ENABLED = process.env.STALE_ALERTS_ENABLED !== "false"; // ativado por padrão
 
@@ -492,7 +493,7 @@ function looksLikeGiro(text) {
 
 // ── Alerta de UPAs inativas ─────────────────────────────────────────────
 
-let staleAlertInterval = null;
+let staleAlertTimer = null; // setTimeout encadeado (não setInterval)
 
 /**
  * Retorna o threshold dinâmico:
@@ -604,15 +605,41 @@ async function checkAndAlertStaleUnits(sock) {
     }
 }
 
+/**
+ * Retorna o intervalo de verificação atual em ms.
+ * Dia (06h-22h BRT): STALE_CHECK_INTERVAL_MIN (padrão 120min)
+ * Noite (22h-06h BRT): STALE_CHECK_INTERVAL_NIGHT_MIN (padrão 180min)
+ */
+function getCurrentIntervalMs() {
+    const now = new Date();
+    const brtHour = (now.getUTCHours() - 3 + 24) % 24;
+    const mins = (brtHour >= 22 || brtHour < 6)
+        ? STALE_CHECK_INTERVAL_NIGHT_MIN
+        : STALE_CHECK_INTERVAL_MIN;
+    return mins * 60 * 1000;
+}
+
+function scheduleNextStaleCheck(sock) {
+    const intervalMs = getCurrentIntervalMs();
+    const mins = Math.round(intervalMs / 60000);
+    console.log(`⏰ Próxima verificação de inatividade em ${mins}min`);
+    staleAlertTimer = setTimeout(async () => {
+        await checkAndAlertStaleUnits(sock);
+        scheduleNextStaleCheck(sock);
+    }, intervalMs);
+}
+
 function startStaleAlertTimer(sock) {
-    if (staleAlertInterval) clearInterval(staleAlertInterval);
-    const intervalMs = STALE_CHECK_INTERVAL_MIN * 60 * 1000;
-    staleAlertInterval = setInterval(
-        () => checkAndAlertStaleUnits(sock),
-        intervalMs
-    );
+    // Cancelar qualquer timer anterior (reconexão)
+    if (staleAlertTimer) {
+        clearTimeout(staleAlertTimer);
+        staleAlertTimer = null;
+    }
     // Primeira verificação após 2 minutos (dar tempo do sistema estabilizar)
-    setTimeout(() => checkAndAlertStaleUnits(sock), 2 * 60 * 1000);
+    staleAlertTimer = setTimeout(async () => {
+        await checkAndAlertStaleUnits(sock);
+        scheduleNextStaleCheck(sock);
+    }, 2 * 60 * 1000);
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -716,7 +743,7 @@ async function startBridge() {
             // ── Iniciar alerta periódico de UPAs inativas ────────────────
             if (STALE_ALERTS_ENABLED && WHATSAPP_GROUP_IDS.length > 0) {
                 console.log(
-                    `⏰ Alerta de UPAs inativas: a cada ${STALE_CHECK_INTERVAL_MIN}min, threshold ${STALE_THRESHOLD_HOURS}h`
+                    `⏰ Alerta de UPAs inativas: dia=${STALE_CHECK_INTERVAL_MIN}min / noite=${STALE_CHECK_INTERVAL_NIGHT_MIN}min, threshold ${STALE_THRESHOLD_HOURS}h`
                 );
                 startStaleAlertTimer(sock);
             }
@@ -932,7 +959,7 @@ async function startBridgeWithPairingCode() {
             await resolvePhoneJids(sock);
             if (STALE_ALERTS_ENABLED && WHATSAPP_GROUP_IDS.length > 0) {
                 console.log(
-                    `⏰ Alerta de UPAs inativas: a cada ${STALE_CHECK_INTERVAL_MIN}min, threshold ${STALE_THRESHOLD_HOURS}h`
+                    `⏰ Alerta de UPAs inativas: dia=${STALE_CHECK_INTERVAL_MIN}min / noite=${STALE_CHECK_INTERVAL_NIGHT_MIN}min, threshold ${STALE_THRESHOLD_HOURS}h`
                 );
                 startStaleAlertTimer(sock);
             }
