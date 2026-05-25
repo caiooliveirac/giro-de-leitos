@@ -390,6 +390,338 @@ Não é causa raiz do incidente do Giro, mas: o ingest está restartando há 17h
 
 ---
 
+---
+
+## Seção F — Decisão arquitetural pendente
+
+> **Status do trabalho**: Fase 1 do plano de execução (fix do bridge) foi
+> aplicada e commitada (`deeda13`) — o crash loop está **interrompido em
+> código**, mas o container **ainda não foi reiniciado**, por escolha
+> deliberada. Decisão A vs B deve ser tomada **antes** do restart, porque
+> ela define se vamos usar o mesmo número (e arriscar o ping-pong de novo)
+> ou se vamos migrar para arquitetura definitiva.
+
+### F.1 Comparação Opção A vs. Opção B
+
+Escala assumida: **3 = alto, 2 = médio, 1 = baixo** (preencher por critério).
+
+| Critério | A: Números distintos | B: Gateway Baileys único |
+|---|---|---|
+| Esforço de implementação (h-engenheiro) | **3-5h** — env var nova, re-pareamento com número novo, atualização do envio de mensagens (Giro responde no grupo) | **20-30h** — novo serviço Node, API HTTP/Redis, refactor de Giro e Transportes para consumir |
+| Custo recorrente (R$/mês) | **R$ 15-40** (chip pré-pago ou linha M2M) | **R$ 0** (mesma infra) |
+| Tempo de bootstrap em produção | ~30 min (re-pareamento + smoke test) | 2-4h (subir gateway + migrar 2 apps em janela de manutenção coordenada) |
+| Risco de regressão imediata | **BAIXO** (cada app vira mais isolada) | **MÉDIO** (refactor cruzado, edge cases de delivery) |
+| Escalabilidade para novas apps SAMU | **Cada app nova → mais 1 número** | **App nova só consome a API do gateway, número único** |
+| Impacto operacional (chefes de plantão precisam re-cadastrar contato em grupos?) | **SIM, num grupo** — o grupo de regulação de leitos precisaria adicionar o novo número e remover/manter o antigo dependendo do uso. Chefe de Plantão fica fora desse grupo se quiser. | **NÃO** — usuário final continua vendo "Chefe de Plantão" mandando mensagens |
+| Complexidade de manutenção | **BAIXO** (status quo, só 1 chip a mais) | **MÉDIO-ALTO** (gateway é serviço novo a operar, monitorar, deployar, ter runbook) |
+| Risco de ban WhatsApp | **MÉDIO** — dois números headless, mas cada um tem fingerprint próprio e tráfego mais baixo individualmente | **BAIXO** — único número, tráfego centralizado e monitorável, pode usar mensagens menos automatizadas |
+| Single point of failure | **NÃO** — falha de uma app não afeta a outra | **SIM** — gateway down → ambas apps perdem WA. Mitigável com HA, mas isso é mais trabalho. |
+| Visibilidade pro Chefe de Plantão | **CONFUSO** — ele vê dois números "Giro-Leitos" e "Transportes" pareados no celular dele e pode deslogar o errado | **TRANSPARENTE** — vê só uma sessão (do gateway) e a aplica para tudo |
+| Quantidade de re-pareamentos no futuro | **Provavelmente menos** — re-parear uma app não derruba a outra | **Único ponto de re-pareamento** — quando precisar, é só lá |
+| Pré-requisito para mensagens **enviadas** (não só recebidas) | nenhum extra | exige API stateful pra escolher "qual app está respondendo" e qual contexto de conversa |
+
+#### Esforço estimado em horas (mais detalhe)
+
+**Opção A:**
+- Adquirir chip/linha + ativar WhatsApp: 30 min – 2h (depende de fornecedor)
+- Re-parear Giro com número novo (runbook abaixo): 30 min em janela noturna
+- Atualizar `WHATSAPP_PHONE_NUMBER` no `.env` do Giro: 5 min
+- Smoke test (mensagem teste → ingestão → DB → dashboard): 30 min
+- Documentação: 1h
+- **Total: ~3-5h em uma janela 23h-01h BRT.**
+
+**Opção B:**
+- Design do gateway (decidir HTTP vs Redis pub/sub, schema de mensagens, autenticação interna): 4-6h
+- Implementação do gateway Baileys + endpoints `/messages`, `/health`, `/send`: 8-12h
+- Adaptar Giro (`whatsapp-bridge` vira consumer Redis em vez de socket Baileys): 4-6h
+- Adaptar Transportes-ingest (idem): 4-6h
+- Testes E2E + deploy coordenado em janela: 4-6h
+- Documentação + runbook: 2h
+- **Total: ~25-40h em ~1-2 semanas, com 1 janela de deploy.**
+
+#### Minha recomendação técnica
+
+**Para a situação atual (1 incidente, 2 apps, prazo de horas), Opção A.** Faz
+o problema sumir em uma janela noturna, custo trivial, e desbloqueia o Giro
+sem dependência de novo serviço.
+
+**Para o roadmap de médio prazo (mais apps SAMU vindo: Taxímetro talvez
+precisa, painel de vagas pode usar), considerar implementar B em paralelo
+nas próximas 2-4 semanas** — mas como projeto separado, não como bloqueador
+do incidente atual.
+
+O caminho mais conservador: A agora (resolve hoje), B no próximo trimestre
+(arquitetura definitiva).
+
+---
+
+### F.2 Esboço técnico da Opção B (gateway único)
+
+Se a decisão for B (agora ou depois), arquitetura mínima:
+
+```
+                           ┌───────────────────────────────┐
+                           │  wa-gateway (PM2 process)     │
+                           │                                │
+   WhatsApp Multi-Device ←─┤  - Baileys single socket       │
+   (1 device-id, 1 número) │  - Persistência: PG nativo     │
+                           │    (db: wa_gateway, table:     │
+                           │     msg_inbound / msg_outbound)│
+                           │  - API HTTP: localhost:3050    │
+                           │  - Redis pub/sub interno       │
+                           └──────────┬────────────┬────────┘
+                                      │            │
+                            ┌─────────┘            └─────────┐
+                            │                                │
+                  wa:msg:in    POST /send             wa:msg:in    POST /send
+                            │                                │
+                 ┌──────────▼──────────┐         ┌──────────▼──────────┐
+                 │  Giro de Leitos     │         │ Transportes-ingest  │
+                 │  (parser-api +      │         │ (worker PM2)        │
+                 │   sem bridge Node)  │         │                     │
+                 └─────────────────────┘         └─────────────────────┘
+```
+
+**Endpoints**:
+- `GET /health` → `{status:"open"|"closed"|"connecting", device:7, uptime:1234}`
+- `POST /send` `{to:"557181082189-1462561641@g.us", text:"...", app:"giro"}` → 202
+- `GET /pair` (admin-only via token) → retorna pairing code ou QR base64
+- `POST /restart` (admin-only) → reinicia sessão Baileys
+
+**Eventos** (Redis pub/sub):
+- Canal `wa:msg:in` → publica `{messageId, from, jid, text, ts, raw}` para todos
+  os subscribers (Giro filtra grupo dele, Transportes filtra grupo dele)
+- Canal `wa:msg:status` → `{messageId, status:"sent"|"delivered"|"read"}` quando
+  uma `/send` é confirmada
+
+**Tabelas PG (db `wa_gateway`)**:
+```sql
+CREATE TABLE msg_inbound (
+  id BIGSERIAL PRIMARY KEY,
+  wa_message_id TEXT UNIQUE NOT NULL,
+  remote_jid TEXT NOT NULL,
+  sender_jid TEXT,
+  text TEXT,
+  raw JSONB,
+  received_at TIMESTAMPTZ DEFAULT NOW(),
+  forwarded_to TEXT[] DEFAULT '{}'  -- ["giro", "transportes"]
+);
+
+CREATE TABLE msg_outbound (
+  id BIGSERIAL PRIMARY KEY,
+  app TEXT NOT NULL,        -- "giro" | "transportes"
+  to_jid TEXT NOT NULL,
+  text TEXT NOT NULL,
+  status TEXT NOT NULL,     -- "queued" | "sent" | "failed"
+  wa_message_id TEXT,
+  requested_at TIMESTAMPTZ DEFAULT NOW(),
+  sent_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_msg_inbound_received_at ON msg_inbound (received_at DESC);
+```
+
+**Localização**:
+- Diretório: `/home/ubuntu/wa-gateway/`
+- PM2: `wa-gateway` (porta 3050 só em 127.0.0.1)
+- Banco: `wa_gateway` no PG nativo, role `wa_gateway`
+- Volume auth: `/var/lib/wa-gateway-auth/` (host filesystem, não Docker — evita o problema do EBUSY)
+- Nginx: **NÃO expor publicamente**. Acesso só de 127.0.0.1.
+
+**Migração das apps existentes**:
+- Giro: remover o serviço `whatsapp-bridge` do `docker-compose.yml`; o
+  `parser-api` (FastAPI) vira subscriber Redis no canal `wa:msg:in` e usa
+  `POST /send` quando precisa responder.
+- Transportes-ingest: substituir `apps/ingest/src/whatsapp/*` por adapter
+  que consome do mesmo Redis.
+
+**Riscos específicos**:
+- Single sock Baileys = 1 ponto único de queda. Mitigar com supervisão PM2
+  agressiva + circuit breaker + alertas heartbeat.
+- Se gateway cair, **as duas apps ficam offline** ao mesmo tempo. Mais grave
+  que ter cada uma com sua sessão. Compensação: gateway é simples (~500
+  linhas), poucos pontos de falha.
+
+---
+
+### F.3 Runbook de re-pareamento controlado
+
+Pré-requisitos antes de executar:
+
+- [ ] **Decisão A ou B já tomada** e seu plano correspondente implementado.
+- [ ] **Janela 23h-01h BRT** (preferencial — menos urgências SAMU).
+- [ ] **Avisar Chefe de Plantão noturno** que vai re-parear — pedir para
+      ele não tocar no app de WhatsApp durante os ~5 minutos do
+      procedimento.
+- [ ] **Backup do volume de auth do Giro**:
+      ```bash
+      docker run --rm -v giro-de-leitos_wa_auth_info:/v -v /tmp:/backup \
+        alpine sh -c "cd /v && tar czf /backup/wa-backup-$(date +%F-%H%M).tgz ."
+      ls -lh /tmp/wa-backup-*.tgz
+      ```
+- [ ] **Backup do auth do Transportes**:
+      ```bash
+      tar czf /tmp/transportes-wa-backup-$(date +%F-%H%M).tgz \
+        -C /home/ubuntu/transportes-samu/apps/ingest auth/
+      ```
+- [ ] Telegram admin chat acessível (alertas vão aparecer).
+- [ ] Acesso SSH/`code .` ao servidor confirmado.
+
+#### Procedimento — Opção A (números distintos)
+
+Assumindo que o chip novo já foi adquirido e ativado (número `XXXXXXXXXX`):
+
+1. **Atualizar env do Giro** (sem reiniciar):
+   ```bash
+   # Editar /home/ubuntu/giro-de-leitos/.env
+   # Trocar:  WHATSAPP_PHONE_NUMBER=5571997150415
+   # Por:     WHATSAPP_PHONE_NUMBER=<NUMERO_NOVO>
+   ```
+
+2. **Limpar auth antigo do Giro** (com o fix da Fase 1.1, o próprio handler
+   loggedOut faria isso, mas vamos fazer explicitamente):
+   ```bash
+   docker compose -f /home/ubuntu/giro-de-leitos/docker-compose.yml stop whatsapp-bridge
+   # Não use 'docker volume rm' — perde o estado do circuit breaker.
+   # Em vez disso, entre no volume e apague só o conteúdo:
+   docker run --rm -v giro-de-leitos_wa_auth_info:/v alpine \
+     sh -c "find /v -mindepth 1 -not -path '/v/.bridge-state*' -delete"
+   ```
+
+3. **Subir o bridge** — vai iniciar pairing code automaticamente (porque
+   `state.creds.registered` será `false`):
+   ```bash
+   docker compose -f /home/ubuntu/giro-de-leitos/docker-compose.yml up -d --build whatsapp-bridge
+   docker compose -f /home/ubuntu/giro-de-leitos/docker-compose.yml logs -f whatsapp-bridge
+   ```
+   Aguardar mensagem no Telegram:
+   `🔑 Código de pareamento WhatsApp: XXXX-XXXX`
+
+4. **No celular do novo número**: WhatsApp → Configurações → Aparelhos
+   conectados → Conectar dispositivo → "Conectar com número de telefone"
+   → digitar o código.
+
+5. **Confirmar conexão** no log:
+   `✅ Reconectado via pairing code!`
+
+6. **Verificação operacional**:
+   ```bash
+   # Mandar mensagem teste no grupo alvo (a partir do celular do Chefe de
+   # Plantão, no número antigo — o NOVO só observa).
+   # Conferir nos logs:
+   docker compose -f /home/ubuntu/giro-de-leitos/docker-compose.yml \
+     logs whatsapp-bridge | grep "messages.upsert" | tail
+   # Confirmar via API:
+   curl -s http://localhost:8000/api/summary | jq '.last_event_at'
+   ```
+
+7. **Smoke completo**: simular um giro em algum UPA conhecido e ver se ele
+   aparece no dashboard.
+
+#### Critério de rollback
+
+Se em até 15 min após restart:
+- Não chegar pairing code no Telegram, OU
+- Pairing code falhar (erro `link too many times` etc), OU
+- Após pareamento, mensagens do grupo não estão aparecendo no log
+
+→ **Rollback**:
+```bash
+docker compose -f /home/ubuntu/giro-de-leitos/docker-compose.yml stop whatsapp-bridge
+docker run --rm -v giro-de-leitos_wa_auth_info:/v -v /tmp:/backup \
+  alpine sh -c "cd /v && find . -mindepth 1 -not -path './.bridge-state*' -delete && tar xzf /backup/wa-backup-YYYY-MM-DD-HHMM.tgz"
+# Reverter WHATSAPP_PHONE_NUMBER no .env
+docker compose -f /home/ubuntu/giro-de-leitos/docker-compose.yml up -d whatsapp-bridge
+```
+
+E abrir incidente no Telegram admin chat — investigar com calma no dia
+seguinte, fora de plantão.
+
+#### Para Opção B (gateway único)
+
+O runbook é diferente — re-pareia só o gateway, não cada app. Será
+escrito quando/se a Opção B for escolhida.
+
+---
+
+### F.4 Riscos de ban WhatsApp
+
+**Estado atual do número 557197150415 (do levantamento)**:
+
+- Foi pareado pelo menos **2 vezes** nas últimas 30 dias (devices `:3` e
+  `:7` ativos; provavelmente outros antes — não temos histórico no Baileys
+  client local).
+- Re-pareamento de ontem foi feito por **deploy automatizado** (Phase 6
+  deployer), o que para o servidor WhatsApp é indistinguível de uma ação
+  humana **mas** em horário de pico, sem aviso prévio à conta.
+- Desde 17h ontem (BRT): ~1080 reconexões falhando (~3/min em algumas
+  janelas) — o servidor WhatsApp **registra** esse padrão.
+
+**Práticas que aumentam risco**:
+- Reconexão em loop com a mesma sessão sem cool-down (foi o que aconteceu)
+- Múltiplos devices headless no mesmo número
+- Mensagens automatizadas em padrão fixo (ex: alerta de UPA inativo em
+  horário cravado, sempre com mesmo template)
+- Broadcast lists com >5 destinatários
+- Pareamento por pairing code (vs QR) é considerado por alguns
+  observadores como sinal de "automação" — embora não confirmado pela Meta
+
+**Práticas que reduzem risco** (já adotadas no código atual):
+- `keepAliveIntervalMs: randInt(25_000, 55_000)` — bom
+- `markOnlineOnConnect: false` — bom
+- `simulateTyping()` antes de enviar mensagem — bom
+- Alertas em horários BRT semi-fixos com pequena variação — bom
+
+**Recomendação de uso conservador até estabilização**:
+
+1. **Não re-parear nada por 24-48h** após o fix C.1 ser aplicado e o
+   container reiniciado, mesmo que o circuit breaker permita. Deixar o
+   servidor WhatsApp "esquecer" o padrão de loop.
+2. Quando for re-parear (Fase 3), fazer em **horário noturno** e
+   **um número de cada vez** com pelo menos 30 min de intervalo.
+3. **Limitar o volume de mensagens enviadas** das duas apps para o grupo
+   nas próximas 2 semanas: não mais que 30 mensagens/dia de cada app.
+4. **Backup periódico** do auth_info (cron diário): tendo o backup,
+   re-pareamento se torna raríssimo.
+
+**Se o número for banido**:
+- WhatsApp não dá recurso fácil. Caminho realista: trocar o número.
+- Backup do conteúdo (mensagens) é local nos creds + DB — não é perdido.
+- Grupos precisam re-adicionar o novo número.
+- Por isso a Opção A já te dá um "número de reserva" embutido — se o atual
+  cair, a outra app continua. Argumento adicional a favor de A.
+
+---
+
+### F.5 TODOs separados (não bloqueiam decisão)
+
+Itens descobertos durante o levantamento que não são causa raiz, mas
+deveriam ser endereçados em algum momento:
+
+- **Heartbeat ativo** (Seção C.8): contrato com o vigilante não está claro.
+  `samu-bot` em `/var/www/samu-ai/` polleia HTTP de outra app
+  (`mnrs.com.br/tabela/api/cases`), não recebe heartbeats. Opções:
+  - Adicionar endpoint `/health/whatsapp` no parser-api do Giro e no `transportes-web` (estes já sondados via nginx); cron `smoke_public_stack.sh` consome e alerta.
+  - Subir um watchdog separado (Node ou Python simples) com webhook Telegram.
+  - **Bloqueador**: precisa decidir contrato (heartbeat push vs pull).
+- **Transportes-ingest** acabou se estabilizando sozinho — os 4 restarts
+  foram durante o deploy de ontem. Os erros `DATABASE_URL is required` no
+  `error.log` são históricos. Não restartar agora (risco de `identity changed`
+  de novo no servidor WA).
+- **Versão do Baileys** está em `^6.7.16` em ambos apps; pinar exato
+  (`6.7.16`) após validar a próxima atualização manualmente.
+- **Arquivos órfãos no repo do Giro**: existem `ed_events` e `ql -U giro
+  -h localhost -d giro_de_leitos -t -c \d parsed_events` no working tree
+  do Giro — parecem ser output acidental de comandos psql. Revisar e
+  apagar separadamente (não tocados neste trabalho).
+- **Trabalho em andamento não commitado no Giro**: `db.py`, `docker-compose.yml`,
+  `main.py`, `parser_service.py`, `tests/test_parser_regressions.py`,
+  `units.py` estão modificados localmente desde antes deste trabalho —
+  não foram tocados aqui, mas merecem atenção (provavelmente do esforço
+  anterior de "detecção de anomalias de horário", commit `c631117`).
+
+---
+
 ## Apêndice — Comandos de verificação read-only usados
 
 ```bash
