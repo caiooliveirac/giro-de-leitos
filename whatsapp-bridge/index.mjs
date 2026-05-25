@@ -26,6 +26,7 @@ import {
 import pino from "pino";
 import qrcode from "qrcode-terminal";
 import fs from "fs";
+import path from "node:path";
 
 // ── Humanização (anti-detecção) ─────────────────────────────────────────
 
@@ -70,10 +71,14 @@ const LIST_GROUPS = process.env.LIST_GROUPS === "true";
 const DRY_RUN = process.env.DRY_RUN === "true";
 
 // ── Config de alerta de UPAs inativas ───────────────────────────────────
-const STALE_CHECK_INTERVAL_MIN = parseInt(process.env.STALE_CHECK_INTERVAL_MIN || "120", 10);
-const STALE_CHECK_INTERVAL_NIGHT_MIN = parseInt(process.env.STALE_CHECK_INTERVAL_NIGHT_MIN || "180", 10);
-const STALE_THRESHOLD_HOURS = parseFloat(process.env.STALE_THRESHOLD_HOURS || "6");
 const STALE_ALERTS_ENABLED = process.env.STALE_ALERTS_ENABLED !== "false"; // ativado por padrão
+// Horários fixos (BRT, UTC-3) em que os alertas de inatividade são disparados.
+// Formato: [hora, minuto]. Fora desses horários, nenhum alerta é enviado.
+// adicionado [10, 42] e [11, 0] temporariamente para teste de alerta imediato
+const STALE_SCHEDULE_BRT = [
+    [10, 42], [11, 0], [7, 0], [8, 0], [10, 0], [12, 0], [14, 0], [16, 0], [18, 0], [20, 30], [23, 0],
+];
+const STALE_THRESHOLD_HOURS = 6;
 
 // ── Config de notificação Telegram (queda de conexão) ───────────────────
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
@@ -82,6 +87,10 @@ const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID || "";
 const logger = pino({ level: LOG_LEVEL });
 
 // ── Notificação Telegram ────────────────────────────────────────────────
+/**
+ * Envia alerta HTML para o chat do admin no Telegram.
+ * Silencia erros para não interromper o fluxo principal.
+ */
 async function notifyTelegram(message) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_ADMIN_CHAT_ID) return;
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -102,10 +111,16 @@ async function notifyTelegram(message) {
 }
 
 // ── Formatar mensagem Telegram com dados brutos + digeridos ─────────────
+/** Formata ratio de uma sala para Telegram (ex: "03/04" ou "—" se null). */
 function fmtRoom(room) {
     return room ? room.ratio : "—";
 }
 
+/**
+ * Monta mensagem HTML detalhada para o Telegram com dados do giro.
+ * Inclui dados digeridos (salas, especialistas, corredor) + texto bruto (blockquote).
+ * Respeita o limite de 4096 chars do Telegram.
+ */
 function buildGiroTelegramMsg(emoji, upaLabel, statusText, rawText, apiResult) {
     const d = apiResult?.event?.data;
     const rooms = d?.rooms || {};
@@ -346,6 +361,7 @@ const MAX_FORWARDED_IDS = 5000;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/** Remove IDs antigos do cache de deduplicação para não crescer infinitamente. */
 function trimForwardedIds() {
     if (forwardedIds.size > MAX_FORWARDED_IDS) {
         const arr = [...forwardedIds];
@@ -354,6 +370,10 @@ function trimForwardedIds() {
     }
 }
 
+/**
+ * Encaminha texto do giro para a API FastAPI via POST.
+ * Retorna o JSON da resposta ou null em caso de erro.
+ */
 async function forwardToApi(text, source, unitHint = null, senderPhone = null) {
     const url = `${API_BASE_URL}${API_INGEST_PATH}`;
     const payload = {
@@ -406,6 +426,7 @@ async function forwardToApi(text, source, unitHint = null, senderPhone = null) {
     }
 }
 
+/** Verifica se o JID é de um grupo alvo configurado em WHATSAPP_GROUP_IDS. */
 function isTargetGroup(jid) {
     if (!jid?.endsWith("@g.us")) return false;
     if (WHATSAPP_GROUP_IDS.length === 0) return true; // aceita todos
@@ -493,27 +514,16 @@ function looksLikeGiro(text) {
 
 // ── Alerta de UPAs inativas ─────────────────────────────────────────────
 
-let staleAlertTimer = null; // setTimeout encadeado (não setInterval)
+let staleAlertTimer = null; // setTimeout para o próximo horário agendado
+let staleAlertEpoch = 0;    // incrementado a cada reconexão para invalidar callbacks órfãos
 
 /**
- * Retorna o threshold dinâmico:
- *  - Entre 22h e 06h (horário de Salvador): 12h
- *  - Fora desse horário: STALE_THRESHOLD_HOURS (padrão 6h)
+ * Consulta a API /stale-units e envia alerta no grupo WhatsApp
+ * para unidades que não atualizaram o giro além do threshold.
+ * Inclui @mentions dos responsáveis de cada unidade.
  */
-function getCurrentThreshold() {
-    const now = new Date();
-    // Salvador = UTC-3
-    const brtHour = (now.getUTCHours() - 3 + 24) % 24;
-    if (brtHour >= 22 || brtHour < 6) {
-        return 12;
-    }
-    return STALE_THRESHOLD_HOURS;
-}
-
 async function checkAndAlertStaleUnits(sock) {
-    const triggerThreshold = getCurrentThreshold(); // 12h à noite, 6h de dia
-    // Sempre buscar todas as unidades com mais de 6h (mínimo)
-    const url = `${API_BASE_URL}/api/stale-units?hours=6`;
+    const url = `${API_BASE_URL}/api/stale-units?hours=${STALE_THRESHOLD_HOURS}`;
     try {
         const res = await fetch(url);
         if (!res.ok) {
@@ -527,8 +537,8 @@ async function checkAndAlertStaleUnits(sock) {
             return;
         }
 
-        // Filtrar: só incluir unidades acima do threshold ativo
-        stale = stale.filter((u) => u.hours_ago >= triggerThreshold);
+        // Filtrar: só incluir unidades acima do threshold (6h)
+        stale = stale.filter((u) => u.hours_ago >= STALE_THRESHOLD_HOURS);
         if (stale.length === 0) return;
 
         // Construir mensagem natural com @mentions
@@ -586,7 +596,7 @@ async function checkAndAlertStaleUnits(sock) {
                 await simulateTyping(sock, groupJid);
                 await sock.sendMessage(groupJid, msgPayload);
                 console.log(
-                    `🔔 Alerta enviado para ${groupJid} (${stale.length} unidade(s), ${mentions.length} mention(s), threshold=${triggerThreshold}h)`
+                    `🔔 Alerta enviado para ${groupJid} (${stale.length} unidade(s), ${mentions.length} mention(s), threshold=${STALE_THRESHOLD_HOURS}h)`
                 );
             } catch (err) {
                 console.error(
@@ -606,44 +616,154 @@ async function checkAndAlertStaleUnits(sock) {
 }
 
 /**
- * Retorna o intervalo de verificação atual em ms.
- * Dia (06h-22h BRT): STALE_CHECK_INTERVAL_MIN (padrão 120min)
- * Noite (22h-06h BRT): STALE_CHECK_INTERVAL_NIGHT_MIN (padrão 180min)
+ * Calcula quantos ms faltam até o próximo horário agendado em STALE_SCHEDULE_BRT.
+ * Retorna { ms, label } onde label é o horário formatado (ex: "08:00").
  */
-function getCurrentIntervalMs() {
-    const now = new Date();
-    const brtHour = (now.getUTCHours() - 3 + 24) % 24;
-    const mins = (brtHour >= 22 || brtHour < 6)
-        ? STALE_CHECK_INTERVAL_NIGHT_MIN
-        : STALE_CHECK_INTERVAL_MIN;
-    return mins * 60 * 1000;
+function msUntilNextScheduledAlert() {
+    const now = Date.now();
+    // BRT = UTC-3 → deslocar em ms
+    const BRT_OFFSET_MS = 3 * 60 * 60 * 1000;
+    const nowBrt = new Date(now - BRT_OFFSET_MS);
+    const nowBrtMin = nowBrt.getUTCHours() * 60 + nowBrt.getUTCMinutes();
+
+    // Schedule em minutos desde meia-noite BRT, ordenado
+    const slots = STALE_SCHEDULE_BRT.map(([h, m]) => h * 60 + m).sort((a, b) => a - b);
+
+    // Encontrar o próximo slot (estritamente após agora)
+    let nextSlotMin = slots.find((s) => s > nowBrtMin);
+    let daysAhead = 0;
+    if (nextSlotMin === undefined) {
+        nextSlotMin = slots[0];
+        daysAhead = 1;
+    }
+
+    // Construir target: meia-noite BRT de hoje + nextSlotMin + daysAhead
+    const midnightBrt = new Date(nowBrt);
+    midnightBrt.setUTCHours(0, 0, 0, 0);
+    // midnightBrt está em "tempo BRT falso" (UTC-shifted), converter de volta para UTC real
+    const targetMs = midnightBrt.getTime() + BRT_OFFSET_MS + nextSlotMin * 60000 + daysAhead * 86400000;
+
+    let ms = targetMs - now;
+    if (ms < 1000) {
+        ms += 86400000; // safety: avançar 1 dia
+    }
+
+    const label = `${String(Math.floor(nextSlotMin / 60)).padStart(2, "0")}:${String(nextSlotMin % 60).padStart(2, "0")}`;
+    return { ms, label };
 }
 
-function scheduleNextStaleCheck(sock) {
-    const intervalMs = getCurrentIntervalMs();
-    const mins = Math.round(intervalMs / 60000);
-    console.log(`⏰ Próxima verificação de inatividade em ${mins}min`);
+/** Agenda o próximo alerta de inatividade no horário fixo mais próximo. */
+function scheduleNextStaleCheck(sock, epoch) {
+    const { ms, label } = msUntilNextScheduledAlert();
+    const mins = Math.round(ms / 60000);
+    console.log(`⏰ Próximo alerta de inatividade às ${label} BRT (em ~${mins}min)`);
     staleAlertTimer = setTimeout(async () => {
+        if (epoch !== staleAlertEpoch) return; // callback órfão de reconexão anterior
         await checkAndAlertStaleUnits(sock);
-        scheduleNextStaleCheck(sock);
-    }, intervalMs);
+        if (epoch !== staleAlertEpoch) return; // reconectou durante execução do alerta
+        scheduleNextStaleCheck(sock, epoch);
+    }, ms);
 }
 
+/** Inicia o agendamento de alertas, cancelando qualquer timer anterior. */
 function startStaleAlertTimer(sock) {
-    // Cancelar qualquer timer anterior (reconexão)
+    staleAlertEpoch++; // invalida qualquer callback pendente da época anterior
     if (staleAlertTimer) {
         clearTimeout(staleAlertTimer);
         staleAlertTimer = null;
     }
-    // Primeira verificação após 2 minutos (dar tempo do sistema estabilizar)
-    staleAlertTimer = setTimeout(async () => {
-        await checkAndAlertStaleUnits(sock);
-        scheduleNextStaleCheck(sock);
-    }, 2 * 60 * 1000);
+    scheduleNextStaleCheck(sock, staleAlertEpoch);
+}
+
+// ── Limpeza segura do auth_info ─────────────────────────────────────────
+// AUTH_DIR é mountpoint de Docker volume (giro-de-leitos_wa_auth_info).
+// Um rmSync no diretório raiz dá EBUSY no kernel. Apagamos só o conteúdo,
+// preservando a subpasta de estado do bridge (circuit breaker).
+const BRIDGE_STATE_DIR_NAME = ".bridge-state";
+
+function bridgeStatePath(filename) {
+    return path.join(AUTH_DIR, BRIDGE_STATE_DIR_NAME, filename);
+}
+
+function ensureBridgeStateDir() {
+    const dir = path.join(AUTH_DIR, BRIDGE_STATE_DIR_NAME);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+async function clearAuthDirContents(dir) {
+    const entries = await fs.promises.readdir(dir);
+    const errors = [];
+    await Promise.all(
+        entries.map(async (name) => {
+            if (name === BRIDGE_STATE_DIR_NAME) return;
+            try {
+                await fs.promises.rm(path.join(dir, name), {
+                    recursive: true,
+                    force: true,
+                    maxRetries: 3,
+                    retryDelay: 100,
+                });
+            } catch (err) {
+                errors.push({ name, msg: err.message });
+            }
+        })
+    );
+    if (errors.length > 0) {
+        throw new Error(
+            `clearAuthDirContents: ${errors.length} entradas não removidas: ${JSON.stringify(errors)}`
+        );
+    }
+}
+
+// ── Circuit breaker para re-pareamento automático ───────────────────────
+// Em loggedOut por conflito de device (Giro/Transportes no mesmo número),
+// re-parear automaticamente derruba a outra app e gera ping-pong.
+// Limites: máx 1 re-pareamento a cada 30 min, máx 3 por janela de 24h.
+// Acima disso, só alerta e exige intervenção humana.
+const REPAIR_COOLDOWN_MS = 30 * 60 * 1000;
+const REPAIR_DAILY_WINDOW_MS = 24 * 60 * 60 * 1000;
+const REPAIR_DAILY_LIMIT = 3;
+
+function readRepairState() {
+    try {
+        return JSON.parse(fs.readFileSync(bridgeStatePath("repair.json"), "utf8"));
+    } catch {
+        return { attempts: [] };
+    }
+}
+
+function writeRepairState(state) {
+    ensureBridgeStateDir();
+    fs.writeFileSync(bridgeStatePath("repair.json"), JSON.stringify(state, null, 2));
+}
+
+function canAutoRepair() {
+    const state = readRepairState();
+    const now = Date.now();
+    state.attempts = state.attempts.filter((t) => now - t < REPAIR_DAILY_WINDOW_MS);
+    if (state.attempts.some((t) => now - t < REPAIR_COOLDOWN_MS)) {
+        return { allowed: false, reason: "cooldown_30min", state };
+    }
+    if (state.attempts.length >= REPAIR_DAILY_LIMIT) {
+        return { allowed: false, reason: "daily_limit_3", state };
+    }
+    return { allowed: true, state };
+}
+
+function recordRepairAttempt() {
+    const state = readRepairState();
+    const now = Date.now();
+    state.attempts = state.attempts.filter((t) => now - t < REPAIR_DAILY_WINDOW_MS);
+    state.attempts.push(now);
+    writeRepairState(state);
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
+/**
+ * Função principal: conecta ao WhatsApp via Baileys, gerencia QR code/pairing,
+ * registra handlers de mensagem e inicia o timer de alertas.
+ */
 async function startBridge() {
     if (!fs.existsSync(AUTH_DIR)) {
         fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -684,7 +804,8 @@ async function startBridge() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log("\n📱 Escaneie o QR code abaixo com seu WhatsApp:\n");
+            console.log("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n");
+            console.log("📱 Escaneie o QR code abaixo com seu WhatsApp:\n");
             qrcode.generate(qr, { small: true });
             console.log(
                 "\n   (Abra WhatsApp → Configurações → Dispositivos conectados → Conectar)\n"
@@ -693,6 +814,7 @@ async function startBridge() {
 
         if (connection === "open") {
             console.log("✅ Conectado ao WhatsApp com sucesso!\n");
+            globalThis.__reconnectAttempts = 0;
 
             // Cancelar notificação de queda pendente (reconectou rápido)
             if (disconnectNotifyTimer) {
@@ -742,8 +864,11 @@ async function startBridge() {
 
             // ── Iniciar alerta periódico de UPAs inativas ────────────────
             if (STALE_ALERTS_ENABLED && WHATSAPP_GROUP_IDS.length > 0) {
+                const schedStr = STALE_SCHEDULE_BRT.map(([h, m]) =>
+                    `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`
+                ).join(", ");
                 console.log(
-                    `⏰ Alerta de UPAs inativas: dia=${STALE_CHECK_INTERVAL_MIN}min / noite=${STALE_CHECK_INTERVAL_NIGHT_MIN}min, threshold ${STALE_THRESHOLD_HOURS}h`
+                    `⏰ Alerta de UPAs inativas: horários BRT [${schedStr}], threshold ${STALE_THRESHOLD_HOURS}h`
                 );
                 startStaleAlertTimer(sock);
             }
@@ -770,23 +895,56 @@ async function startBridge() {
                         );
                     }, 60_000);
                 }
-                setTimeout(() => startBridge(), 3000);
-            } else {
-                // Deslogado é grave — notifica imediatamente
-                if (disconnectNotifyTimer) {
-                    clearTimeout(disconnectNotifyTimer);
-                    disconnectNotifyTimer = null;
-                }
-                lastDisconnectNotify = Date.now();
-                const now = new Date().toLocaleString("pt-BR", { timeZone: "America/Bahia" });
-                notifyTelegram(
-                    `🚨 <b>WhatsApp Bridge DESLOGADO</b>\n\nA sessão WhatsApp foi encerrada (code=${statusCode}).\n\n<b>Como reconectar do celular:</b>\n1. Abra o WhatsApp no celular\n2. Vá em Configurações > Dispositivos conectados\n3. Toque em "Conectar dispositivo"\n4. O bot vai gerar um código de pareamento e enviar aqui no Telegram\n\nAguardando 60s para gerar o código...\n${now}`
-                );
-                // Clear auth to force new pairing/QR
-                fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-                // Esperar um pouco mais para dar tempo de ler a mensagem
-                setTimeout(() => startBridgeWithPairingCode(), 60 * 1000);
+                // Backoff exponencial: 3s, 6s, 12s, 24s, 48s, cap em 60s
+                const attempt = (globalThis.__reconnectAttempts ?? 0) + 1;
+                globalThis.__reconnectAttempts = attempt;
+                const delay = Math.min(3000 * 2 ** Math.min(attempt - 1, 5), 60_000);
+                console.log(`   Reconectando em ${delay}ms (tentativa ${attempt})`);
+                setTimeout(() => startBridge(), delay);
+                return;
             }
+
+            // loggedOut: número foi deslogado pelo servidor WhatsApp.
+            // Causa típica: outra app pareada no mesmo número fez pairing
+            // e invalidou o nosso device. Re-parear automaticamente sem
+            // circuit breaker gera ping-pong entre as duas apps e arrisca
+            // ban da conta.
+            if (disconnectNotifyTimer) {
+                clearTimeout(disconnectNotifyTimer);
+                disconnectNotifyTimer = null;
+            }
+            lastDisconnectNotify = Date.now();
+            const now = new Date().toLocaleString("pt-BR", { timeZone: "America/Bahia" });
+
+            // 1) Limpar credenciais — versão mountpoint-safe (apaga conteúdo,
+            //    não o diretório), preservando .bridge-state/.
+            try {
+                await clearAuthDirContents(AUTH_DIR);
+                console.log("🧹 auth_info conteúdo apagado");
+            } catch (err) {
+                console.error(`❌ Falha ao limpar auth_info: ${err.message}`);
+                notifyTelegram(
+                    `🚨 <b>WhatsApp Bridge DESLOGADO</b> (code=${statusCode})\n\nFalha ao limpar credenciais: <code>${err.message}</code>\n\nIntervenção manual necessária — re-pareamento automático não foi tentado.\n${now}`
+                );
+                return; // não tenta re-parear
+            }
+
+            // 2) Circuit breaker — bloqueia se já houve repair recente.
+            const gate = canAutoRepair();
+            if (!gate.allowed) {
+                console.warn(`⛔ Re-pareamento automático bloqueado (${gate.reason})`);
+                notifyTelegram(
+                    `🚨 <b>WhatsApp Bridge DESLOGADO</b> (code=${statusCode})\n\nRe-pareamento automático <b>bloqueado</b> (${gate.reason}). ${gate.state.attempts.length} tentativa(s) nas últimas 24h.\n\nVeja runbook em <code>docs/baileys-isolamento-2026-05-25.md</code>.\n${now}`
+                );
+                return;
+            }
+
+            // 3) Re-parear com pairing code, registrar tentativa.
+            recordRepairAttempt();
+            notifyTelegram(
+                `⚠️ <b>WhatsApp Bridge DESLOGADO</b> (code=${statusCode})\n\nA sessão WhatsApp foi encerrada.\n\nIniciando re-pareamento automático em 60s — o código será enviado aqui no Telegram.\n${now}`
+            );
+            setTimeout(() => startBridgeWithPairingCode(), 60 * 1000);
         }
     });
 
@@ -797,6 +955,11 @@ async function startBridge() {
 }
 
 // ── Handler de mensagens (compartilhado entre startBridge e pairing) ────────
+/**
+ * Registra os handlers de mensagens (messages.upsert) no socket Baileys.
+ * Filtra mensagens de giro, encaminha para API, notifica Telegram e
+ * responde no grupo quando faltam dados.
+ */
 function registerMessageHandlers(sock) {
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
         console.log(`📩 messages.upsert: type=${type}, count=${messages.length}`);
@@ -908,7 +1071,7 @@ function registerMessageHandlers(sock) {
 // ── Entry ───────────────────────────────────────────────────────────────────
 
 // Número vinculado ao WhatsApp (para pairing code remoto)
-const WHATSAPP_PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER || "557181619480";
+const WHATSAPP_PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER || "";
 
 /**
  * Inicia o bridge com pairing code em vez de QR code.
@@ -948,6 +1111,7 @@ async function startBridgeWithPairingCode() {
         if (connection === "open") {
             console.log("✅ Reconectado via pairing code!\n");
             pairingCodeRequested = false;
+            globalThis.__reconnectAttempts = 0;
             if (disconnectNotifyTimer) {
                 clearTimeout(disconnectNotifyTimer);
                 disconnectNotifyTimer = null;
@@ -958,8 +1122,11 @@ async function startBridgeWithPairingCode() {
             // Resolver JIDs e iniciar timer
             await resolvePhoneJids(sock);
             if (STALE_ALERTS_ENABLED && WHATSAPP_GROUP_IDS.length > 0) {
+                const schedStr = STALE_SCHEDULE_BRT.map(([h, m]) =>
+                    `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`
+                ).join(", ");
                 console.log(
-                    `⏰ Alerta de UPAs inativas: dia=${STALE_CHECK_INTERVAL_MIN}min / noite=${STALE_CHECK_INTERVAL_NIGHT_MIN}min, threshold ${STALE_THRESHOLD_HOURS}h`
+                    `⏰ Alerta de UPAs inativas: horários BRT [${schedStr}], threshold ${STALE_THRESHOLD_HOURS}h`
                 );
                 startStaleAlertTimer(sock);
             }
@@ -979,7 +1146,12 @@ async function startBridgeWithPairingCode() {
                 notifyTelegram(
                     `🚨 <b>Pairing code falhou</b>\nNão foi possível reconectar automaticamente.\nAcesse o servidor para escanear QR code manualmente.\n${now}`
                 );
-                fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                try {
+                    await clearAuthDirContents(AUTH_DIR);
+                } catch (err) {
+                    console.error(`❌ Falha ao limpar auth_info no pairing fallback: ${err.message}`);
+                    return; // não tenta re-startar — intervenção manual
+                }
                 setTimeout(() => startBridge(), 5000);
             }
         }
