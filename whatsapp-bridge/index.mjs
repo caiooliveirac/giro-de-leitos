@@ -939,7 +939,22 @@ async function startBridge() {
                 return;
             }
 
-            // 3) Re-parear com pairing code, registrar tentativa.
+            // 3) Flag global — fail-stop vs auto-repair. Default é fail-stop
+            //    (false): bridge fica deslogado e avisa, sem disparar pairing
+            //    code que pode chegar antes do operador estar pronto.
+            //    Só setar AUTO_REPAIR_ENABLED=true em janelas controladas de
+            //    re-pareamento (ver docs/baileys-isolamento-2026-05-25.md §F.3).
+            if (process.env.AUTO_REPAIR_ENABLED !== "true") {
+                console.warn(
+                    "⚠️  AUTO_REPAIR_ENABLED=false — bridge ficará deslogado. Re-pareamento manual necessário."
+                );
+                notifyTelegram(
+                    `⚠️ <b>WhatsApp Bridge DESLOGADO</b> (code=${statusCode})\n\nAuto-repair <b>DESLIGADO</b> por configuração.\n\nRe-pareamento manual necessário — siga o runbook em <code>docs/baileys-isolamento-2026-05-25.md §F.3</code>.\n${now}`
+                );
+                return;
+            }
+
+            // 4) Re-parear com pairing code, registrar tentativa.
             recordRepairAttempt();
             notifyTelegram(
                 `⚠️ <b>WhatsApp Bridge DESLOGADO</b> (code=${statusCode})\n\nA sessão WhatsApp foi encerrada.\n\nIniciando re-pareamento automático em 60s — o código será enviado aqui no Telegram.\n${now}`
