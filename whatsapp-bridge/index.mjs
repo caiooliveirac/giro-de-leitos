@@ -836,7 +836,10 @@ async function startBridge() {
     const sock = makeWASocket({
         version,
         logger,
-        browser: Browsers.macOS("Safari"),
+        // Identidade distinta do Transportes-ingest (que usa Browsers.macOS("Safari"))
+        // para que WhatsApp Multi-Device trate ambos como dispositivos lógicos
+        // separados no mesmo número compartilhado. Ver docs §F.4 / Seção I.
+        browser: ["Giro-Leitos-SAMU", "Desktop", "1.0.0"],
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger),
@@ -1166,7 +1169,10 @@ async function startBridgeWithPairingCode() {
     const sock = makeWASocket({
         version,
         logger,
-        browser: Browsers.macOS("Safari"),
+        // Identidade distinta do Transportes-ingest (que usa Browsers.macOS("Safari"))
+        // para que WhatsApp Multi-Device trate ambos como dispositivos lógicos
+        // separados no mesmo número compartilhado. Ver docs §F.4 / Seção I.
+        browser: ["Giro-Leitos-SAMU", "Desktop", "1.0.0"],
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger),
