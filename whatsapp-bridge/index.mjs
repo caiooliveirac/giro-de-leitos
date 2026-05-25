@@ -197,6 +197,10 @@ let lastDisconnectNotify = 0;
 let pairingCodeRequested = false;
 let disconnectNotifyTimer = null; // timer para notificação adiada de queda
 let currentSock = null; // referência ao socket ativo (evita handlers duplicados)
+// Após fail-stop, qualquer setTimeout(()=>startBridge()) que tenha sido
+// agendado antes (por outro evento connection.update emitido pelo sock
+// ainda vivo) precisa abortar. Por isso shutdown é global, não local.
+let bridgeShuttingDown = false;
 
 // ── Mapeamento de telefone → UPA ─────────────────────────────────────────
 // Formato: número sem "+" e sem espaços → nome canônico da UPA
@@ -758,6 +762,26 @@ function recordRepairAttempt() {
     writeRepairState(state);
 }
 
+// ── Shutdown idempotente ────────────────────────────────────────────────
+// Em todo caminho fail-stop (loggedOut + AUTO_REPAIR_ENABLED=false,
+// circuit breaker bloqueado, falha de clearAuthDirContents) o sock deve
+// ser explicitamente encerrado — senão eventos pendentes do socket vivo
+// disparam reconnect e expõem QR no log.
+function shutdownBridge(sock, reason) {
+    bridgeShuttingDown = true;
+    try {
+        sock?.ev?.removeAllListeners();
+    } catch (err) {
+        console.warn(`⚠️  falha ao remover listeners: ${err?.message}`);
+    }
+    try {
+        sock?.end?.(undefined);
+    } catch (err) {
+        console.warn(`⚠️  falha ao encerrar sock: ${err?.message}`);
+    }
+    console.log(`🛑 bridge em estado idle — aguardando re-pareamento manual (reason=${reason})`);
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 /**
@@ -765,6 +789,10 @@ function recordRepairAttempt() {
  * registra handlers de mensagem e inicia o timer de alertas.
  */
 async function startBridge() {
+    if (bridgeShuttingDown) {
+        console.warn("⚠️  bridge marcado para shutdown — startBridge() abortado");
+        return;
+    }
     if (!fs.existsSync(AUTH_DIR)) {
         fs.mkdirSync(AUTH_DIR, { recursive: true });
     }
@@ -801,14 +829,17 @@ async function startBridge() {
 
     // ── QR Code ─────────────────────────────────────────────────────────────
     sock.ev.on("connection.update", async (update) => {
-        const { connection, lastDisconnect, qr } = update;
+        const { connection, lastDisconnect } = update;
 
-        if (qr) {
-            console.log("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n");
-            console.log("📱 Escaneie o QR code abaixo com seu WhatsApp:\n");
-            qrcode.generate(qr, { small: true });
-            console.log(
-                "\n   (Abra WhatsApp → Configurações → Dispositivos conectados → Conectar)\n"
+        // Defesa: NUNCA logar o QR completo (vetor de re-pareamento
+        // acidental — qualquer um com acesso a `docker logs` poderia
+        // escanear e parear o número antigo). Re-pareamento deve ser via
+        // pairing code Telegram em janela controlada — ver docs §F.3.
+        if (update.qr) {
+            console.warn(
+                "⚠️  evento QR recebido — REDIGIDO por segurança. " +
+                "Re-pareamento legítimo deve usar pairing code via Telegram " +
+                "(ver docs/baileys-isolamento-2026-05-25.md §F.3)."
             );
         }
 
@@ -926,7 +957,8 @@ async function startBridge() {
                 notifyTelegram(
                     `🚨 <b>WhatsApp Bridge DESLOGADO</b> (code=${statusCode})\n\nFalha ao limpar credenciais: <code>${err.message}</code>\n\nIntervenção manual necessária — re-pareamento automático não foi tentado.\n${now}`
                 );
-                return; // não tenta re-parear
+                shutdownBridge(sock, "clear_auth_failed");
+                return;
             }
 
             // 2) Circuit breaker — bloqueia se já houve repair recente.
@@ -936,6 +968,7 @@ async function startBridge() {
                 notifyTelegram(
                     `🚨 <b>WhatsApp Bridge DESLOGADO</b> (code=${statusCode})\n\nRe-pareamento automático <b>bloqueado</b> (${gate.reason}). ${gate.state.attempts.length} tentativa(s) nas últimas 24h.\n\nVeja runbook em <code>docs/baileys-isolamento-2026-05-25.md</code>.\n${now}`
                 );
+                shutdownBridge(sock, `circuit_breaker:${gate.reason}`);
                 return;
             }
 
@@ -951,6 +984,7 @@ async function startBridge() {
                 notifyTelegram(
                     `⚠️ <b>WhatsApp Bridge DESLOGADO</b> (code=${statusCode})\n\nAuto-repair <b>DESLIGADO</b> por configuração.\n\nRe-pareamento manual necessário — siga o runbook em <code>docs/baileys-isolamento-2026-05-25.md §F.3</code>.\n${now}`
                 );
+                shutdownBridge(sock, "auto_repair_disabled");
                 return;
             }
 
@@ -1094,6 +1128,11 @@ const WHATSAPP_PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER || "";
  * e o usuário digita no WhatsApp do celular.
  */
 async function startBridgeWithPairingCode() {
+    if (bridgeShuttingDown) {
+        console.warn("⚠️  bridge marcado para shutdown — startBridgeWithPairingCode() abortado");
+        return;
+    }
+
     if (!fs.existsSync(AUTH_DIR)) {
         fs.mkdirSync(AUTH_DIR, { recursive: true });
     }
