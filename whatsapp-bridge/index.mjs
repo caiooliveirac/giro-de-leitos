@@ -793,8 +793,29 @@ async function startBridge() {
         console.warn("⚠️  bridge marcado para shutdown — startBridge() abortado");
         return;
     }
+
     if (!fs.existsSync(AUTH_DIR)) {
         fs.mkdirSync(AUTH_DIR, { recursive: true });
+    }
+
+    // Guard: sem credenciais E auto-repair desligado → não inicie conexão.
+    // Tentar conectar sem creds resulta em loop infinito de close 428
+    // (WhatsApp não tem sessão pra invalidar → não retorna loggedOut →
+    // shouldReconnect=true → re-loop). Esse caso nunca aciona o caminho
+    // fail-stop do handler de loggedOut, então precisa ser detectado aqui.
+    const credsFile = path.join(AUTH_DIR, "creds.json");
+    const hasCreds = fs.existsSync(credsFile);
+    const autoRepairEnabled = process.env.AUTO_REPAIR_ENABLED === "true";
+    if (!hasCreds && !autoRepairEnabled) {
+        console.warn(
+            "⚠️  Sem credenciais E AUTO_REPAIR_ENABLED=false — bridge não vai conectar. " +
+            "Re-pareamento manual necessário (docs §F.3)."
+        );
+        await notifyTelegram(
+            "⚠️ <b>WhatsApp Bridge</b>\n\nSem credenciais e auto-repair desligado.\nBridge ficará idle até re-pareamento manual (docs §F.3)."
+        );
+        bridgeShuttingDown = true;
+        return;
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
