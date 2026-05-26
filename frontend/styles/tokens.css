@@ -1,0 +1,25 @@
+:root {
+  --surface: 247 247 250;
+  --card: 255 255 255;
+  --border: 229 229 234;
+  --text-primary: 15 15 17;
+  --text-secondary: 99 99 102;
+  --text-tertiary: 174 174 178;
+  --accent-red: 255 59 48;
+  --accent-amber: 255 149 0;
+  --accent-green: 52 199 89;
+  --accent-blue: 10 132 255;
+}
+
+.dark {
+  --surface: 0 0 0;
+  --card: 28 28 30;
+  --border: 58 58 60;
+  --text-primary: 255 255 255;
+  --text-secondary: 141 141 147;
+  --text-tertiary: 99 99 102;
+  --accent-red: 255 69 58;
+  --accent-amber: 255 159 10;
+  --accent-green: 48 209 88;
+  --accent-blue: 10 132 255;
+}
