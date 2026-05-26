@@ -1,8 +1,9 @@
 'use client';
 
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import * as Toast from '@radix-ui/react-toast';
+import { initOfflineQueue, flush as flushOfflineQueue } from '@/lib/offline-queue';
 
 export function Providers({ children }: { children: ReactNode }) {
   const [client] = useState(
@@ -17,6 +18,14 @@ export function Providers({ children }: { children: ReactNode }) {
         },
       }),
   );
+
+  useEffect(() => {
+    initOfflineQueue();
+    if (typeof navigator !== 'undefined' && navigator.onLine) {
+      // Fire and forget; do not block render.
+      void flushOfflineQueue();
+    }
+  }, []);
 
   return (
     <QueryClientProvider client={client}>

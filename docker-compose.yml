@@ -57,6 +57,19 @@ services:
     tty: true
     stdin_open: true
 
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: giro-de-leitos-frontend
+    restart: unless-stopped
+    depends_on:
+      - parser-api
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://parser-api:8000}
+
 volumes:
   giro_db_data_local:
   wa_auth_info:

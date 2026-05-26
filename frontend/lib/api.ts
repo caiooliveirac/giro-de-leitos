@@ -39,6 +39,48 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
   return body as T;
 }
 
+export interface ApiMutateOptions {
+  offlineQueue?: boolean;
+}
+
+/**
+ * Wrapper around apiFetch that, on network failure, can enqueue the request
+ * in the offline IndexedDB queue instead of throwing. Returns the parsed
+ * response body on success, or `null` when the request was enqueued.
+ */
+export async function apiMutate<T>(
+  path: string,
+  init: RequestInit = {},
+  options: ApiMutateOptions = {},
+): Promise<T | null> {
+  try {
+    return await apiFetch<T>(path, init);
+  } catch (err) {
+    const isNetworkFailure =
+      !(err instanceof ApiError) || (err instanceof ApiError && err.status === 0);
+    if (options.offlineQueue && isNetworkFailure) {
+      const { enqueue } = await import('@/lib/offline-queue');
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (init.headers) {
+        new Headers(init.headers).forEach((v, k) => {
+          headers[k] = v;
+        });
+      }
+      let body: string | null = null;
+      if (typeof init.body === 'string') body = init.body;
+      else if (init.body) body = JSON.stringify(init.body);
+      await enqueue({
+        url: path,
+        method: (init.method ?? 'GET').toUpperCase(),
+        headers,
+        body,
+      });
+      return null;
+    }
+    throw err;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Domain types (placeholders aligned with migrations/001_auth_and_beds.sql).
 // Will be refined in Phase 5/7 as the API contract is finalized.

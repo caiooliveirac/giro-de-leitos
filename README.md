@@ -371,3 +371,29 @@ No estado atual, o serviço já pode ser usado em rotina operacional para:
 - manter histórico e alertas
 
 O ponto mais importante é que a informação operacional já chega tratada para a tela, reduzindo necessidade de interpretação manual do texto bruto.
+
+---
+
+## Frontend web app
+
+Há um frontend Next.js 14 em `frontend/` que substitui o playground HTML antigo para o fluxo operacional de UPAs.
+
+### Rodar em desenvolvimento
+
+1. Backend em `localhost:8000`:
+   `uvicorn main:app --reload --port 8000`
+2. Frontend:
+   `cd frontend && pnpm install && pnpm dev`
+3. Acesse `http://localhost:3000`. O Next proxya `/api/*` e `/ws/*` pro backend automaticamente.
+
+### Onboarding inicial
+
+1. Configure `.env` a partir de `.env.example`. Gere `CPF_ENCRYPTION_KEY` Fernet.
+2. Rode `python scripts/seed_admin.py` — cria as UPAs e o usuário admin root.
+3. Faça login admin em `/admin/login`, gere convite de coordenador, copie o link, envie por WhatsApp.
+
+### Build de produção
+
+`docker compose up --build` sobe Postgres, parser-api, whatsapp-bridge e frontend.
+
+O playground HTML antigo (`/api/playground`) continua acessível como fallback.
