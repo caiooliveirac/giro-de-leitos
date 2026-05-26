@@ -20,10 +20,7 @@ export function Providers({ children }: { children: ReactNode }) {
 
   return (
     <QueryClientProvider client={client}>
-      <Toast.Provider swipeDirection="right">
-        {children}
-        <Toast.Viewport className="fixed bottom-4 right-4 z-[100] flex w-96 max-w-[100vw] flex-col gap-2 outline-none" />
-      </Toast.Provider>
+      <Toast.Provider swipeDirection="down">{children}</Toast.Provider>
     </QueryClientProvider>
   );
 }
