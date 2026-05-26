@@ -1,115 +1,78 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ChangeEvent } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { useForm } from 'react-hook-form';
-import { zodResolver } from '@hookform/resolvers/zod';
-import { z } from 'zod';
+import { Bed, Camera, Check, Clock, Lock, ShieldCheck, X } from 'lucide-react';
 import {
-  ArrowLeft,
-  ArrowRight,
-  Camera,
-  CheckCircle2,
-  Lock,
-  ShieldCheck,
-  Sparkles,
-  UserRound,
-} from 'lucide-react';
-import { apiFetch, ApiError } from '@/lib/api';
+  apiFetch,
+  ApiError,
+  type InvitePreview,
+  type InviteAcceptPayload,
+} from '@/lib/api';
 import { formatCpf, validateCpf, digitsOnly as cpfDigits } from '@/lib/cpf';
 import { formatPhoneBR, isValidPhoneBR, digitsOnly as phoneDigits } from '@/lib/phone';
 import { useToast } from '@/lib/toast';
 import { ToastViewport } from '@/components/shared/ToastViewport';
 
-interface InvitePreview {
-  type: 'coordinator' | 'professional';
-  unit_name: string | null;
-  inviter_name: string;
-  expires_at: string;
-}
-
-const CARGO_OPTIONS = ['Médico', 'Enfermeiro', 'Téc. Enfermagem', 'Outro'];
-const PROFESSIONAL_CARGOS = new Set(['Médico', 'Enfermeiro']);
-
-const stepATwoSchema = z.object({
-  name: z.string().min(2, 'Informe o nome completo').max(160),
-  cpf: z
-    .string()
-    .transform((v) => cpfDigits(v))
-    .refine((v) => validateCpf(v), 'CPF inválido'),
-  phone: z
-    .string()
-    .transform((v) => phoneDigits(v))
-    .refine((v) => isValidPhoneBR(v), 'Telefone inválido'),
-});
-
-const stepAThreeSchema = z
-  .object({
-    cargo: z.enum(['Médico', 'Enfermeiro', 'Téc. Enfermagem', 'Outro']),
-    coren_crm: z.string().max(40).optional().or(z.literal('')),
-    photo_data_url: z.string().min(1, 'Adicione uma foto'),
-  })
-  .refine(
-    (data) =>
-      !PROFESSIONAL_CARGOS.has(data.cargo) || (data.coren_crm && data.coren_crm.length >= 3),
-    {
-      message: 'COREN/CRM obrigatório para médico e enfermeiro',
-      path: ['coren_crm'],
-    },
-  );
-
-const stepAFourSchema = z
-  .object({
-    password: z.string().min(8, 'Mínimo 8 caracteres'),
-    password_confirm: z.string().min(8),
-    pin: z.string().regex(/^\d{4}$/, 'PIN deve ter 4 dígitos'),
-    pin_confirm: z.string().regex(/^\d{4}$/, 'PIN deve ter 4 dígitos'),
-  })
-  .refine((d) => d.password === d.password_confirm, {
-    message: 'Senhas não conferem',
-    path: ['password_confirm'],
-  })
-  .refine((d) => d.pin === d.pin_confirm, {
-    message: 'PINs não conferem',
-    path: ['pin_confirm'],
-  });
-
-type StepATwo = z.infer<typeof stepATwoSchema>;
-type StepAThree = z.infer<typeof stepAThreeSchema>;
-type StepAFour = z.infer<typeof stepAFourSchema>;
+const ROLES = ['Téc. enfermagem', 'Enfermeiro', 'Médico', 'Outro'];
+const PROF_ROLES = new Set(['Enfermeiro', 'Médico']);
 
 interface FormState {
+  photo_data_url: string;
+  photo_initials: string;
   name: string;
-  cpf: string;
-  phone: string;
   cargo: string;
   coren_crm: string;
-  photo_data_url: string;
+  phone: string;
+  cpf: string;
+  lgpd: boolean;
   password: string;
+  password_confirm: string;
   pin: string;
-  lgpd_accepted: boolean;
 }
 
 const EMPTY: FormState = {
+  photo_data_url: '',
+  photo_initials: '',
   name: '',
-  cpf: '',
-  phone: '',
   cargo: '',
   coren_crm: '',
-  photo_data_url: '',
+  phone: '',
+  cpf: '',
+  lgpd: false,
   password: '',
+  password_confirm: '',
   pin: '',
-  lgpd_accepted: false,
 };
+
+function calcStrength(pw: string): 0 | 1 | 2 | 3 | 4 {
+  if (!pw) return 0;
+  let s = 0;
+  if (pw.length >= 8) s++;
+  if (/[a-z]/.test(pw) && /[A-Z]/.test(pw)) s++;
+  if (/\d/.test(pw)) s++;
+  if (/[^a-zA-Z0-9]/.test(pw)) s++;
+  return s as 0 | 1 | 2 | 3 | 4;
+}
+const STRENGTH_LABEL = ['', 'fraca', 'média', 'boa', 'forte'];
+
+function initialsOf(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return '';
+  return (parts[0]![0]! + (parts[1]?.[0] ?? '')).toUpperCase();
+}
 
 export default function InvitePage({ params }: { params: { token: string } }) {
   const toast = useToast();
-  const [step, setStep] = useState<1 | 2 | 3 | 4 | 5 | 6>(1);
+  const [step, setStep] = useState<0 | 1 | 2 | 3 | 4>(0);
   const [preview, setPreview] = useState<InvitePreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [loadingPreview, setLoadingPreview] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [data, setData] = useState<FormState>(EMPTY);
+
+  const update = (patch: Partial<FormState>) =>
+    setData((d) => ({ ...d, ...patch }));
 
   useEffect(() => {
     let cancelled = false;
@@ -137,21 +100,22 @@ export default function InvitePage({ params }: { params: { token: string } }) {
   const submit = async () => {
     setSubmitting(true);
     try {
+      const payload: InviteAcceptPayload = {
+        name: data.name,
+        cpf: cpfDigits(data.cpf),
+        phone: phoneDigits(data.phone),
+        cargo: data.cargo,
+        coren_crm: data.coren_crm.trim() || null,
+        password: data.password,
+        pin: data.pin,
+        photo_url: data.photo_data_url,
+        lgpd_accepted: data.lgpd,
+      };
       await apiFetch(`/api/invites/${encodeURIComponent(params.token)}/accept`, {
         method: 'POST',
-        body: JSON.stringify({
-          name: data.name,
-          cpf: data.cpf,
-          phone: data.phone,
-          cargo: data.cargo,
-          coren_crm: data.coren_crm || null,
-          password: data.password,
-          pin: data.pin,
-          photo_url: data.photo_data_url,
-          lgpd_accepted: data.lgpd_accepted,
-        }),
+        body: JSON.stringify(payload),
       });
-      setStep(6);
+      setStep(4);
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : 'Falha ao enviar cadastro';
       toast.error(msg);
@@ -160,672 +124,595 @@ export default function InvitePage({ params }: { params: { token: string } }) {
     }
   };
 
+  // ── render ───────────────────────────────────────────────
+  if (loadingPreview) {
+    return (
+      <InviteShell>
+        <p className="mt-8 text-center text-sm text-ink-3">Carregando convite…</p>
+      </InviteShell>
+    );
+  }
+
+  if (previewError || !preview) {
+    return <InviteInvalid message={previewError ?? 'Convite inválido'} />;
+  }
+
+  const stepNum = step >= 1 && step <= 3 ? (step as 1 | 2 | 3) : null;
+
   return (
-    <main className="mx-auto min-h-dvh w-full max-w-[520px] px-4 pb-16 pt-8">
-      <ProgressBar step={step} />
+    <InviteShell step={stepNum}>
       <AnimatePresence mode="wait">
-        {loadingPreview && (
-          <StepShell key="loading">
-            <p className="text-center text-sm text-text-secondary">Carregando convite…</p>
-          </StepShell>
+        {step === 0 && (
+          <Slide key="s0">
+            <Welcome preview={preview} onStart={() => setStep(1)} />
+          </Slide>
         )}
-
-        {!loadingPreview && previewError && (
-          <StepShell key="invalid">
-            <div className="text-center">
-              <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-pill bg-accent-red/10 text-accent-red">
-                <ShieldCheck size={24} />
-              </div>
-              <h2 className="text-xl font-semibold text-text-primary">
-                Convite inválido ou expirado
-              </h2>
-              <p className="mt-2 text-sm text-text-secondary">{previewError}</p>
-            </div>
-          </StepShell>
+        {step === 1 && (
+          <Slide key="s1">
+            <Step1
+              data={data}
+              onChange={update}
+              onNext={() => setStep(2)}
+              onBack={() => setStep(0)}
+            />
+          </Slide>
         )}
-
-        {!loadingPreview && !previewError && step === 1 && preview && (
-          <StepWelcome key="s1" preview={preview} onNext={() => setStep(2)} />
-        )}
-
         {step === 2 && (
-          <StepPersonal
-            key="s2"
-            initial={data}
-            onBack={() => setStep(1)}
-            onNext={(v) => {
-              setData((d) => ({ ...d, ...v }));
-              setStep(3);
-            }}
-          />
+          <Slide key="s2">
+            <Step2
+              data={data}
+              onChange={update}
+              onNext={() => setStep(3)}
+              onBack={() => setStep(1)}
+            />
+          </Slide>
         )}
-
         {step === 3 && (
-          <StepRole
-            key="s3"
-            initial={data}
-            onBack={() => setStep(2)}
-            onNext={(v) => {
-              setData((d) => ({ ...d, ...v }));
-              setStep(4);
-            }}
-          />
+          <Slide key="s3">
+            <Step3
+              data={data}
+              onChange={update}
+              onNext={submit}
+              onBack={() => setStep(2)}
+              submitting={submitting}
+            />
+          </Slide>
         )}
-
         {step === 4 && (
-          <StepSecurity
-            key="s4"
-            initial={data}
-            onBack={() => setStep(3)}
-            onNext={(v) => {
-              setData((d) => ({ ...d, password: v.password, pin: v.pin }));
-              setStep(5);
-            }}
-          />
+          <Slide key="s4">
+            <Success preview={preview} />
+          </Slide>
         )}
-
-        {step === 5 && (
-          <StepLgpd
-            key="s5"
-            data={data}
-            submitting={submitting}
-            onBack={() => setStep(4)}
-            onAccept={(v) => setData((d) => ({ ...d, lgpd_accepted: v }))}
-            onSubmit={submit}
-          />
-        )}
-
-        {step === 6 && <StepDone key="s6" />}
       </AnimatePresence>
       <ToastViewport />
-    </main>
+    </InviteShell>
   );
 }
 
-function ProgressBar({ step }: { step: number }) {
-  const total = 5;
-  const current = Math.min(step, total);
+// ─── shell ────────────────────────────────────────────────
+function InviteShell({
+  step,
+  children,
+}: {
+  step?: 1 | 2 | 3 | null;
+  children: React.ReactNode;
+}) {
   return (
-    <div className="mb-6 flex items-center gap-1.5" aria-label={`Etapa ${current} de ${total}`}>
-      {Array.from({ length: total }).map((_, i) => {
-        const active = i + 1 <= current;
-        return (
-          <motion.div
-            key={i}
-            className={`h-1 flex-1 rounded-pill ${
-              active ? 'bg-accent-blue' : 'bg-border'
-            }`}
-            animate={{ scale: active ? 1 : 0.98 }}
-            transition={{ type: 'spring', stiffness: 360, damping: 30 }}
-          />
-        );
-      })}
+    <div className="invite-app">
+      <div className="invite-top">
+        <div className="invite-brand">
+          <span className="badge">
+            <Bed size={14} aria-hidden />
+          </span>
+          <span>Giro de Leitos</span>
+        </div>
+        {step != null && (
+          <div className="step-dots" aria-label={`Passo ${step} de 3`}>
+            {[1, 2, 3].map((i) => (
+              <span key={i} data-on={i <= step} />
+            ))}
+          </div>
+        )}
+      </div>
+      <div className="invite-body">{children}</div>
     </div>
   );
 }
 
-function StepShell({ children }: { children: React.ReactNode }) {
+function Slide({ children }: { children: React.ReactNode }) {
   return (
-    <motion.section
-      initial={{ opacity: 0, y: 16 }}
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -16 }}
+      exit={{ opacity: 0, y: -12 }}
       transition={{ type: 'spring', stiffness: 320, damping: 32 }}
-      className="rounded-card border border-border bg-card p-5 shadow-card"
     >
       {children}
-    </motion.section>
+    </motion.div>
   );
 }
 
-function PrimaryButton({
-  children,
-  onClick,
-  type = 'button',
-  disabled,
-  loading,
-}: {
-  children: React.ReactNode;
-  onClick?: () => void;
-  type?: 'button' | 'submit';
-  disabled?: boolean;
-  loading?: boolean;
-}) {
-  return (
-    <motion.button
-      type={type}
-      whileTap={{ scale: disabled ? 1 : 0.97 }}
-      onClick={onClick}
-      disabled={disabled || loading}
-      className="flex w-full items-center justify-center gap-2 rounded-pill bg-accent-blue px-6 py-3.5 text-base font-semibold text-white disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-card"
-    >
-      {loading ? 'Enviando…' : children}
-    </motion.button>
-  );
-}
-
-function SecondaryButton({
-  children,
-  onClick,
-}: {
-  children: React.ReactNode;
-  onClick?: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="flex items-center gap-1.5 rounded-pill border border-border bg-surface px-4 py-2 text-sm font-medium text-text-secondary transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue hover:text-text-primary"
-    >
-      {children}
-    </button>
-  );
-}
-
-function StepWelcome({
+// ─── A1 welcome ──────────────────────────────────────────
+function Welcome({
   preview,
-  onNext,
+  onStart,
 }: {
   preview: InvitePreview;
-  onNext: () => void;
+  onStart: () => void;
 }) {
-  const role = preview.type === 'coordinator' ? 'Coordenador' : 'Profissional';
-  const target = preview.unit_name ? ` na ${preview.unit_name}` : '';
-  return (
-    <StepShell>
-      <div className="text-center">
-        <motion.div
-          initial={{ scale: 0.6, opacity: 0 }}
-          animate={{ scale: 1, opacity: 1 }}
-          transition={{ type: 'spring', stiffness: 360, damping: 22 }}
-          className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-pill bg-accent-blue/10 text-accent-blue"
-        >
-          <Sparkles size={26} />
-        </motion.div>
-        <h1 className="text-2xl font-semibold tracking-tight text-text-primary">
-          Bem-vindo ao Giro
-        </h1>
-        <p className="mt-2 text-sm text-text-secondary">
-          Você foi convidado{target} como <strong className="text-text-primary">{role}</strong> por{' '}
-          <strong className="text-text-primary">{preview.inviter_name}</strong>.
-        </p>
-        <p className="mt-1 text-xs text-text-tertiary">
-          Convite válido até {new Date(preview.expires_at).toLocaleString('pt-BR')}.
-        </p>
-      </div>
-      <div className="mt-6">
-        <PrimaryButton onClick={onNext}>
-          Começar <ArrowRight size={18} />
-        </PrimaryButton>
-      </div>
-    </StepShell>
-  );
-}
-
-function StepPersonal({
-  initial,
-  onBack,
-  onNext,
-}: {
-  initial: FormState;
-  onBack: () => void;
-  onNext: (v: StepATwo) => void;
-}) {
-  const {
-    register,
-    handleSubmit,
-    formState: { errors },
-    setValue,
-    watch,
-  } = useForm<StepATwo>({
-    resolver: zodResolver(stepATwoSchema),
-    defaultValues: {
-      name: initial.name,
-      cpf: initial.cpf,
-      phone: initial.phone,
-    },
+  const isCoord = preview.type === 'coordinator';
+  const unit = preview.unit_name ?? 'sua unidade';
+  const expires = new Date(preview.expires_at).toLocaleDateString('pt-BR', {
+    day: '2-digit',
+    month: 'long',
   });
-
-  const cpfValue = watch('cpf');
-  const phoneValue = watch('phone');
-
   return (
-    <StepShell>
-      <h2 className="text-xl font-semibold text-text-primary">Seus dados</h2>
-      <p className="mt-1 text-xs text-text-secondary">
-        CPF é cifrado em repouso e só aparece mascarado.
+    <>
+      <h1 className="invite-h1">
+        {isCoord ? (
+          <>
+            Você foi convidado pra
+            <br />
+            coordenar a {unit}
+          </>
+        ) : (
+          <>
+            Você foi convidado pra
+            <br />
+            fazer parte da equipe
+            <br />
+            da {unit}
+          </>
+        )}
+      </h1>
+      <p className="invite-sub">
+        Convite de {preview.inviter_name} · válido até {expires}
       </p>
 
-      <form className="mt-5 space-y-4" onSubmit={handleSubmit(onNext)} noValidate>
-        <Field label="Nome completo" error={errors.name?.message}>
-          <input
-            {...register('name')}
-            autoComplete="name"
-            className="input-base"
-            placeholder="Maria da Silva"
-          />
-        </Field>
-
-        <Field label="CPF" error={errors.cpf?.message}>
-          <input
-            inputMode="numeric"
-            autoComplete="off"
-            value={formatCpf(cpfValue ?? '')}
-            onChange={(e) => setValue('cpf', cpfDigits(e.target.value), { shouldValidate: true })}
-            className="input-base"
-            placeholder="000.000.000-00"
-          />
-        </Field>
-
-        <Field label="Telefone (WhatsApp)" error={errors.phone?.message}>
-          <input
-            inputMode="tel"
-            autoComplete="tel"
-            value={formatPhoneBR(phoneValue ?? '')}
-            onChange={(e) =>
-              setValue('phone', phoneDigits(e.target.value), { shouldValidate: true })
-            }
-            className="input-base"
-            placeholder="(11) 91234-5678"
-          />
-        </Field>
-
-        <div className="flex items-center justify-between gap-3 pt-2">
-          <SecondaryButton onClick={onBack}>
-            <ArrowLeft size={16} /> Voltar
-          </SecondaryButton>
-          <PrimaryButton type="submit">
-            Continuar <ArrowRight size={18} />
-          </PrimaryButton>
+      <div className="invite-inviter">
+        <div className="av">{initialsOf(preview.inviter_name) || '?'}</div>
+        <div className="min-w-0 flex-1">
+          <div className="name truncate">{preview.inviter_name}</div>
+          <div className="meta">
+            {isCoord ? 'Administrador central' : `Coordenador · ${unit}`}
+          </div>
         </div>
-      </form>
-      <InputStyles />
-    </StepShell>
+      </div>
+
+      <p className="text-[14px] leading-[1.5] text-ink-2">Você vai precisar de:</p>
+      <ul className="mt-1 list-disc pl-5 text-[13px] leading-[1.7] text-ink-2">
+        <li>Uma foto pra colegas te reconhecerem no plantão</li>
+        <li>Seu CPF e telefone</li>
+        <li>Cerca de 2 minutos</li>
+      </ul>
+
+      <button type="button" className="cta mt-6" onClick={onStart}>
+        Começar cadastro
+      </button>
+
+      <p className="invite-fine">
+        Ao continuar, você concorda com nossa{' '}
+        <a href="#" tabIndex={-1}>política de privacidade</a>.<br />
+        Seus dados são protegidos pela LGPD.
+      </p>
+    </>
   );
 }
 
-function StepRole({
-  initial,
-  onBack,
+// ─── A2 step1: identity ──────────────────────────────────
+function Step1({
+  data,
+  onChange,
   onNext,
+  onBack,
 }: {
-  initial: FormState;
+  data: FormState;
+  onChange: (patch: Partial<FormState>) => void;
+  onNext: () => void;
   onBack: () => void;
-  onNext: (v: StepAThree) => void;
 }) {
-  const {
-    register,
-    handleSubmit,
-    formState: { errors },
-    setValue,
-    watch,
-  } = useForm<StepAThree>({
-    resolver: zodResolver(stepAThreeSchema),
-    defaultValues: {
-      cargo: (initial.cargo as StepAThree['cargo']) || 'Médico',
-      coren_crm: initial.coren_crm,
-      photo_data_url: initial.photo_data_url,
-    },
-  });
-
-  const cargo = watch('cargo');
-  const photo = watch('photo_data_url');
   const fileRef = useRef<HTMLInputElement | null>(null);
+  const canNext =
+    data.name.trim().length >= 3 &&
+    data.cargo &&
+    (!PROF_ROLES.has(data.cargo) || data.coren_crm.trim().length >= 3);
 
-  const handleFile = (file: File) => {
+  const handlePhoto = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === 'string') {
-        setValue('photo_data_url', reader.result, { shouldValidate: true });
+        onChange({ photo_data_url: reader.result, photo_initials: '' });
       }
     };
     reader.readAsDataURL(file);
   };
 
-  const showCoren = PROFESSIONAL_CARGOS.has(cargo);
-
   return (
-    <StepShell>
-      <h2 className="text-xl font-semibold text-text-primary">Função e foto</h2>
-      <p className="mt-1 text-xs text-text-secondary">
-        A foto aparece pros colegas escolherem você ao iniciar plantão.
-      </p>
+    <>
+      <button type="button" className="back-btn" onClick={onBack} aria-label="Voltar">
+        ← voltar
+      </button>
+      <h1 className="invite-h1 mt-2">Quem é você?</h1>
+      <p className="invite-sub">Passo 1 de 3 · vamos te identificar pra equipe.</p>
 
-      <form className="mt-5 space-y-4" onSubmit={handleSubmit(onNext)} noValidate>
-        <Field label="Cargo" error={errors.cargo?.message}>
-          <select {...register('cargo')} className="input-base">
-            {CARGO_OPTIONS.map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
-          </select>
-        </Field>
-
-        {showCoren && (
-          <Field label="COREN ou CRM" error={errors.coren_crm?.message}>
-            <input {...register('coren_crm')} className="input-base" placeholder="123456" />
-          </Field>
-        )}
-
-        <Field label="Foto de perfil" error={errors.photo_data_url?.message}>
-          <div className="flex items-center gap-4">
-            <div className="flex h-24 w-24 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border bg-surface">
-              {photo ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img src={photo} alt="Foto de perfil" className="h-full w-full object-cover" />
-              ) : (
-                <UserRound size={36} className="text-text-tertiary" aria-hidden />
-              )}
-            </div>
-            <div className="flex-1">
-              <input
-                ref={fileRef}
-                type="file"
-                accept="image/*"
-                capture="user"
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) handleFile(f);
-                }}
-              />
+      <div className="avatar-pick">
+        <button
+          type="button"
+          className="circle"
+          data-filled={Boolean(data.photo_data_url || data.photo_initials)}
+          onClick={() => fileRef.current?.click()}
+          aria-label="Adicionar foto"
+        >
+          {data.photo_data_url ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={data.photo_data_url} alt="" />
+          ) : data.photo_initials ? (
+            <span className="text-[28px] font-semibold">{data.photo_initials}</span>
+          ) : (
+            <Camera size={28} aria-hidden />
+          )}
+        </button>
+        <div className="help">
+          Foto do rosto, ajuda colegas a te reconhecerem no plantão.
+          <br />
+          <button
+            type="button"
+            onClick={() => fileRef.current?.click()}
+            className="mt-1.5 text-[13px] font-semibold text-accent"
+          >
+            {data.photo_data_url ? 'Trocar foto' : 'Adicionar foto'}
+          </button>
+          {!data.photo_data_url && data.name && (
+            <>
+              {' · '}
               <button
                 type="button"
-                onClick={() => fileRef.current?.click()}
-                className="flex items-center gap-1.5 rounded-pill border border-border bg-surface px-3 py-2 text-sm font-medium text-text-primary transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue hover:bg-border/40"
+                onClick={() =>
+                  onChange({ photo_initials: initialsOf(data.name) })
+                }
+                className="text-[13px] text-ink-3 underline"
               >
-                <Camera size={16} /> {photo ? 'Trocar foto' : 'Tirar/escolher foto'}
+                usar iniciais
               </button>
-            </div>
-          </div>
-        </Field>
-
-        <div className="flex items-center justify-between gap-3 pt-2">
-          <SecondaryButton onClick={onBack}>
-            <ArrowLeft size={16} /> Voltar
-          </SecondaryButton>
-          <PrimaryButton type="submit">
-            Continuar <ArrowRight size={18} />
-          </PrimaryButton>
-        </div>
-      </form>
-      <InputStyles />
-    </StepShell>
-  );
-}
-
-function passwordStrength(pwd: string): { score: 0 | 1 | 2 | 3 | 4; label: string } {
-  let s = 0;
-  if (pwd.length >= 8) s++;
-  if (/[A-Z]/.test(pwd)) s++;
-  if (/[0-9]/.test(pwd)) s++;
-  if (/[^A-Za-z0-9]/.test(pwd)) s++;
-  const labels = ['Muito fraca', 'Fraca', 'Razoável', 'Boa', 'Forte'];
-  return { score: s as 0 | 1 | 2 | 3 | 4, label: labels[s] };
-}
-
-function StepSecurity({
-  initial,
-  onBack,
-  onNext,
-}: {
-  initial: FormState;
-  onBack: () => void;
-  onNext: (v: { password: string; pin: string }) => void;
-}) {
-  const {
-    register,
-    handleSubmit,
-    formState: { errors },
-    watch,
-  } = useForm<StepAFour>({
-    resolver: zodResolver(stepAFourSchema),
-    defaultValues: {
-      password: initial.password,
-      password_confirm: initial.password,
-      pin: initial.pin,
-      pin_confirm: initial.pin,
-    },
-  });
-
-  const password = watch('password') ?? '';
-  const strength = passwordStrength(password);
-
-  return (
-    <StepShell>
-      <h2 className="text-xl font-semibold text-text-primary">Segurança</h2>
-      <p className="mt-1 text-xs text-text-secondary">
-        Senha pra login web. PIN de 4 dígitos pra iniciar plantão no tablet.
-      </p>
-
-      <form
-        className="mt-5 space-y-4"
-        onSubmit={handleSubmit((v) => onNext({ password: v.password, pin: v.pin }))}
-        noValidate
-      >
-        <Field label="Senha" error={errors.password?.message}>
-          <input
-            type="password"
-            autoComplete="new-password"
-            {...register('password')}
-            className="input-base"
-            placeholder="Mínimo 8 caracteres"
-          />
-          {password.length > 0 && (
-            <div className="mt-2">
-              <div className="flex h-1.5 gap-1">
-                {[0, 1, 2, 3].map((i) => (
-                  <div
-                    key={i}
-                    className={`flex-1 rounded-pill ${
-                      i < strength.score
-                        ? strength.score >= 3
-                          ? 'bg-accent-green'
-                          : strength.score === 2
-                            ? 'bg-accent-amber'
-                            : 'bg-accent-red'
-                        : 'bg-border'
-                    }`}
-                  />
-                ))}
-              </div>
-              <p className="mt-1 text-[11px] text-text-tertiary">Força: {strength.label}</p>
-            </div>
+            </>
           )}
-        </Field>
-
-        <Field label="Confirmar senha" error={errors.password_confirm?.message}>
-          <input
-            type="password"
-            autoComplete="new-password"
-            {...register('password_confirm')}
-            className="input-base"
-          />
-        </Field>
-
-        <Field label="PIN (4 dígitos)" error={errors.pin?.message}>
-          <input
-            type="password"
-            inputMode="numeric"
-            maxLength={4}
-            autoComplete="off"
-            {...register('pin')}
-            className="input-base tracking-[0.5em]"
-            placeholder="••••"
-          />
-        </Field>
-
-        <Field label="Confirmar PIN" error={errors.pin_confirm?.message}>
-          <input
-            type="password"
-            inputMode="numeric"
-            maxLength={4}
-            autoComplete="off"
-            {...register('pin_confirm')}
-            className="input-base tracking-[0.5em]"
-            placeholder="••••"
-          />
-        </Field>
-
-        <div className="flex items-center justify-between gap-3 pt-2">
-          <SecondaryButton onClick={onBack}>
-            <ArrowLeft size={16} /> Voltar
-          </SecondaryButton>
-          <PrimaryButton type="submit">
-            Continuar <ArrowRight size={18} />
-          </PrimaryButton>
         </div>
-      </form>
-      <InputStyles />
-    </StepShell>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/*"
+          capture="user"
+          className="hidden"
+          onChange={handlePhoto}
+          aria-label="Selecionar foto"
+        />
+      </div>
+
+      <div className="field-stack mt-5">
+        <div className="field">
+          <label className="field-label" htmlFor="iv-name">
+            Nome completo
+          </label>
+          <input
+            id="iv-name"
+            className="input-shell"
+            value={data.name}
+            placeholder="Ex.: Mariana Soares"
+            autoComplete="name"
+            onChange={(e) => onChange({ name: e.target.value })}
+          />
+        </div>
+
+        <div className="field">
+          <span className="field-label">Cargo</span>
+          <div className="chip-pick" role="radiogroup" aria-label="Cargo">
+            {ROLES.map((r) => (
+              <button
+                key={r}
+                type="button"
+                role="radio"
+                aria-checked={data.cargo === r}
+                data-on={data.cargo === r}
+                onClick={() => onChange({ cargo: r })}
+              >
+                {r}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {PROF_ROLES.has(data.cargo) && (
+          <div className="field">
+            <label className="field-label" htmlFor="iv-coren">
+              COREN ou CRM{' '}
+              <span className="font-medium normal-case tracking-normal text-ink-3">
+                · se aplicável
+              </span>
+            </label>
+            <input
+              id="iv-coren"
+              className="input-shell"
+              value={data.coren_crm}
+              placeholder="Ex.: COREN/BA 412.388"
+              onChange={(e) => onChange({ coren_crm: e.target.value })}
+            />
+          </div>
+        )}
+      </div>
+
+      <button type="button" className="cta mt-6" disabled={!canNext} onClick={onNext}>
+        Continuar
+      </button>
+    </>
   );
 }
 
-function StepLgpd({
+// ─── A3 step2: contact ───────────────────────────────────
+function Step2({
   data,
-  submitting,
+  onChange,
+  onNext,
   onBack,
-  onAccept,
-  onSubmit,
 }: {
   data: FormState;
-  submitting: boolean;
+  onChange: (patch: Partial<FormState>) => void;
+  onNext: () => void;
   onBack: () => void;
-  onAccept: (v: boolean) => void;
-  onSubmit: () => void;
 }) {
-  const summary = useMemo(
-    () => [
-      { label: 'Nome', value: data.name },
-      { label: 'CPF', value: formatCpf(data.cpf) },
-      { label: 'Telefone', value: formatPhoneBR(data.phone) },
-      { label: 'Cargo', value: data.cargo + (data.coren_crm ? ` · ${data.coren_crm}` : '') },
-    ],
-    [data],
-  );
+  const [cpfTouched, setCpfTouched] = useState(false);
+  const phoneOk = isValidPhoneBR(data.phone);
+  const cpfOk = validateCpf(data.cpf);
+  const cpfShowErr = cpfTouched && cpfDigits(data.cpf).length === 11 && !cpfOk;
+  const canNext = phoneOk && cpfOk && data.lgpd;
 
   return (
-    <StepShell>
-      <div className="flex items-center gap-2">
-        <div className="flex h-9 w-9 items-center justify-center rounded-pill bg-accent-blue/10 text-accent-blue">
-          <Lock size={18} />
+    <>
+      <button type="button" className="back-btn" onClick={onBack} aria-label="Voltar">
+        ← voltar
+      </button>
+      <h1 className="invite-h1 mt-2">Como te encontramos?</h1>
+      <p className="invite-sub">
+        Passo 2 de 3 · vamos avisar você no WhatsApp quando seu cadastro for aprovado.
+      </p>
+
+      <div className="field-stack">
+        <div className="field">
+          <label className="field-label" htmlFor="iv-tel">
+            Telefone celular
+          </label>
+          <input
+            id="iv-tel"
+            className="input-shell"
+            value={data.phone}
+            placeholder="(71) 99488-3120"
+            inputMode="tel"
+            autoComplete="tel"
+            onChange={(e) => onChange({ phone: formatPhoneBR(e.target.value) })}
+          />
+          <div className="help">
+            Vamos usar pra te avisar quando seu cadastro for aprovado.
+          </div>
         </div>
-        <h2 className="text-xl font-semibold text-text-primary">Privacidade e revisão</h2>
-      </div>
 
-      <div className="mt-4 rounded-card bg-surface p-4 text-xs leading-relaxed text-text-secondary">
-        <p>
-          O Giro segue a LGPD. Seus dados são usados apenas pra operação interna da UPA:
-        </p>
-        <ul className="mt-2 list-disc space-y-1 pl-5">
-          <li>CPF é cifrado em repouso e exibido apenas mascarado (***.***.***-**).</li>
-          <li>Toda ação (alta, óbito, transferência) gera log de auditoria.</li>
-          <li>Seus dados não são compartilhados com terceiros.</li>
-          <li>Você pode solicitar exclusão a qualquer momento via coordenador.</li>
-        </ul>
-      </div>
-
-      <div className="mt-4 rounded-card border border-border bg-surface p-4">
-        <p className="text-xs font-semibold uppercase tracking-wider text-text-tertiary">
-          Resumo
-        </p>
-        <dl className="mt-2 space-y-1.5 text-sm">
-          {summary.map((s) => (
-            <div key={s.label} className="flex items-baseline justify-between gap-4">
-              <dt className="text-text-secondary">{s.label}</dt>
-              <dd className="truncate font-medium text-text-primary">{s.value}</dd>
+        <div className="field">
+          <label className="field-label" htmlFor="iv-cpf">
+            CPF
+          </label>
+          <input
+            id="iv-cpf"
+            className="input-shell tnum"
+            value={data.cpf}
+            placeholder="000.000.000-00"
+            inputMode="numeric"
+            data-err={cpfShowErr}
+            onBlur={() => setCpfTouched(true)}
+            onChange={(e) => onChange({ cpf: formatCpf(e.target.value) })}
+          />
+          {cpfShowErr ? (
+            <div className="help text-critical-ink">
+              CPF inválido — verifique os dígitos.
             </div>
-          ))}
-        </dl>
-      </div>
+          ) : (
+            <div className="secure-hint">
+              <Lock size={14} aria-hidden className="mt-[2px] flex-shrink-0" />
+              <span>
+                Seu CPF é criptografado e usado apenas pra confirmar sua identidade. Não
+                compartilhamos com terceiros.
+              </span>
+            </div>
+          )}
+        </div>
 
-      <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-card border border-border bg-card p-3">
-        <input
-          type="checkbox"
-          checked={data.lgpd_accepted}
-          onChange={(e) => onAccept(e.target.checked)}
-          className="mt-0.5 h-4 w-4 accent-accent-blue"
-        />
-        <span className="text-sm text-text-primary">
-          Li e aceito o tratamento dos meus dados conforme descrito acima.
-        </span>
-      </label>
-
-      <div className="mt-5 flex items-center justify-between gap-3">
-        <SecondaryButton onClick={onBack}>
-          <ArrowLeft size={16} /> Voltar
-        </SecondaryButton>
-        <PrimaryButton onClick={onSubmit} disabled={!data.lgpd_accepted} loading={submitting}>
-          Concluir cadastro
-        </PrimaryButton>
-      </div>
-    </StepShell>
-  );
-}
-
-function StepDone() {
-  return (
-    <StepShell>
-      <div className="text-center">
-        <motion.div
-          initial={{ scale: 0.5, opacity: 0 }}
-          animate={{ scale: 1, opacity: 1 }}
-          transition={{ type: 'spring', stiffness: 360, damping: 22 }}
-          className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-pill bg-accent-green/10 text-accent-green"
+        <button
+          type="button"
+          className="lgpd"
+          data-on={data.lgpd}
+          onClick={() => onChange({ lgpd: !data.lgpd })}
+          aria-pressed={data.lgpd}
         >
-          <CheckCircle2 size={32} />
-        </motion.div>
-        <h2 className="text-2xl font-semibold text-text-primary">Cadastro enviado</h2>
-        <p className="mt-2 text-sm text-text-secondary">
-          Aguarde a aprovação. Assim que liberar, você recebe um WhatsApp e já pode entrar
-          no plantão.
-        </p>
+          <span className="box">
+            <Check size={14} aria-hidden />
+          </span>
+          <span>
+            Autorizo o tratamento dos meus dados conforme a{' '}
+            <a href="#" onClick={(e) => e.stopPropagation()}>
+              política de privacidade
+            </a>{' '}
+            e LGPD.
+          </span>
+        </button>
       </div>
-    </StepShell>
+
+      <button type="button" className="cta mt-6" disabled={!canNext} onClick={onNext}>
+        Continuar
+      </button>
+    </>
   );
 }
 
-function Field({
-  label,
-  error,
-  children,
+// ─── A4 step3: password + PIN ────────────────────────────
+function Step3({
+  data,
+  onChange,
+  onNext,
+  onBack,
+  submitting,
 }: {
-  label: string;
-  error?: string;
-  children: React.ReactNode;
+  data: FormState;
+  onChange: (patch: Partial<FormState>) => void;
+  onNext: () => void;
+  onBack: () => void;
+  submitting: boolean;
 }) {
+  const strength = calcStrength(data.password);
+  const match = data.password.length > 0 && data.password === data.password_confirm;
+  const minOk =
+    data.password.length >= 8 &&
+    /[a-zA-Z]/.test(data.password) &&
+    /\d/.test(data.password);
+  const pinOk = /^\d{4}$/.test(data.pin);
+  const canNext = minOk && match && pinOk && !submitting;
+
   return (
-    <label className="block">
-      <span className="mb-1.5 block text-xs font-medium text-text-secondary">{label}</span>
-      {children}
-      {error && (
-        <span className="mt-1 block text-xs font-medium text-accent-red" role="alert">
-          {error}
-        </span>
-      )}
-    </label>
+    <>
+      <button type="button" className="back-btn" onClick={onBack} aria-label="Voltar">
+        ← voltar
+      </button>
+      <h1 className="invite-h1 mt-2">Crie uma senha</h1>
+      <p className="invite-sub">
+        Passo 3 de 3 · você usa essa senha pra abrir o app no celular.
+      </p>
+
+      <div className="field-stack">
+        <div className="field">
+          <label className="field-label" htmlFor="iv-pw">
+            Senha
+          </label>
+          <input
+            id="iv-pw"
+            type="password"
+            className="input-shell"
+            value={data.password}
+            autoComplete="new-password"
+            placeholder="8+ caracteres, com letra e número"
+            onChange={(e) => onChange({ password: e.target.value })}
+          />
+          {data.password.length > 0 && (
+            <>
+              <div className="pw-meter" data-strength={strength}>
+                {[1, 2, 3, 4].map((i) => (
+                  <span key={i} />
+                ))}
+              </div>
+              <div className="pw-meter-label">{STRENGTH_LABEL[strength]}</div>
+            </>
+          )}
+        </div>
+
+        <div className="field">
+          <label className="field-label" htmlFor="iv-pw2">
+            Repita a senha
+          </label>
+          <input
+            id="iv-pw2"
+            type="password"
+            className="input-shell"
+            value={data.password_confirm}
+            autoComplete="new-password"
+            placeholder="mesma senha"
+            data-err={data.password_confirm.length > 0 && !match}
+            onChange={(e) => onChange({ password_confirm: e.target.value })}
+          />
+          {data.password_confirm.length > 0 && !match && (
+            <div className="help text-critical-ink">As senhas não batem.</div>
+          )}
+        </div>
+
+        <div className="field">
+          <label className="field-label" htmlFor="iv-pin">
+            PIN de plantão · 4 dígitos
+          </label>
+          <input
+            id="iv-pin"
+            type="password"
+            inputMode="numeric"
+            maxLength={4}
+            className="input-shell tnum tracking-[0.5em]"
+            value={data.pin}
+            placeholder="••••"
+            onChange={(e) =>
+              onChange({ pin: e.target.value.replace(/\D/g, '').slice(0, 4) })
+            }
+          />
+          <div className="help">
+            Esse PIN é o que você usa pra entrar em cada plantão pelo tablet.
+          </div>
+        </div>
+      </div>
+
+      <button type="button" className="cta mt-6" disabled={!canNext} onClick={onNext}>
+        {submitting ? 'Enviando…' : 'Finalizar cadastro'}
+      </button>
+
+      <p className="invite-fine">
+        Ao finalizar, seus dados vão pra aprovação do coordenador.
+      </p>
+    </>
   );
 }
 
-function InputStyles() {
+// ─── A5 success ───────────────────────────────────────────
+function Success({ preview }: { preview: InvitePreview }) {
+  const isCoord = preview.type === 'coordinator';
   return (
-    <style jsx>{`
-      :global(.input-base) {
-        width: 100%;
-        border-radius: 14px;
-        border: 1px solid rgb(var(--border));
-        background: rgb(var(--surface));
-        padding: 12px 14px;
-        font-size: 16px;
-        color: rgb(var(--text-primary));
-        outline: none;
-        transition: border-color 0.15s ease;
-      }
-      :global(.input-base:focus) {
-        border-color: rgb(var(--accent-blue));
-        box-shadow: 0 0 0 3px rgb(var(--accent-blue) / 0.25);
-      }
-    `}</style>
+    <>
+      <div className="wait-art" aria-hidden>
+        <Clock size={44} />
+      </div>
+      <h1 className="invite-h1 text-center" style={{ margin: '6px 0 8px' }}>
+        Cadastro enviado!
+      </h1>
+      <p className="invite-sub mx-auto max-w-[320px] text-center">
+        {isCoord
+          ? 'O administrador central foi notificado e vai aprovar em instantes. Você recebe uma mensagem no WhatsApp quando estiver liberado.'
+          : 'Seu coordenador foi notificado e vai aprovar em instantes. Você recebe uma mensagem no WhatsApp quando estiver liberado pra usar o app.'}
+      </p>
+
+      <div className="invite-inviter">
+        <div className="av">
+          <ShieldCheck size={18} aria-hidden />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="name truncate">{preview.inviter_name}</div>
+          <div className="meta">
+            notificado · {isCoord ? 'admin central' : 'coordenador'}
+          </div>
+        </div>
+      </div>
+
+      <p className="invite-fine text-center">Pode fechar esta página.</p>
+    </>
+  );
+}
+
+// ─── invalid / expired ────────────────────────────────────
+function InviteInvalid({ message }: { message: string }) {
+  return (
+    <InviteShell>
+      <div className="err-art" aria-hidden>
+        <X size={44} />
+      </div>
+      <h1 className="invite-h1 text-center" style={{ margin: '6px 0 8px' }}>
+        Convite não está mais válido
+      </h1>
+      <p className="invite-sub mx-auto max-w-[320px] text-center">
+        {message}. Peça um novo convite ao seu coordenador.
+      </p>
+      <p className="invite-fine text-center">
+        Convites valem 7 dias e funcionam uma vez só, pra sua segurança.
+      </p>
+    </InviteShell>
   );
 }

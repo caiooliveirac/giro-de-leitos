@@ -176,3 +176,39 @@ export interface UnitState {
   updated_at: string;
   parser_snapshot?: ParserSnapshot | null;
 }
+
+// ---------------------------------------------------------------------------
+// Auth / invite types — alinhados com backend (auth/schemas.py).
+// ---------------------------------------------------------------------------
+
+export type InviteKind = 'coordinator' | 'professional';
+
+export interface InvitePreview {
+  type: InviteKind;
+  unit_name: string | null;
+  inviter_name: string;
+  expires_at: string;
+}
+
+export interface InviteAcceptPayload {
+  name: string;
+  cpf: string;
+  phone: string;
+  cargo: string;
+  coren_crm: string | null;
+  password: string;
+  pin: string;
+  photo_url: string;
+  lgpd_accepted: boolean;
+}
+
+export interface StaffMember {
+  id: string;
+  name: string;
+  role: UserRole;
+  cargo: string | null;
+  photo_url: string | null;
+  status: UserStatus;
+  unit_id: string | null;
+  cpf_masked: string;
+}
