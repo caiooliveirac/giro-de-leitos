@@ -1949,3 +1949,11 @@ async def dashboard_ws(websocket: WebSocket) -> None:
         manager.disconnect(websocket)
     except Exception:
         manager.disconnect(websocket)
+
+
+# ---------------------------------------------------------------------------
+# Fase 2 — Auth, convites, aprovação
+# ---------------------------------------------------------------------------
+from auth.router import router as auth_router  # noqa: E402
+
+app.include_router(auth_router)
