@@ -127,8 +127,9 @@ class ExamUpdate(BaseModel):
 class _BaseRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     version: int
-    last_updated_at: datetime
+    last_updated_at: Optional[datetime] = None
     last_updated_by: Optional[UUID] = None
+    source: Literal["manual", "parser", "default"] = "manual"
 
 
 class BedRead(_BaseRead):
@@ -161,6 +162,13 @@ class SectorConfigRead(BaseModel):
     capacity: Optional[int] = None
 
 
+class ParserSnapshot(BaseModel):
+    received_at: Optional[datetime] = None
+    is_critical: bool = False
+    raw_text: str = ""
+    unit_match_method: Optional[str] = None
+
+
 class UnitStateResponse(BaseModel):
     unit: dict[str, Any]
     sectors_config: list[SectorConfigRead]
@@ -168,6 +176,7 @@ class UnitStateResponse(BaseModel):
     counters: list[CounterRead]
     specialists: list[SpecialistRead]
     exams: list[ExamRead]
+    parser_snapshot: Optional[ParserSnapshot] = None
 
 
 __all__ = [
@@ -188,5 +197,6 @@ __all__ = [
     "CounterRead",
     "SpecialistRead",
     "ExamRead",
+    "ParserSnapshot",
     "UnitStateResponse",
 ]

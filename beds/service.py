@@ -100,8 +100,221 @@ def _serialize_exam(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Parser → new-app projection (pure, DB-free)
+# ---------------------------------------------------------------------------
+# Maps Type-B counter sector_key → (occupied_col, capacity_col) in
+# ``current_unit_status``. Sectors absent from this map have no parser source
+# and project to 0/0.
+COUNTER_PARSER_MAP: dict[str, tuple[str, str]] = {
+    "yellow_unisex": ("yellow_occupied", "yellow_capacity"),
+    "yellow_male": ("yellow_male_occupied", "yellow_male_capacity"),
+    "yellow_female": ("yellow_female_occupied", "yellow_female_capacity"),
+    "isolation_adult_m": ("isolation_male_occupied", "isolation_male_capacity"),
+    "isolation_adult_f": ("isolation_female_occupied", "isolation_female_capacity"),
+    "isolation_adult_unisex": ("isolation_total_occupied", "isolation_total_capacity"),
+    "isolation_pediatric": ("isolation_pediatric_occupied", "isolation_pediatric_capacity"),
+}
+
+# Type-C specialists whose presence is reflected in ``current_unit_status``.
+SPECIALIST_PARSER_MAP: dict[str, str] = {
+    "orthopedist": "has_orthopedist",
+    "surgeon": "has_surgeon",
+}
+
+
+def project_parser_state(
+    parser_row: Optional[dict[str, Any]],
+    sectors_config: list[dict[str, Any]] | dict[str, dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Project parser state (``current_unit_status`` row) onto the new-app
+    resource shape.
+
+    Pure: no DB access. Used by ``get_unit_state`` when there is no manual
+    row yet for a given resource, and exercised by unit tests.
+
+    ``parser_row`` may be ``None`` (parser never saw this unit).
+    ``sectors_config`` is either a list of {sector_key, enabled, capacity}
+    dicts (as returned by ``get_unit_state``) or a dict keyed by sector_key.
+    Returns a dict with keys ``beds``, ``counters``, ``specialists``, ``exams``,
+    each a list of projected resource dicts ready to merge into the response.
+    """
+    if isinstance(sectors_config, list):
+        cfg = {item["sector_key"]: item for item in sectors_config}
+    else:
+        cfg = sectors_config
+
+    received_at = parser_row.get("received_at") if parser_row else None
+
+    # --- counters --------------------------------------------------------
+    counters: list[dict[str, Any]] = []
+    for key in SECTOR_TYPE_B_COUNTERS:
+        sec = cfg.get(key)
+        if not sec or not sec.get("enabled"):
+            continue
+        occ, cap = 0, 0
+        if parser_row and key in COUNTER_PARSER_MAP:
+            occ_col, cap_col = COUNTER_PARSER_MAP[key]
+            occ = parser_row.get(occ_col) or 0
+            cap = parser_row.get(cap_col) or 0
+        source = "parser" if (parser_row and key in COUNTER_PARSER_MAP) else "default"
+        counters.append(
+            {
+                "sector_key": key,
+                "occupancy": occ,
+                "capacity": cap,
+                "version": 0,
+                "last_updated_at": received_at,
+                "last_updated_by": None,
+                "source": source,
+            }
+        )
+
+    # --- specialists -----------------------------------------------------
+    specialists: list[dict[str, Any]] = []
+    for key in SECTOR_TYPE_C_SPECIALISTS:
+        sec = cfg.get(key)
+        if not sec or not sec.get("enabled"):
+            continue
+        if parser_row and key in SPECIALIST_PARSER_MAP:
+            flag = bool(parser_row.get(SPECIALIST_PARSER_MAP[key]))
+            status = "available" if flag else "unavailable"
+            source = "parser"
+        else:
+            status = "unavailable"
+            source = "default"
+        specialists.append(
+            {
+                "sector_key": key,
+                "status": status,
+                "version": 0,
+                "last_updated_at": received_at,
+                "last_updated_by": None,
+                "source": source,
+            }
+        )
+
+    # --- exams (parser does not cover) -----------------------------------
+    exams: list[dict[str, Any]] = []
+    for key in SECTOR_TYPE_D_EXAMS:
+        sec = cfg.get(key)
+        if not sec or not sec.get("enabled"):
+            continue
+        exams.append(
+            {
+                "sector_key": key,
+                "status": "working",
+                "unavailable_reason": None,
+                "version": 0,
+                "last_updated_at": received_at,
+                "last_updated_by": None,
+                "source": "default",
+            }
+        )
+
+    # --- beds (red_room Type A) ------------------------------------------
+    beds: list[dict[str, Any]] = []
+    red_cfg = cfg.get("red_room")
+    if red_cfg and red_cfg.get("enabled"):
+        red_capacity = 0
+        red_occupied = 0
+        if parser_row:
+            red_capacity = parser_row.get("red_capacity") or 0
+            red_occupied = parser_row.get("red_occupied") or 0
+        # Cap occupied at capacity to keep invariants sane.
+        if red_capacity and red_occupied > red_capacity:
+            red_occupied = red_capacity
+        for n in range(1, red_capacity + 1):
+            occupied = n <= red_occupied
+            beds.append(
+                {
+                    "bed_number": n,
+                    "patient_sigla": "—" if occupied else None,
+                    "clinical_summary": "Aguardando detalhamento" if occupied else None,
+                    "occupied_since": None,
+                    "version": 0,
+                    "last_updated_at": received_at,
+                    "last_updated_by": None,
+                    "source": "parser" if parser_row else "default",
+                }
+            )
+
+    return {
+        "beds": beds,
+        "counters": counters,
+        "specialists": specialists,
+        "exams": exams,
+    }
+
+
+def _fetch_parser_status(conn, unit_code: Optional[str]) -> Optional[dict[str, Any]]:
+    if not unit_code:
+        return None
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT received_at, updated_at, is_critical, payload,
+                   unit_match_method, unit_match_confidence, unit_matched_alias,
+                   red_occupied, red_capacity,
+                   yellow_occupied, yellow_capacity,
+                   isolation_total_occupied, isolation_total_capacity,
+                   isolation_female_occupied, isolation_female_capacity,
+                   isolation_male_occupied, isolation_male_capacity,
+                   isolation_pediatric_occupied, isolation_pediatric_capacity,
+                   has_orthopedist, has_surgeon, has_psychiatrist
+              FROM current_unit_status
+             WHERE unit_code = %s
+             ORDER BY received_at DESC
+             LIMIT 1
+            """,
+            (unit_code,),
+        )
+        return cur.fetchone()
+
+
+def _yellow_male_female_from_payload(
+    parser_row: dict[str, Any] | None,
+) -> dict[str, int | None]:
+    """Extract yellow_male / yellow_female occupied+capacity from the parser
+    ``payload`` JSONB blob (those columns don't exist as top-level fields on
+    ``current_unit_status``). Returns keys expected by ``COUNTER_PARSER_MAP``.
+    """
+    out: dict[str, int | None] = {
+        "yellow_male_occupied": None,
+        "yellow_male_capacity": None,
+        "yellow_female_occupied": None,
+        "yellow_female_capacity": None,
+    }
+    if not parser_row:
+        return out
+    payload = parser_row.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            import json as _json
+
+            payload = _json.loads(payload)
+        except Exception:
+            payload = {}
+    rooms = (payload.get("rooms") or {}) if isinstance(payload, dict) else {}
+    ymale = rooms.get("yellow_male") or {}
+    yfem = rooms.get("yellow_female") or {}
+    if isinstance(ymale, dict):
+        out["yellow_male_occupied"] = ymale.get("occupied")
+        out["yellow_male_capacity"] = ymale.get("capacity")
+    if isinstance(yfem, dict):
+        out["yellow_female_occupied"] = yfem.get("occupied")
+        out["yellow_female_capacity"] = yfem.get("capacity")
+    return out
+
+
 def get_unit_state(conn, unit_id: str) -> dict[str, Any]:
-    """Return the full state of a unit — sectors, beds, counters, specs, exams."""
+    """Return the full state of a unit — sectors, beds, counters, specs, exams.
+
+    When a manual row is missing for a given enabled resource, the parser's
+    latest ``current_unit_status`` row is projected in-memory (``version=0``,
+    ``source="parser"`` or ``"default"``). The first manual edit creates a
+    real row with ``version=1``.
+    """
     unit = _get_unit(conn, unit_id)
 
     # sectors_config — fill defaults for every known key.
@@ -127,7 +340,14 @@ def get_unit_state(conn, unit_id: str) -> dict[str, Any]:
             }
         )
 
-    # beds (red_room only — Type A)
+    # Parser snapshot from current_unit_status (joined on unit.code).
+    parser_row = _fetch_parser_status(conn, unit.get("code"))
+    parser_row_for_projection: Optional[dict[str, Any]] = None
+    if parser_row:
+        parser_row_for_projection = dict(parser_row)
+        parser_row_for_projection.update(_yellow_male_female_from_payload(parser_row))
+
+    # beds (red_room only — Type A) — manual rows first.
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -139,16 +359,13 @@ def get_unit_state(conn, unit_id: str) -> dict[str, Any]:
             """,
             (unit_id,),
         )
-        beds = [_serialize_bed(r) for r in cur.fetchall()]
+        beds_rows = [_serialize_bed(r) for r in cur.fetchall()]
+    for b in beds_rows:
+        b["source"] = "manual"
 
-    # counters / specialists / exams — only rows for enabled sectors of each type.
     enabled_counter_keys = [k for k in SECTOR_TYPE_B_COUNTERS if by_key.get(k) and by_key[k]["enabled"]]
     enabled_spec_keys = [k for k in SECTOR_TYPE_C_SPECIALISTS if by_key.get(k) and by_key[k]["enabled"]]
     enabled_exam_keys = [k for k in SECTOR_TYPE_D_EXAMS if by_key.get(k) and by_key[k]["enabled"]]
-
-    counters: list[dict[str, Any]] = []
-    specialists: list[dict[str, Any]] = []
-    exams: list[dict[str, Any]] = []
 
     with conn.cursor() as cur:
         cur.execute(
@@ -178,18 +395,61 @@ def get_unit_state(conn, unit_id: str) -> dict[str, Any]:
         )
         exams = [_serialize_exam(r) for r in cur.fetchall()]
 
-    # Filter to enabled sectors only.
-    counters = [c for c in counters if c["sector_key"] in enabled_counter_keys]
-    specialists = [s for s in specialists if s["sector_key"] in enabled_spec_keys]
-    exams = [e for e in exams if e["sector_key"] in enabled_exam_keys]
+    counters = [{**c, "source": "manual"} for c in counters if c["sector_key"] in enabled_counter_keys]
+    specialists = [{**s, "source": "manual"} for s in specialists if s["sector_key"] in enabled_spec_keys]
+    exams = [{**e, "source": "manual"} for e in exams if e["sector_key"] in enabled_exam_keys]
+
+    # Projection — fill enabled resources lacking a manual row.
+    projected = project_parser_state(parser_row_for_projection, sectors_config)
+
+    have_counter_keys = {c["sector_key"] for c in counters}
+    for pc in projected["counters"]:
+        if pc["sector_key"] not in have_counter_keys:
+            counters.append(pc)
+
+    have_spec_keys = {s["sector_key"] for s in specialists}
+    for ps in projected["specialists"]:
+        if ps["sector_key"] not in have_spec_keys:
+            specialists.append(ps)
+
+    have_exam_keys = {e["sector_key"] for e in exams}
+    for pe in projected["exams"]:
+        if pe["sector_key"] not in have_exam_keys:
+            exams.append(pe)
+
+    if not beds_rows:
+        beds_rows = projected["beds"]
+
+    # parser_snapshot — small payload for the frontend to render
+    # "última atualização via WhatsApp".
+    parser_snapshot: Optional[dict[str, Any]] = None
+    if parser_row:
+        raw_text = ""
+        payload = parser_row.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                import json as _json
+
+                payload = _json.loads(payload)
+            except Exception:
+                payload = {}
+        if isinstance(payload, dict):
+            raw_text = str(payload.get("raw_text") or payload.get("text") or "")
+        parser_snapshot = {
+            "received_at": parser_row.get("received_at"),
+            "is_critical": bool(parser_row.get("is_critical")),
+            "raw_text": raw_text[:200],
+            "unit_match_method": parser_row.get("unit_match_method"),
+        }
 
     return {
         "unit": unit,
         "sectors_config": sectors_config,
-        "beds": beds,
+        "beds": beds_rows,
         "counters": counters,
         "specialists": specialists,
         "exams": exams,
+        "parser_snapshot": parser_snapshot,
     }
 
 
@@ -580,6 +840,9 @@ __all__ = [
     "VersionConflict",
     "NotFound",
     "get_unit_state",
+    "project_parser_state",
+    "COUNTER_PARSER_MAP",
+    "SPECIALIST_PARSER_MAP",
     "put_sector_config",
     "upsert_bed",
     "discharge_bed",

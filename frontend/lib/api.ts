@@ -112,6 +112,8 @@ export interface Unit {
   active: boolean;
 }
 
+export type ResourceSource = 'manual' | 'parser' | 'default';
+
 export interface Bed {
   id: number;
   unit_id: string;
@@ -122,6 +124,7 @@ export interface Bed {
   last_updated_by: string | null;
   last_updated_at: string;
   version: number;
+  source?: ResourceSource;
 }
 
 export interface Counter {
@@ -131,6 +134,7 @@ export interface Counter {
   capacity: number;
   last_updated_at: string;
   version: number;
+  source?: ResourceSource;
 }
 
 export type SpecialistStatus = 'available' | 'unavailable' | 'on_call';
@@ -141,6 +145,7 @@ export interface Specialist {
   status: SpecialistStatus;
   last_updated_at: string;
   version: number;
+  source?: ResourceSource;
 }
 
 export type ExamStatus = 'working' | 'unavailable';
@@ -152,6 +157,14 @@ export interface Exam {
   unavailable_reason: string | null;
   last_updated_at: string;
   version: number;
+  source?: ResourceSource;
+}
+
+export interface ParserSnapshot {
+  received_at: string | null;
+  is_critical: boolean;
+  raw_text: string;
+  unit_match_method: string | null;
 }
 
 export interface UnitState {
@@ -161,4 +174,5 @@ export interface UnitState {
   specialists: Specialist[];
   exams: Exam[];
   updated_at: string;
+  parser_snapshot?: ParserSnapshot | null;
 }
