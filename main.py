@@ -1957,3 +1957,25 @@ async def dashboard_ws(websocket: WebSocket) -> None:
 from auth.router import router as auth_router  # noqa: E402
 
 app.include_router(auth_router)
+
+
+# ---------------------------------------------------------------------------
+# Fase 3 — Beds, sectors, counters, specialists, exams
+# ---------------------------------------------------------------------------
+from beds.router import router as beds_router  # noqa: E402
+from beds.ws import unit_manager  # noqa: E402
+
+app.include_router(beds_router)
+
+
+@app.websocket("/ws/unit/{unit_id}")
+async def unit_websocket(websocket: WebSocket, unit_id: str) -> None:
+    await websocket.accept()
+    await unit_manager.connect(websocket, unit_id)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        unit_manager.disconnect(websocket)
+    except Exception:
+        unit_manager.disconnect(websocket)
