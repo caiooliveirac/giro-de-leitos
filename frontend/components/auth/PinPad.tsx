@@ -11,8 +11,14 @@ interface PinPadProps {
   error?: string | null;
   title?: string;
   description?: string;
+  compact?: boolean;
 }
 
+// Disposição idêntica ao design/src/pin.jsx:
+// 1 2 3
+// 4 5 6
+// 7 8 9
+// ·  0  ⌫
 const KEYS: Array<{ label: string; value: string | 'del' | 'noop'; aria: string }> = [
   { label: '1', value: '1', aria: 'Dígito 1' },
   { label: '2', value: '2', aria: 'Dígito 2' },
@@ -35,18 +41,22 @@ export function PinPad({
   error,
   title = 'Confirme com seu PIN',
   description,
+  compact = false,
 }: PinPadProps) {
   const [pin, setPin] = useState('');
   const [internalError, setInternalError] = useState<string | null>(null);
+  const [shaking, setShaking] = useState(false);
   const controls = useAnimationControls();
 
   const message = error ?? internalError;
 
   const triggerShake = useCallback(async () => {
+    setShaking(true);
     await controls.start({
       x: [0, -10, 10, -8, 8, -4, 4, 0],
       transition: { duration: 0.45 },
     });
+    setShaking(false);
   }, [controls]);
 
   useEffect(() => {
@@ -64,20 +74,31 @@ export function PinPad({
         setPin((p) => p.slice(0, -1));
         return;
       }
+      if (pin.length >= length) return;
       const next = (pin + value).slice(0, length);
       setPin(next);
       if (next.length === length) {
-        try {
-          await onSubmit(next);
-        } catch {
-          setInternalError('PIN incorreto');
-          setPin('');
-          void triggerShake();
-        }
+        // 120ms tick pro último ponto preencher visualmente
+        setTimeout(() => {
+          void (async () => {
+            try {
+              await onSubmit(next);
+            } catch {
+              setInternalError('PIN incorreto · tente de novo');
+              setPin('');
+              void triggerShake();
+            }
+          })();
+        }, 120);
       }
     },
     [pin, length, onSubmit, triggerShake],
   );
+
+  const dotSize = compact ? 'h-2.5 w-2.5' : 'h-3.5 w-3.5';
+  const keyHeight = compact ? 'h-12' : 'h-16';
+  const keyRadius = compact ? 'rounded-2xl' : 'rounded-[22px]';
+  const keyFont = compact ? 'text-xl' : 'text-[26px]';
 
   return (
     <motion.div
@@ -85,20 +106,24 @@ export function PinPad({
       initial={{ opacity: 0, y: -8 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ type: 'spring', stiffness: 360, damping: 30 }}
-      className="mt-3 rounded-card border border-border bg-card p-4"
+      className={
+        compact
+          ? 'mt-3 flex flex-col items-center'
+          : 'mt-3 rounded-card border border-line bg-surface-elev p-4'
+      }
       role="group"
       aria-label="Teclado de PIN"
     >
-      <div className="text-center">
-        <p className="text-sm font-medium text-text-primary">{title}</p>
-        {description && (
-          <p className="mt-1 text-xs text-text-secondary">{description}</p>
-        )}
-      </div>
+      {!compact && (
+        <div className="text-center">
+          <p className="text-sm font-semibold text-ink">{title}</p>
+          {description && <p className="mt-1 text-xs text-ink-2">{description}</p>}
+        </div>
+      )}
 
       <motion.div
         animate={controls}
-        className="mt-4 flex items-center justify-center gap-3"
+        className={`flex items-center justify-center ${compact ? 'mb-3 mt-4 gap-2.5' : 'mb-5 mt-6 gap-3.5'}`}
       >
         {Array.from({ length }).map((_, i) => {
           const filled = i < pin.length;
@@ -106,59 +131,59 @@ export function PinPad({
             <motion.div
               key={i}
               layout
-              className={`h-3.5 w-3.5 rounded-full border ${
-                filled
-                  ? 'border-accent-blue bg-accent-blue'
-                  : 'border-border bg-transparent'
+              className={`${dotSize} rounded-full border-[1.5px] ${
+                shaking
+                  ? 'border-critical bg-critical'
+                  : filled
+                    ? 'border-ink bg-ink'
+                    : 'border-line-strong bg-transparent'
               }`}
-              animate={{ scale: filled ? 1.15 : 1 }}
+              animate={{ scale: filled ? 1.08 : 1 }}
               transition={{ type: 'spring', stiffness: 500, damping: 24 }}
             />
           );
         })}
       </motion.div>
 
-      {message && (
-        <p className="mt-2 text-center text-xs font-medium text-accent-red" role="alert">
-          {message}
-        </p>
-      )}
-
-      <div className="mx-auto mt-5 grid max-w-[280px] grid-cols-3 gap-3">
+      <div
+        className={`mx-auto grid w-full max-w-[300px] grid-cols-3 ${compact ? 'gap-2' : 'gap-2.5 px-2'}`}
+      >
         {KEYS.map((k, idx) => {
           if (k.value === 'noop') {
             return <div key={`empty-${idx}`} aria-hidden />;
           }
           return (
-            <motion.div
+            <motion.button
               key={`${k.label}-${idx}`}
-              role="button"
-              tabIndex={0}
+              type="button"
               aria-label={k.aria}
-              whileTap={{ scale: 0.92 }}
+              whileTap={{ scale: 0.93 }}
               onClick={() => void handlePress(k.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  void handlePress(k.value);
-                }
-              }}
-              className="flex h-[64px] cursor-pointer select-none items-center justify-center rounded-pill bg-surface text-2xl font-semibold tabular-nums text-text-primary transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-card hover:bg-border/40"
+              className={`flex ${keyHeight} ${keyRadius} ${keyFont} items-center justify-center border border-line bg-surface-elev font-medium tabular-nums text-ink transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--surface)] active:bg-surface-2`}
             >
-              {k.value === 'del' ? <Delete size={22} aria-hidden /> : k.label}
-            </motion.div>
+              {k.value === 'del' ? <Delete size={compact ? 18 : 22} aria-hidden /> : k.label}
+            </motion.button>
           );
         })}
       </div>
+
+      {message && (
+        <p
+          className="mt-3.5 text-center text-xs font-medium text-critical-ink"
+          role="alert"
+        >
+          {message}
+        </p>
+      )}
 
       {onCancel && (
         <div className="mt-4 flex justify-center">
           <button
             type="button"
             onClick={onCancel}
-            className="text-sm text-text-secondary underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-card"
+            className="text-sm text-ink-2 underline-offset-2 hover:underline focus-visible:outline-none"
           >
-            Cancelar
+            cancelar
           </button>
         </div>
       )}

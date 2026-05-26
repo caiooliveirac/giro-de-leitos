@@ -255,10 +255,14 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <section className="mt-7 first:mt-2">
-      <div className="mb-2.5 px-1">
-        <h2 className="text-[22px] font-semibold tracking-tight text-text-primary">{title}</h2>
-        {subtitle && <p className="mt-0.5 text-xs text-text-secondary">{subtitle}</p>}
+    <section className="mt-6 first:mt-2">
+      <div className="mb-2 flex items-baseline justify-between gap-3 px-1 pt-3">
+        <h2 className="truncate text-[11px] font-semibold uppercase tracking-[0.14em] text-ink-3">
+          {title}
+        </h2>
+        {subtitle && (
+          <p className="shrink-0 text-[13px] tabular-nums text-ink-2">{subtitle}</p>
+        )}
       </div>
       {children}
     </section>

@@ -5,23 +5,84 @@
 @tailwind utilities;
 
 @layer base {
+  * {
+    box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
+  }
   html,
   body {
     height: 100%;
+    margin: 0;
+    padding: 0;
+  }
+  :root {
+    --font-sans: 'Geist', system-ui, -apple-system, sans-serif;
   }
   body {
-    @apply bg-surface text-text-primary font-sans antialiased;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-feature-settings: 'ss01', 'cv11';
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
   }
-  * {
-    @apply border-border;
+  button {
+    font-family: inherit;
+    color: inherit;
   }
 }
 
 @layer components {
-  .card-ios {
-    @apply bg-card rounded-card shadow-card border border-border/40 p-6;
+  /* ─ tabular nums helper ─ */
+  .tnum {
+    font-variant-numeric: tabular-nums;
   }
+
+  /* ─ legacy card (mantida pra não quebrar componentes da Fase 5) ─ */
+  .card-ios {
+    background: var(--surface-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    box-shadow: var(--shadow-card);
+    padding: 1.5rem;
+  }
+
+  /* ─ live pill (TopBar) ─ */
+  .live-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--ink-2);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    padding: 6px 10px;
+    border-radius: 100px;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+  .live-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 0 0 color-mix(in oklch, var(--success) 60%, transparent);
+    animation: gl-live-pulse 2s infinite;
+  }
+  @keyframes gl-live-pulse {
+    0%   { box-shadow: 0 0 0 0 color-mix(in oklch, var(--success) 60%, transparent); }
+    70%  { box-shadow: 0 0 0 8px color-mix(in oklch, var(--success) 0%, transparent); }
+    100% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--success) 0%, transparent); }
+  }
+
+  /* ─ shake (PIN errado) ─ */
+  @keyframes gl-shake {
+    0%, 100% { transform: translateX(0); }
+    20% { transform: translateX(-6px); }
+    40% { transform: translateX(6px); }
+    60% { transform: translateX(-4px); }
+    80% { transform: translateX(4px); }
+  }
+  .animate-gl-shake { animation: gl-shake 320ms ease; }
 }

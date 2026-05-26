@@ -1,25 +1,101 @@
+/* ─────────────────────────────────────────────
+   Giro de Leitos · tokens semânticos
+   Fonte: design/styles.css (oklch). Mantém aliases
+   legados (--text-primary, --accent-red…) pra não
+   quebrar componentes da fase anterior.
+   ───────────────────────────────────────────── */
+
 :root {
-  --surface: 247 247 250;
-  --card: 255 255 255;
-  --border: 229 229 234;
-  --text-primary: 15 15 17;
-  --text-secondary: 99 99 102;
-  --text-tertiary: 174 174 178;
-  --accent-red: 255 59 48;
-  --accent-amber: 255 149 0;
-  --accent-green: 52 199 89;
-  --accent-blue: 10 132 255;
+  /* superfícies */
+  --bg:           oklch(0.985 0.006 80);
+  --surface:      oklch(0.97 0.008 85);
+  --surface-2:    oklch(0.94 0.012 85);
+  --surface-elev: #ffffff;
+  --line:         oklch(0.9 0.01 85);
+  --line-strong:  oklch(0.82 0.012 85);
+
+  /* tipografia */
+  --ink:    oklch(0.22 0.01 85);
+  --ink-2:  oklch(0.45 0.008 85);
+  --ink-3:  oklch(0.62 0.006 85);
+  --ink-on-color: #fff;
+
+  /* críticos / status */
+  --critical:      oklch(0.62 0.22 25);
+  --critical-soft: oklch(0.95 0.04 25);
+  --critical-ink:  oklch(0.45 0.18 25);
+
+  --success:      oklch(0.66 0.16 150);
+  --success-soft: oklch(0.95 0.045 150);
+  --success-ink:  oklch(0.42 0.13 150);
+
+  --warning:      oklch(0.78 0.16 75);
+  --warning-soft: oklch(0.96 0.05 75);
+  --warning-ink:  oklch(0.52 0.13 75);
+
+  --obit:      oklch(0.42 0.14 20);
+  --obit-soft: oklch(0.92 0.04 20);
+
+  --accent:      oklch(0.56 0.14 250);
+  --accent-soft: oklch(0.95 0.035 250);
+
+  --neutral:      oklch(0.72 0.012 85);
+
+  --r-sm: 12px;
+  --r-md: 18px;
+  --r-lg: 24px;
+  --r-xl: 32px;
+
+  --shadow-card: 0 1px 0 oklch(0.96 0.01 85), 0 1px 2px oklch(0.85 0.012 85 / 0.4);
+  --shadow-pop:  0 12px 32px oklch(0.5 0.01 85 / 0.18);
+
+  --spring: cubic-bezier(0.34, 1.2, 0.4, 1);
+  --ease:   cubic-bezier(0.4, 0.0, 0.2, 1);
+
+  /* ── aliases legados (Tailwind colors mapeiam aqui) ── */
+  --text-primary:   var(--ink);
+  --text-secondary: var(--ink-2);
+  --text-tertiary:  var(--ink-3);
+  --card:           var(--surface-elev);
+  --border:         var(--line);
+  --accent-red:     var(--critical);
+  --accent-amber:   var(--warning);
+  --accent-green:   var(--success);
+  --accent-blue:    var(--accent);
 }
 
-.dark {
-  --surface: 0 0 0;
-  --card: 28 28 30;
-  --border: 58 58 60;
-  --text-primary: 255 255 255;
-  --text-secondary: 141 141 147;
-  --text-tertiary: 99 99 102;
-  --accent-red: 255 69 58;
-  --accent-amber: 255 159 10;
-  --accent-green: 48 209 88;
-  --accent-blue: 10 132 255;
+[data-theme="dark"] {
+  --bg:           oklch(0.16 0.008 270);
+  --surface:      oklch(0.21 0.01 270);
+  --surface-2:    oklch(0.25 0.012 270);
+  --surface-elev: oklch(0.27 0.013 270);
+  --line:         oklch(0.3 0.012 270);
+  --line-strong:  oklch(0.4 0.014 270);
+
+  --ink:   oklch(0.96 0.008 85);
+  --ink-2: oklch(0.74 0.01 85);
+  --ink-3: oklch(0.58 0.012 85);
+
+  --critical:      oklch(0.7 0.21 25);
+  --critical-soft: oklch(0.3 0.11 25);
+  --critical-ink:  oklch(0.85 0.17 25);
+
+  --success:      oklch(0.72 0.18 150);
+  --success-soft: oklch(0.28 0.09 150);
+  --success-ink:  oklch(0.82 0.16 150);
+
+  --warning:      oklch(0.8 0.16 75);
+  --warning-soft: oklch(0.32 0.09 75);
+  --warning-ink:  oklch(0.88 0.14 75);
+
+  --obit:      oklch(0.58 0.18 20);
+  --obit-soft: oklch(0.3 0.11 20);
+
+  --accent:      oklch(0.72 0.14 250);
+  --accent-soft: oklch(0.3 0.1 250);
+
+  --neutral: oklch(0.4 0.012 270);
+
+  --shadow-card: 0 1px 0 oklch(0.28 0.012 270), 0 1px 2px rgba(0,0,0,0.4);
+  --shadow-pop:  0 16px 40px rgba(0,0,0,0.5);
 }
