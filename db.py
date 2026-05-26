@@ -168,6 +168,7 @@ def init_db() -> None:
                             (unit["code"], unit["canonical_name"], _json_dumps(unit["aliases"])),
                         )
                 conn.commit()
+            apply_migrations()
             return
         except psycopg.OperationalError:
             if attempts >= 15:
@@ -1657,5 +1658,41 @@ def admin_update_event(
                     )
 
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# SQL file-based migrations (auth/beds/etc)
+# ---------------------------------------------------------------------------
+
+_MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")
+
+
+def apply_migrations() -> None:
+    """Apply all .sql files under migrations/ in alphabetical order.
+
+    Each file is executed inside its own transaction. SQL files MUST be
+    idempotent (use IF NOT EXISTS / IF EXISTS guards).
+    """
+    if not is_database_configured():
+        return
+    if not os.path.isdir(_MIGRATIONS_DIR):
+        return
+
+    files = sorted(
+        name for name in os.listdir(_MIGRATIONS_DIR) if name.endswith(".sql")
+    )
+    if not files:
+        return
+
+    with _connect() as conn:
+        for filename in files:
+            full_path = os.path.join(_MIGRATIONS_DIR, filename)
+            with open(full_path, "r", encoding="utf-8") as fh:
+                sql = fh.read()
+            if not sql.strip():
+                continue
+            with conn.cursor() as cur:
+                cur.execute(sql)
+            conn.commit()
 
     return get_event_detail(event_id)
