@@ -1,3 +1,19 @@
+# ============================================================================
+# Este docker-compose.yml e para DEV LOCAL.
+#
+# Em PROD (EC2 samu):
+#   - postgres roda NATIVO no host (NAO em container). A API acessa via
+#     host.docker.internal:5432, e o pg_dump do backup roda no host.
+#   - parser-api (giro-de-leitos-api) e frontend sao gerenciados via raw
+#     `docker run` pelo workflow .github/workflows/deploy.yml (canary + swap).
+#     NAO usar `docker compose up` para subir a API/frontend em prod.
+#   - whatsapp-bridge continua sendo gerenciada via `docker compose up -d
+#     whatsapp-bridge` (sobrevive aos swaps para nao perder a sessao Baileys).
+#   - A rede `giro-de-leitos_default` e criada pelo compose e reaproveitada
+#     pelos `docker run` da API (com --network-alias parser-api).
+#
+# Em DEV local, `docker compose up` sobe tudo (incluindo postgres em container).
+# ============================================================================
 services:
   postgres:
     image: postgres:16-alpine

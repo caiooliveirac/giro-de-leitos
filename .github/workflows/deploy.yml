@@ -93,14 +93,26 @@ jobs:
             set -euo pipefail
             mkdir -p /home/ubuntu/giro-backups
             ts=$(date +%Y%m%dT%H%M%S)
-            DB_CT=$(docker ps --filter "name=giro-de-leitos-db" --format '{{.Names}}' | head -1)
-            if [ -z "$DB_CT" ]; then
-              echo "WARN: nenhum container giro-de-leitos-db* rodando, pulando backup"
+            # Postgres roda NATIVO no host (nao em container docker). pg_dump precisa
+            # estar instalado no host (deve estar; verificar com `which pg_dump`).
+            # DATABASE_URL usa host.docker.internal:5432 para que a API (em container)
+            # alcance o host; aqui, no host, trocamos por 127.0.0.1.
+            if ! command -v pg_dump > /dev/null 2>&1; then
+              echo "WARN: pg_dump nao instalado no host, pulando backup"
               exit 0
             fi
-            docker exec "$DB_CT" pg_dump -U giro giro_de_leitos | gzip > /home/ubuntu/giro-backups/db-$ts.sql.gz
+            if [ ! -f /home/ubuntu/giro-de-leitos/.deploy-env ]; then
+              echo "WARN: .deploy-env ausente, pulando backup"
+              exit 0
+            fi
+            # shellcheck disable=SC1091
+            set -a
+            source /home/ubuntu/giro-de-leitos/.deploy-env
+            set +a
+            DUMP_URL=$(echo "$DATABASE_URL" | sed 's|host.docker.internal|127.0.0.1|g')
+            pg_dump "$DUMP_URL" | gzip > /home/ubuntu/giro-backups/db-$ts.sql.gz
             ls -t /home/ubuntu/giro-backups/db-*.sql.gz | tail -n +8 | xargs -r rm
-            echo "backup: db-$ts.sql.gz"
+            echo "backup: db-$ts.sql.gz ($(du -h /home/ubuntu/giro-backups/db-$ts.sql.gz | cut -f1))"
           EOF
 
       - name: Build and swap API (canary)
@@ -124,18 +136,22 @@ jobs:
               docker tag "$IMG_PREV" giro-api:previous || true
             fi
 
-            echo "=== [api] canary em 127.0.0.1:8001 ==="
+            echo "=== [api] canary em 127.0.0.1:8051 ==="
+            # Postgres roda no host: precisamos de host.docker.internal => host-gateway
+            # para o canary conseguir conectar no DB. Canary nao precisa do alias
+            # parser-api (bridge so fala com o container final).
             docker rm -f giro-api-canary 2>/dev/null || true
             docker run -d --name giro-api-canary \
               --network giro-de-leitos_default \
+              --add-host=host.docker.internal:host-gateway \
               --env-file /home/ubuntu/giro-de-leitos/.deploy-env \
-              -p 127.0.0.1:8001:8000 \
+              -p 127.0.0.1:8051:8000 \
               "$IMG_NEW"
 
             echo "=== [api] healthcheck canary ==="
             ok=0
             for i in $(seq 1 30); do
-              if curl -fsS http://127.0.0.1:8001/api/health > /dev/null 2>&1; then
+              if curl -fsS http://127.0.0.1:8051/api/health > /dev/null 2>&1; then
                 ok=1; echo "canary OK em ${i}s"; break
               fi
               sleep 1
@@ -148,7 +164,7 @@ jobs:
             fi
 
             echo "=== [api] verificando /api/summary no canary ==="
-            curl -fsS http://127.0.0.1:8001/api/summary > /dev/null || {
+            curl -fsS http://127.0.0.1:8051/api/summary > /dev/null || {
               echo "ERRO: /api/summary falhou no canary"
               docker logs --tail 80 giro-api-canary || true
               docker rm -f giro-api-canary || true
@@ -156,10 +172,16 @@ jobs:
             }
 
             echo "=== [api] ATOMIC SWAP em 127.0.0.1:8000 ==="
+            # --network-alias parser-api: a bridge resolve http://parser-api:8000 via
+            #   DNS interno da rede docker. O nome do container ja vira primeiro alias
+            #   automatico, mas precisamos do segundo para manter compatibilidade.
+            # --add-host: postgres roda no host (host.docker.internal => host-gateway).
             docker rm -f giro-de-leitos-api 2>/dev/null || true
             docker run -d --name giro-de-leitos-api \
               --restart unless-stopped \
               --network giro-de-leitos_default \
+              --network-alias parser-api \
+              --add-host=host.docker.internal:host-gateway \
               --env-file /home/ubuntu/giro-de-leitos/.deploy-env \
               -p 127.0.0.1:8000:8000 \
               "$IMG_NEW"
@@ -209,16 +231,16 @@ jobs:
               docker tag "$IMG_PREV" giro-frontend:previous || true
             fi
 
-            echo "=== [frontend] canary em 127.0.0.1:3051 ==="
+            echo "=== [frontend] canary em 127.0.0.1:3052 ==="
             docker rm -f giro-frontend-canary 2>/dev/null || true
             docker run -d --name giro-frontend-canary \
-              -p 127.0.0.1:3051:3000 \
+              -p 127.0.0.1:3052:3000 \
               "$IMG_NEW"
 
             echo "=== [frontend] healthcheck canary ==="
             ok=0
             for i in $(seq 1 40); do
-              if curl -fsS http://127.0.0.1:3051/ > /dev/null 2>&1; then
+              if curl -fsS http://127.0.0.1:3052/ > /dev/null 2>&1; then
                 ok=1; echo "canary OK em ${i}s"; break
               fi
               sleep 1

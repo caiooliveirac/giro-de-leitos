@@ -43,7 +43,12 @@ Template:
 
 ```env
 # --- Banco ---
-DATABASE_URL=postgresql://giro:giro_seguro_2026@giro-de-leitos-db-local:5432/giro_de_leitos
+# Em prod, postgres roda NATIVO no host (nao em container docker).
+# A API roda em container e usa host.docker.internal:5432 para alcancar o host
+# (precisa de `--add-host=host.docker.internal:host-gateway` no docker run, ja
+# tratado pelo workflow). O pg_dump do step de backup roda no host e troca
+# automaticamente host.docker.internal -> 127.0.0.1 antes de chamar pg_dump.
+DATABASE_URL=postgresql://giro:SENHA_DO_HOST_POSTGRES@host.docker.internal:5432/giro_de_leitos
 
 # --- Auth / Crypto (gere com `openssl rand -hex 32` / `openssl rand -base64 32`) ---
 JWT_SECRET=__GERAR__
@@ -98,13 +103,26 @@ DNS: `giro.mnrs.com.br` deve apontar para o EC2. Em geral o wildcard da Cloudfla
 1. Cadastre os Secrets (passo 1).
 2. Crie o `.deploy-env` (passo 2).
 3. Configure nginx (passo 3).
-4. **Push em `main`** ou rode manualmente:
+4. **Verificacoes one-time no host** antes do primeiro deploy:
+
+   ```bash
+   # Portas que o workflow usa (canary 8051/3052 + prod 8000/3050) devem estar livres.
+   # 8001 esta ocupada (repo-web-1), 8050 esta ocupada (samu-onboarding); por isso
+   # usamos 8051 e 3052 para o canary.
+   ssh samu 'ss -tlnp | grep -E ":(8051|3050|3052) "'
+   # ^ retorno vazio = OK.
+
+   # pg_dump precisa estar instalado no host (postgres roda nativo, nao em docker):
+   ssh samu 'which pg_dump'
+   ```
+
+6. **Push em `main`** ou rode manualmente:
 
    ```
    GitHub -> Actions -> "Deploy" -> Run workflow -> component=both
    ```
 
-5. Pós-primeiro deploy, seed dos coordenadores (CSV não vai pelo rsync):
+7. Pós-primeiro deploy, seed dos coordenadores (CSV não vai pelo rsync):
 
    ```bash
    scp coordenadores.csv samu:/home/ubuntu/giro-de-leitos/
@@ -128,7 +146,7 @@ O workflow:
 2. rsync do source.
 3. Backup `pg_dump` do postgres (mantém últimos 8).
 4. Build `giro-api:<sha>` + `giro-frontend:<sha>`.
-5. Sobe canary em portas altas (`8001` / `3051`), healthcheck `/api/health` e `/`.
+5. Sobe canary em portas altas (`8051` / `3052`), healthcheck `/api/health` e `/`.
 6. **Atomic swap** nas portas reais (`8000` / `3050`) — downtime ~1-3s.
 7. Tagueia versão anterior como `giro-api:previous` / `giro-frontend:previous`.
 8. Notifica Telegram (se secrets presentes).
@@ -152,6 +170,8 @@ ssh samu
 docker rm -f giro-de-leitos-api
 docker run -d --name giro-de-leitos-api --restart unless-stopped \
   --network giro-de-leitos_default \
+  --network-alias parser-api \
+  --add-host=host.docker.internal:host-gateway \
   --env-file /home/ubuntu/giro-de-leitos/.deploy-env \
   -p 127.0.0.1:8000:8000 \
   giro-api:previous
@@ -167,7 +187,7 @@ docker run -d --name giro-de-leitos-api --restart unless-stopped \
 | API 502 após swap                                      | `docker logs giro-de-leitos-api --tail 100`                                  | `Actions -> Rollback`                  |
 | Bridge logando "ECONNREFUSED parser-api:8000"          | Bridge perdeu a rede docker. Rede `giro-de-leitos_default` deletada por engano | `docker network create giro-de-leitos_default` + `docker network connect` em ambos |
 | Frontend 502                                           | `docker logs giro-de-leitos-frontend`                                        | `Actions -> Rollback -> frontend`      |
-| Postgres não responde                                  | `docker ps` — container `giro-de-leitos-db-local` parado?                    | Restaurar do último dump em `/home/ubuntu/giro-backups/` |
+| Postgres não responde                                  | postgres roda nativo no host: `sudo systemctl status postgresql`             | `sudo systemctl restart postgresql`; restaurar do último dump em `/home/ubuntu/giro-backups/` se necessário |
 | QR code do WhatsApp pedindo de novo                    | Alguém parou a bridge                                                        | `docker compose up -d whatsapp-bridge` + ler logs para escanear QR |
 
 ---

@@ -48,10 +48,14 @@ jobs:
             fi
 
             echo "=== [api] swap para giro-api:previous ==="
+            # --network-alias parser-api: bridge resolve http://parser-api:8000.
+            # --add-host: postgres roda no host (host.docker.internal => host-gateway).
             docker rm -f giro-de-leitos-api 2>/dev/null || true
             docker run -d --name giro-de-leitos-api \
               --restart unless-stopped \
               --network giro-de-leitos_default \
+              --network-alias parser-api \
+              --add-host=host.docker.internal:host-gateway \
               --env-file /home/ubuntu/giro-de-leitos/.deploy-env \
               -p 127.0.0.1:8000:8000 \
               giro-api:previous
