@@ -1659,6 +1659,8 @@ def admin_update_event(
 
         conn.commit()
 
+    return get_event_detail(event_id)
+
 
 # ---------------------------------------------------------------------------
 # SQL file-based migrations (auth/beds/etc)
@@ -1694,5 +1696,3 @@ def apply_migrations() -> None:
             with conn.cursor() as cur:
                 cur.execute(sql)
             conn.commit()
-
-    return get_event_detail(event_id)
