@@ -1,3 +1,19 @@
+# docker-compose.prod.yml — Produção
+#
+# IMPORTANTE: `whatsapp-bridge` NÃO está aqui de propósito. Em produção a bridge
+# (Baileys) roda por outro caminho (compose separado / PM2 / outra máquina) e
+# NENHUM script de deploy deste repo pode parar, reiniciar ou recriar ela.
+# A bridge só precisa estar na rede `perguntas_default` para conseguir falar
+# com `parser-api:8000` (ou `giro-de-leitos-api:8000`).
+#
+# Variáveis de imagem:
+#   API_IMAGE        — imagem completa (ex: giro-api:abc1234). Default: giro-api:latest
+#   API_SHA          — alternativa: usa giro-api:${API_SHA}
+#   FRONTEND_IMAGE   — imagem completa do frontend
+#   FRONTEND_SHA     — alternativa: giro-frontend:${FRONTEND_SHA}
+#
+# `deploy/deploy.sh` exporta API_SHA / FRONTEND_SHA antes do `up`.
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -11,17 +27,47 @@ services:
       - giro_db_data:/var/lib/postgresql/data
 
   parser-api:
+    # Imagem por SHA (preferida). `build: .` permanece como fallback se a
+    # imagem não existir localmente — o pipeline de deploy SEMPRE faz build
+    # antes do `up`, então o fallback raramente é exercido.
+    image: ${API_IMAGE:-giro-api:${API_SHA:-latest}}
     build: .
     container_name: giro-de-leitos-api
     restart: unless-stopped
     depends_on:
       - postgres
     environment:
+      # --- Integrações existentes ---
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ADMIN_CHAT_ID: ${TELEGRAM_ADMIN_CHAT_ID:-}
       TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://mnrs.com.br}
       PUBLIC_WEBHOOK_PATH: ${PUBLIC_WEBHOOK_PATH:-/giro/api/webhook/telegram}
       DATABASE_URL: ${DATABASE_URL:-postgresql://giro:giro_seguro_2026@postgres:5432/giro_de_leitos}
+      WHATSAPP_BRIDGE_URL: ${WHATSAPP_BRIDGE_URL:-http://whatsapp-bridge:3000}
+      # --- Auth / Crypto (novos) ---
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET obrigatorio em producao}
+      CPF_ENCRYPTION_KEY: ${CPF_ENCRYPTION_KEY:?CPF_ENCRYPTION_KEY obrigatorio em producao}
+      CPF_HASH_PEPPER: ${CPF_HASH_PEPPER:-}
+      # --- Seed admin inicial (scripts/seed_admin.py, idempotente) ---
+      ADMIN_INITIAL_EMAIL: ${ADMIN_INITIAL_EMAIL:-}
+      ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-}
+      ADMIN_INITIAL_NAME: ${ADMIN_INITIAL_NAME:-}
+      ADMIN_INITIAL_CPF: ${ADMIN_INITIAL_CPF:-}
+      ADMIN_INITIAL_PIN: ${ADMIN_INITIAL_PIN:-}
+    networks:
+      - default
+      - shared_proxy
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-giro-frontend:${FRONTEND_SHA:-latest}}
+    container_name: giro-de-leitos-frontend
+    restart: unless-stopped
+    depends_on:
+      - parser-api
+    environment:
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: "1"
     networks:
       - default
       - shared_proxy
