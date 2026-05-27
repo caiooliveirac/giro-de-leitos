@@ -165,6 +165,36 @@ def test_self_pair_missing_body(client):
     assert resp.status_code == 422
 
 
+def test_self_pair_accepts_username(client, monkeypatch):
+    # Sem cpf, apenas username — deve passar do 422 e seguir pro lookup (401 com user None).
+    monkeypatch.setattr(auth_service, "find_user_by_username", lambda *a, **kw: None)
+    monkeypatch.setattr(auth_service, "find_user_by_cpf_digits", lambda *a, **kw: None)
+    monkeypatch.setattr(auth_service, "check_self_pair_rate_limit", lambda *a, **kw: None)
+    resp = client.post(
+        "/api/auth/device/self-pair",
+        json={
+            "username": "ivan.bairrodapaz",
+            "password": "abc123",
+            "pin": "1234",
+            "device_fingerprint": "fp-test-abc",
+        },
+    )
+    assert resp.status_code == 401
+    assert resp.json().get("detail") == "Credenciais inválidas."
+
+
+def test_self_pair_requires_username_or_cpf(client):
+    resp = client.post(
+        "/api/auth/device/self-pair",
+        json={
+            "password": "abc123",
+            "pin": "1234",
+            "device_fingerprint": "fp-test-abc",
+        },
+    )
+    assert resp.status_code == 422
+
+
 def test_self_pair_invalid_credentials(client, monkeypatch):
     # Force user lookup to fail → 401 generic message.
     monkeypatch.setattr(auth_service, "find_user_by_cpf_digits", lambda *a, **kw: None)

@@ -148,6 +148,22 @@ SELF_PAIR_WINDOW = timedelta(minutes=15)
 SELF_PAIR_MAX_FAILS = 5
 
 
+def find_user_by_username(conn, username: str) -> Optional[dict[str, Any]]:
+    if not username:
+        return None
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, name, role, status, unit_id, cargo, photo_url,
+                   cpf_encrypted, coren_crm, password_hash, pin_hash
+              FROM users
+             WHERE LOWER(username) = LOWER(%s)
+            """,
+            (username.strip(),),
+        )
+        return cur.fetchone()
+
+
 def find_user_by_cpf_digits(conn, cpf_digits: str) -> Optional[dict[str, Any]]:
     if not cpf_digits or len(cpf_digits) != 11:
         return None
@@ -210,6 +226,7 @@ def self_pair_device(
     pin: str,
     device_fingerprint: str,
     label: Optional[str],
+    username: Optional[str] = None,
 ) -> dict[str, Any]:
     """Pair a device using an existing active user's own credentials.
 
@@ -223,7 +240,10 @@ def self_pair_device(
     except Exception:  # noqa: BLE001
         cpf_hash = None
 
-    user = find_user_by_cpf_digits(conn, cpf_digits)
+    if username:
+        user = find_user_by_username(conn, username)
+    else:
+        user = find_user_by_cpf_digits(conn, cpf_digits)
     if not user:
         raise HTTPException(status_code=401, detail=_GENERIC_CREDS_MSG)
     if not crypto.verify_password(password, user.get("password_hash")):

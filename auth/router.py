@@ -222,6 +222,7 @@ def device_self_pair(
             pin=payload.pin,
             device_fingerprint=payload.device_fingerprint,
             label=payload.label,
+            username=payload.username,
         )
     except HTTPException as exc:
         # Audit failure for credential-class errors (401) and gate-class (403)

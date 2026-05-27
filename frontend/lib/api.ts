@@ -203,7 +203,8 @@ export interface InviteAcceptPayload {
 }
 
 export interface DeviceSelfPairPayload {
-  cpf: string;
+  username?: string;
+  cpf?: string;
   password: string;
   pin: string;
   device_fingerprint: string;

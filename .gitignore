@@ -22,3 +22,6 @@ postgres_data/
 # OS
 .DS_Store
 Thumbs.db
+credentials.json
+credentials.v2.json
+coordenadores.csv

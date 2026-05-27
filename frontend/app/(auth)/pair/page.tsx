@@ -12,7 +12,6 @@ import {
 import { getOrCreateDeviceFingerprint } from '@/lib/device';
 import { useToast } from '@/lib/toast';
 import { ToastViewport } from '@/components/shared/ToastViewport';
-import { formatCpf, digitsOnly, validateCpf } from '@/lib/cpf';
 
 const LENGTH = 6;
 const PIN_LENGTH = 4;
@@ -74,7 +73,7 @@ export default function PairPage() {
 
       <p className="mt-5 text-center text-[12px] text-ink-3">
         {mode === 'code'
-          ? 'Já tem cadastro? Use a aba ao lado pra parear com seu CPF/senha/PIN.'
+          ? 'Já tem cadastro? Use a aba ao lado pra parear com seu login/senha/PIN.'
           : 'Precisa do código? Peça pra um coordenador.'}
       </p>
 
@@ -252,7 +251,7 @@ function CodeMode() {
 function SelfPairMode() {
   const router = useRouter();
   const toast = useToast();
-  const [cpf, setCpf] = useState('');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [pin, setPin] = useState<string[]>(() => Array(PIN_LENGTH).fill(''));
   const [loading, setLoading] = useState(false);
@@ -260,12 +259,12 @@ function SelfPairMode() {
   const [shaking, setShaking] = useState(false);
   const pinRefs = useRef<Array<HTMLInputElement | null>>([]);
 
-  const cpfDigits = digitsOnly(cpf);
-  const cpfOk = validateCpf(cpf);
+  const usernameTrim = username.trim();
+  const usernameOk = usernameTrim.length >= 3;
   const pinStr = pin.join('');
   const pinOk = pinStr.length === PIN_LENGTH && pin.every((d) => /\d/.test(d));
-  const passwordOk = password.length >= 8;
-  const canSubmit = cpfOk && pinOk && passwordOk && !loading;
+  const passwordOk = password.length >= 6;
+  const canSubmit = usernameOk && pinOk && passwordOk && !loading;
 
   const setPinAt = (i: number, value: string) => {
     setPin((d) => {
@@ -324,7 +323,7 @@ function SelfPairMode() {
         {
           method: 'POST',
           body: JSON.stringify({
-            cpf: cpfDigits,
+            username: usernameTrim,
             password,
             pin: pinStr,
             device_fingerprint: fingerprint,
@@ -372,24 +371,26 @@ function SelfPairMode() {
       transition={{ duration: 0.38 }}
     >
       <p className="text-[14px] leading-relaxed text-ink-2">
-        Use seu CPF, senha e PIN. O aparelho fica vinculado à sua UPA por 30
+        Use seu login, senha e PIN. O aparelho fica vinculado à sua UPA por 30
         dias e seu plantão já começa.
       </p>
 
       <div className="field">
-        <label className="field-label" htmlFor="sp-cpf">
-          CPF
+        <label className="field-label" htmlFor="sp-user">
+          Login
         </label>
         <input
-          id="sp-cpf"
+          id="sp-user"
           type="text"
-          inputMode="numeric"
+          inputMode="text"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
           autoComplete="username"
-          className="input-shell tnum"
-          value={formatCpf(cpf)}
-          placeholder="000.000.000-00"
-          data-err={cpf.length >= 11 && !cpfOk}
-          onChange={(e) => setCpf(e.target.value)}
+          className="input-shell"
+          value={username}
+          placeholder="ex.: ivan.bairrodapaz"
+          onChange={(e) => setUsername(e.target.value)}
           disabled={loading}
         />
       </div>

@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -54,11 +54,18 @@ class DevicePairResponse(BaseModel):
 
 
 class DeviceSelfPair(BaseModel):
-    cpf: str = Field(min_length=11, max_length=14)
+    username: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    cpf: Optional[str] = Field(default=None, min_length=11, max_length=14)
     password: str = Field(min_length=1, max_length=128)
     pin: str = Field(min_length=4, max_length=8)
     device_fingerprint: str = Field(min_length=4, max_length=128)
     label: Optional[str] = Field(default=None, max_length=120)
+
+    @model_validator(mode="after")
+    def _one_login(self):
+        if not (self.username or self.cpf):
+            raise ValueError("Informe username ou cpf.")
+        return self
 
 
 class DeviceSelfPairResponse(BaseModel):
