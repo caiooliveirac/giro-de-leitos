@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from uuid import UUID
 
@@ -9,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from auth import service
 from auth.audit import record_audit
-from auth.crypto import decrypt_cpf, mask_cpf
+from auth.crypto import decrypt_cpf, hash_cpf, mask_cpf
 from auth.deps import (
     ADMIN_TOKEN_TTL,
     DEVICE_TOKEN_TTL,
@@ -32,6 +33,8 @@ from auth.schemas import (
     DeviceGenerateCodeResponse,
     DevicePair,
     DevicePairResponse,
+    DeviceSelfPair,
+    DeviceSelfPairResponse,
     InviteAccept,
     InviteCreate,
     InviteCreateResponse,
@@ -192,6 +195,83 @@ def device_pair(payload: DevicePair, request: Request, response: Response, conn=
         **client_meta(request),
     )
     return paired
+
+
+@router.post("/auth/device/self-pair", response_model=DeviceSelfPairResponse)
+def device_self_pair(
+    payload: DeviceSelfPair,
+    request: Request,
+    response: Response,
+    conn=Depends(get_db),
+):
+    cpf_digits = re.sub(r"\D", "", payload.cpf or "")
+    meta = client_meta(request)
+    try:
+        cpf_hash_val = hash_cpf(cpf_digits) if len(cpf_digits) == 11 else None
+    except Exception:  # noqa: BLE001
+        cpf_hash_val = None
+
+    # Pre-check rate limit (by IP and/or cpf_hash)
+    service.check_self_pair_rate_limit(conn, client_ip=meta.get("client_ip"), cpf_hash=cpf_hash_val)
+
+    try:
+        result = service.self_pair_device(
+            conn,
+            cpf_digits=cpf_digits,
+            password=payload.password,
+            pin=payload.pin,
+            device_fingerprint=payload.device_fingerprint,
+            label=payload.label,
+        )
+    except HTTPException as exc:
+        # Audit failure for credential-class errors (401) and gate-class (403)
+        if exc.status_code in (401, 403):
+            record_audit(
+                conn,
+                action="device.self_pair.fail",
+                entity_type="cpf_hash",
+                entity_id=cpf_hash_val,
+                new_value={"reason": exc.detail, "status": exc.status_code},
+                **meta,
+            )
+        raise
+
+    device_token = encode_token(
+        {
+            "scope": "device",
+            "unit_id": str(result["unit_id"]),
+            "device_id": result["device_id"],
+        },
+        DEVICE_TOKEN_TTL,
+    )
+    set_device_cookie(response, device_token)
+    session_token = encode_token(
+        {
+            "scope": "shift",
+            "session_id": str(result["session"]["id"]),
+            "sub": str(result["user"]["id"]),
+        },
+        SHIFT_TOKEN_TTL,
+    )
+    set_session_cookie(response, session_token)
+    record_audit(
+        conn,
+        actor_user_id=result["user"]["id"],
+        session_id=result["session"]["id"],
+        device_id=result["device_id"],
+        action="device.self_pair",
+        entity_type="device",
+        entity_id=result["device_id"],
+        new_value={"unit_id": str(result["unit_id"])},
+        **meta,
+    )
+    return DeviceSelfPairResponse(
+        device_id=result["device_id"],
+        unit_id=result["unit_id"],
+        session_id=result["session"]["id"],
+        expires_at=result["session"]["expires_at"],
+        user=_user_public(result["user"]),
+    )
 
 
 # ---------------------------------------------------------------------------

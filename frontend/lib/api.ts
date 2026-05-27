@@ -202,6 +202,36 @@ export interface InviteAcceptPayload {
   lgpd_accepted: boolean;
 }
 
+export interface DeviceSelfPairPayload {
+  cpf: string;
+  password: string;
+  pin: string;
+  device_fingerprint: string;
+  label?: string | null;
+}
+
+export interface DeviceSelfPairResponse {
+  device_id: string;
+  unit_id: string;
+  session_id: string;
+  expires_at: string;
+  user: {
+    id: string;
+    name: string;
+    role: UserRole;
+    cargo: string | null;
+    photo_url: string | null;
+    status: UserStatus;
+    unit_id: string | null;
+    cpf_masked: string;
+  };
+}
+
+export interface PairingCodeResponse {
+  pairing_code: string;
+  expires_at: string;
+}
+
 export interface StaffMember {
   id: string;
   name: string;

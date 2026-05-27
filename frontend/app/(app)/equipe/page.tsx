@@ -11,7 +11,7 @@ import {
   UserRound,
   X,
 } from 'lucide-react';
-import { apiFetch, ApiError } from '@/lib/api';
+import { apiFetch, ApiError, type PairingCodeResponse } from '@/lib/api';
 import { useToast } from '@/lib/toast';
 import { useCurrentUser } from '@/hooks/useCurrentUser';
 import { TopBar } from '@/components/shared/TopBar';
@@ -149,6 +149,13 @@ export default function EquipePage() {
               <InviteCard invite={invite} onReset={() => setInvite(null)} />
             )}
           </div>
+        </Section>
+
+        <Section
+          title="Adicionar aparelho"
+          subtitle="Gera um código de 6 dígitos pra parear um tablet desta UPA"
+        >
+          <PairingCodeBlock unitId={user?.unit_id ?? null} />
         </Section>
 
         <Section title="Pendentes" subtitle="Toque ✓ para aprovar. Mantenha ✗ pra rejeitar.">
@@ -383,6 +390,127 @@ function PendingCard({
         </div>
       </div>
     </motion.div>
+  );
+}
+
+function PairingCodeBlock({ unitId }: { unitId: string | null }) {
+  const toast = useToast();
+  const [code, setCode] = useState<PairingCodeResponse | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [now, setNow] = useState<number>(() => Date.now());
+
+  useEffect(() => {
+    if (!code) return;
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [code]);
+
+  const expiresMs = code ? new Date(code.expires_at).getTime() : 0;
+  const remainingSec = code ? Math.max(0, Math.floor((expiresMs - now) / 1000)) : 0;
+  const expired = code != null && remainingSec === 0;
+
+  useEffect(() => {
+    if (expired) setCode(null);
+  }, [expired]);
+
+  const mmss = (() => {
+    const m = Math.floor(remainingSec / 60);
+    const s = remainingSec % 60;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  })();
+
+  const generate = async () => {
+    if (!unitId) {
+      toast.error('Sua unidade não foi identificada.');
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await apiFetch<PairingCodeResponse>(
+        '/api/auth/device/generate-code',
+        {
+          method: 'POST',
+          body: JSON.stringify({ unit_id: unitId }),
+        },
+      );
+      setCode(res);
+      setNow(Date.now());
+      toast.success('Código gerado · válido por 10 min');
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : 'Falha ao gerar código.';
+      toast.error(msg);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copy = async () => {
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code.pairing_code);
+      toast.success('Código copiado');
+    } catch {
+      toast.error('Não foi possível copiar');
+    }
+  };
+
+  const waUrl = code
+    ? `https://wa.me/?text=${encodeURIComponent(
+        `Código de pareamento: ${code.pairing_code} (válido por 10min)`,
+      )}`
+    : '#';
+
+  return (
+    <div className="rounded-card border border-border bg-card p-4">
+      {!code && (
+        <button
+          type="button"
+          onClick={() => void generate()}
+          disabled={busy || !unitId}
+          className="flex w-full items-center justify-center gap-2 rounded-pill bg-accent-blue px-5 py-3 text-base font-semibold text-white disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+        >
+          {busy ? 'Gerando…' : 'Gerar código de pareamento'}
+        </button>
+      )}
+
+      {code && (
+        <div className="space-y-3 text-center">
+          <p className="text-xs text-text-secondary">
+            Digite este código no aparelho a ser pareado.
+          </p>
+          <div className="tnum text-[40px] font-semibold tracking-[0.32em] text-text-primary">
+            {code.pairing_code}
+          </div>
+          <p className="text-[11px] uppercase tracking-wider text-text-tertiary">
+            expira em <span className="tnum text-text-secondary">{mmss}</span>
+          </p>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => void copy()}
+              className="flex items-center justify-center gap-1.5 rounded-pill border border-border bg-surface px-3 py-2 text-sm font-medium text-text-primary transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue hover:bg-border/40"
+            >
+              <Copy size={14} /> Copiar
+            </button>
+            <a
+              href={waUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center justify-center gap-1.5 rounded-pill bg-accent-green px-3 py-2 text-sm font-semibold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-green"
+            >
+              <MessageCircle size={14} /> WhatsApp
+            </a>
+          </div>
+          <button
+            type="button"
+            onClick={() => setCode(null)}
+            className="text-xs text-text-secondary hover:text-text-primary"
+          >
+            Gerar outro código
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 

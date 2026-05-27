@@ -53,6 +53,22 @@ class DevicePairResponse(BaseModel):
     expires_at: datetime
 
 
+class DeviceSelfPair(BaseModel):
+    cpf: str = Field(min_length=11, max_length=14)
+    password: str = Field(min_length=1, max_length=128)
+    pin: str = Field(min_length=4, max_length=8)
+    device_fingerprint: str = Field(min_length=4, max_length=128)
+    label: Optional[str] = Field(default=None, max_length=120)
+
+
+class DeviceSelfPairResponse(BaseModel):
+    device_id: str
+    unit_id: UUID
+    session_id: UUID
+    expires_at: datetime
+    user: "UserPublic"
+
+
 # ---------------------------------------------------------------------------
 # Shift / PIN
 # ---------------------------------------------------------------------------
@@ -157,3 +173,6 @@ class PendingUser(BaseModel):
 class ApproveResponse(BaseModel):
     id: UUID
     status: str
+
+
+DeviceSelfPairResponse.model_rebuild()

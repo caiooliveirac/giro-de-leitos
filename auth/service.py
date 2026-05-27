@@ -141,6 +141,159 @@ def pair_device(
 
 
 # ---------------------------------------------------------------------------
+# Self-pair (device pairing by existing user without coordinator code)
+# ---------------------------------------------------------------------------
+_GENERIC_CREDS_MSG = "Credenciais inválidas."
+SELF_PAIR_WINDOW = timedelta(minutes=15)
+SELF_PAIR_MAX_FAILS = 5
+
+
+def find_user_by_cpf_digits(conn, cpf_digits: str) -> Optional[dict[str, Any]]:
+    if not cpf_digits or len(cpf_digits) != 11:
+        return None
+    try:
+        cpf_hash = crypto.hash_cpf(cpf_digits)
+    except Exception:  # noqa: BLE001
+        return None
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, name, role, status, unit_id, cargo, photo_url,
+                   cpf_encrypted, coren_crm, password_hash, pin_hash
+              FROM users
+             WHERE cpf_hash = %s
+            """,
+            (cpf_hash,),
+        )
+        return cur.fetchone()
+
+
+def _count_recent_self_pair_fails(conn, *, client_ip: Optional[str], cpf_hash: Optional[str]) -> int:
+    """Counts recent device.self_pair.fail audit rows by IP or cpf_hash."""
+    if not client_ip and not cpf_hash:
+        return 0
+    clauses = ["action = 'device.self_pair.fail'", "created_at > NOW() - INTERVAL '15 minutes'"]
+    params: list[Any] = []
+    ors: list[str] = []
+    if client_ip:
+        ors.append("client_ip = %s")
+        params.append(client_ip)
+    if cpf_hash:
+        ors.append("entity_id = %s")
+        params.append(cpf_hash)
+    clauses.append("(" + " OR ".join(ors) + ")")
+    sql = "SELECT COUNT(*)::int AS n FROM audit_log WHERE " + " AND ".join(clauses)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            row = cur.fetchone()
+        return int(row["n"]) if row else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def check_self_pair_rate_limit(conn, *, client_ip: Optional[str], cpf_hash: Optional[str]) -> None:
+    n = _count_recent_self_pair_fails(conn, client_ip=client_ip, cpf_hash=cpf_hash)
+    if n >= SELF_PAIR_MAX_FAILS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Muitas tentativas. Tente novamente em alguns minutos.",
+            headers={"Retry-After": "900"},
+        )
+
+
+def self_pair_device(
+    conn,
+    *,
+    cpf_digits: str,
+    password: str,
+    pin: str,
+    device_fingerprint: str,
+    label: Optional[str],
+) -> dict[str, Any]:
+    """Pair a device using an existing active user's own credentials.
+
+    Failure modes 1-3 (unknown CPF, wrong password, wrong PIN) all collapse to a
+    single generic 401 to avoid enumeration. Statuses 4-5 are explicit because
+    they aren't credential-enumerable.
+    """
+    cpf_hash: Optional[str] = None
+    try:
+        cpf_hash = crypto.hash_cpf(cpf_digits) if cpf_digits and len(cpf_digits) == 11 else None
+    except Exception:  # noqa: BLE001
+        cpf_hash = None
+
+    user = find_user_by_cpf_digits(conn, cpf_digits)
+    if not user:
+        raise HTTPException(status_code=401, detail=_GENERIC_CREDS_MSG)
+    if not crypto.verify_password(password, user.get("password_hash")):
+        raise HTTPException(status_code=401, detail=_GENERIC_CREDS_MSG)
+    if not crypto.verify_pin(pin, user.get("pin_hash")):
+        raise HTTPException(status_code=401, detail=_GENERIC_CREDS_MSG)
+    if user["status"] != "active":
+        raise HTTPException(status_code=403, detail="Conta não ativa.")
+    if not user.get("unit_id"):
+        raise HTTPException(status_code=403, detail="Usuário sem unidade.")
+
+    unit_id = str(user["unit_id"])
+    now = datetime.now(timezone.utc)
+    device_expires = now + DEVICE_TOKEN_TTL
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO trusted_devices
+                (unit_id, device_fingerprint, label, paired_at, expires_at)
+            VALUES (%s, %s, %s, NOW(), %s)
+            ON CONFLICT (unit_id, device_fingerprint) DO UPDATE
+              SET label = COALESCE(EXCLUDED.label, trusted_devices.label),
+                  paired_at = NOW(),
+                  expires_at = EXCLUDED.expires_at,
+                  revoked_at = NULL,
+                  pairing_code = NULL,
+                  pairing_code_expires_at = NULL
+            RETURNING id, unit_id, expires_at
+            """,
+            (unit_id, device_fingerprint, label, device_expires),
+        )
+        dev = cur.fetchone()
+
+    device_id = str(dev["id"])
+    sess = start_shift_no_pin(conn, user_id=user["id"], device_id=device_id)
+    return {
+        "device_id": device_id,
+        "unit_id": dev["unit_id"],
+        "session": sess,
+        "user": user,
+    }
+
+
+def start_shift_no_pin(conn, *, user_id: UUID | str, device_id: str) -> dict[str, Any]:
+    """Open a shift session for an already-authenticated user (no PIN re-check).
+
+    Used by self_pair where PIN was already verified upstream.
+    """
+    expires_at = datetime.now(timezone.utc) + SHIFT_TOKEN_TTL
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE auth_sessions
+               SET ended_at = NOW(), end_reason = 'superseded'
+             WHERE user_id = %s AND ended_at IS NULL
+            """,
+            (str(user_id),),
+        )
+        cur.execute(
+            """
+            INSERT INTO auth_sessions (user_id, device_id, expires_at)
+            VALUES (%s, %s, %s)
+            RETURNING id, user_id, device_id, started_at, expires_at
+            """,
+            (str(user_id), device_id, expires_at),
+        )
+        return cur.fetchone()
+
+
+# ---------------------------------------------------------------------------
 # Shift session
 # ---------------------------------------------------------------------------
 def start_shift(conn, user_id: UUID | str, pin: str, device_id: str) -> dict[str, Any]:

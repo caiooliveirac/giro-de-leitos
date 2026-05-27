@@ -100,6 +100,7 @@ def test_router_registered():
         "/api/auth/admin/login",
         "/api/auth/device/generate-code",
         "/api/auth/device/pair",
+        "/api/auth/device/self-pair",
         "/api/auth/me/unit/staff",
         "/api/auth/shift/start",
         "/api/auth/shift/end",
@@ -157,6 +158,63 @@ def test_validate_cpf_rejects_bad():
     assert validate_cpf("123") is False
     assert validate_cpf("11111111111") is False
     assert validate_cpf("12345678900") is False
+
+
+def test_self_pair_missing_body(client):
+    resp = client.post("/api/auth/device/self-pair", json={})
+    assert resp.status_code == 422
+
+
+def test_self_pair_invalid_credentials(client, monkeypatch):
+    # Force user lookup to fail → 401 generic message.
+    monkeypatch.setattr(auth_service, "find_user_by_cpf_digits", lambda *a, **kw: None)
+    monkeypatch.setattr(auth_service, "check_self_pair_rate_limit", lambda *a, **kw: None)
+    monkeypatch.setattr(auth_service.crypto, "verify_password", lambda *a, **kw: False)
+    monkeypatch.setattr(auth_service.crypto, "verify_pin", lambda *a, **kw: False)
+    resp = client.post(
+        "/api/auth/device/self-pair",
+        json={
+            "cpf": "529.982.247-25",
+            "password": "wrong-pass-123",
+            "pin": "1234",
+            "device_fingerprint": "fp-test-abc",
+            "label": "tablet",
+        },
+    )
+    assert resp.status_code == 401
+    body = resp.json()
+    assert body.get("detail") == "Credenciais inválidas."
+
+
+def test_self_pair_pending_user_returns_403(client, monkeypatch):
+    fake_user = {
+        "id": uuid.uuid4(),
+        "name": "Fulana",
+        "role": "professional",
+        "status": "pending",
+        "unit_id": uuid.uuid4(),
+        "cargo": "Enf.",
+        "photo_url": None,
+        "cpf_encrypted": None,
+        "coren_crm": None,
+        "password_hash": "fake-hash",
+        "pin_hash": "fake-pin-hash",
+    }
+    monkeypatch.setattr(auth_service, "find_user_by_cpf_digits", lambda *a, **kw: fake_user)
+    monkeypatch.setattr(auth_service, "check_self_pair_rate_limit", lambda *a, **kw: None)
+    monkeypatch.setattr(auth_service.crypto, "verify_password", lambda *a, **kw: True)
+    monkeypatch.setattr(auth_service.crypto, "verify_pin", lambda *a, **kw: True)
+    resp = client.post(
+        "/api/auth/device/self-pair",
+        json={
+            "cpf": "529.982.247-25",
+            "password": "right-pass",
+            "pin": "1234",
+            "device_fingerprint": "fp-test-abc",
+        },
+    )
+    assert resp.status_code == 403
+    assert resp.json().get("detail") == "Conta não ativa."
 
 
 def test_pairing_code_format(monkeypatch):
