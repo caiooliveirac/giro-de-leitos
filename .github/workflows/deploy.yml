@@ -1,0 +1,284 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      component:
+        description: "Componente a publicar"
+        required: true
+        type: choice
+        options: [both, api, frontend]
+        default: both
+
+concurrency:
+  group: giro-de-leitos-deploy
+  cancel-in-progress: false
+
+env:
+  APP: giro-de-leitos
+  REMOTE: ${{ secrets.PROD_SSH_USER }}@${{ secrets.PROD_SSH_HOST }}
+  DEPLOY_DIR: /home/ubuntu/giro-de-leitos
+
+jobs:
+  test:
+    name: Test (backend + frontend typecheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+      - name: Run backend tests
+        run: pytest tests/ -q
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Install frontend deps
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      - name: Frontend typecheck
+        working-directory: frontend
+        run: pnpm exec tsc --noEmit
+
+  deploy:
+    name: Deploy (rsync + canary swap)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.PROD_SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Rsync source to server
+        run: |
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude 'node_modules' \
+            --exclude '.next' \
+            --exclude '.venv' \
+            --exclude '__pycache__' \
+            --exclude '.env.local' \
+            --exclude '.pytest_cache' \
+            --exclude 'credentials*.json' \
+            --exclude 'coordenadores.csv' \
+            --exclude '.deploy-env' \
+            --exclude '*.zip' \
+            -e "ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519" \
+            ./ ${{ env.REMOTE }}:${{ env.DEPLOY_DIR }}/
+
+      - name: Backup database
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ${{ env.REMOTE }} 'bash -s' << 'EOF'
+            set -euo pipefail
+            mkdir -p /home/ubuntu/giro-backups
+            ts=$(date +%Y%m%dT%H%M%S)
+            DB_CT=$(docker ps --filter "name=giro-de-leitos-db" --format '{{.Names}}' | head -1)
+            if [ -z "$DB_CT" ]; then
+              echo "WARN: nenhum container giro-de-leitos-db* rodando, pulando backup"
+              exit 0
+            fi
+            docker exec "$DB_CT" pg_dump -U giro giro_de_leitos | gzip > /home/ubuntu/giro-backups/db-$ts.sql.gz
+            ls -t /home/ubuntu/giro-backups/db-*.sql.gz | tail -n +8 | xargs -r rm
+            echo "backup: db-$ts.sql.gz"
+          EOF
+
+      - name: Build and swap API (canary)
+        if: ${{ github.event_name == 'push' || inputs.component == 'api' || inputs.component == 'both' }}
+        run: |
+          ssh -o ServerAliveInterval=20 -o ServerAliveCountMax=180 \
+              -i ~/.ssh/id_ed25519 \
+              ${{ env.REMOTE }} bash -s << 'REMOTE_SCRIPT'
+            set -euo pipefail
+            cd /home/ubuntu/giro-de-leitos
+
+            SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "manual-$(date +%s)")
+            IMG_NEW="giro-api:$SHA"
+            IMG_PREV=$(docker inspect giro-de-leitos-api --format '{{.Config.Image}}' 2>/dev/null || echo "")
+
+            echo "=== [api] build $IMG_NEW ==="
+            docker build --pull -t "$IMG_NEW" -t giro-api:candidate .
+
+            if [ -n "$IMG_PREV" ] && [ "$IMG_PREV" != "$IMG_NEW" ]; then
+              echo "=== [api] taggeando anterior como giro-api:previous ($IMG_PREV) ==="
+              docker tag "$IMG_PREV" giro-api:previous || true
+            fi
+
+            echo "=== [api] canary em 127.0.0.1:8001 ==="
+            docker rm -f giro-api-canary 2>/dev/null || true
+            docker run -d --name giro-api-canary \
+              --network giro-de-leitos_default \
+              --env-file /home/ubuntu/giro-de-leitos/.deploy-env \
+              -p 127.0.0.1:8001:8000 \
+              "$IMG_NEW"
+
+            echo "=== [api] healthcheck canary ==="
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:8001/api/health > /dev/null 2>&1; then
+                ok=1; echo "canary OK em ${i}s"; break
+              fi
+              sleep 1
+            done
+            if [ "$ok" -eq 0 ]; then
+              echo "ERRO: canary nao passou no healthcheck"
+              docker logs --tail 80 giro-api-canary || true
+              docker rm -f giro-api-canary || true
+              exit 1
+            fi
+
+            echo "=== [api] verificando /api/summary no canary ==="
+            curl -fsS http://127.0.0.1:8001/api/summary > /dev/null || {
+              echo "ERRO: /api/summary falhou no canary"
+              docker logs --tail 80 giro-api-canary || true
+              docker rm -f giro-api-canary || true
+              exit 1
+            }
+
+            echo "=== [api] ATOMIC SWAP em 127.0.0.1:8000 ==="
+            docker rm -f giro-de-leitos-api 2>/dev/null || true
+            docker run -d --name giro-de-leitos-api \
+              --restart unless-stopped \
+              --network giro-de-leitos_default \
+              --env-file /home/ubuntu/giro-de-leitos/.deploy-env \
+              -p 127.0.0.1:8000:8000 \
+              "$IMG_NEW"
+
+            echo "=== [api] aguardando 8000 voltar ==="
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:8000/api/health > /dev/null 2>&1; then
+                ok=1; echo "producao OK em ${i}s"; break
+              fi
+              sleep 1
+            done
+            if [ "$ok" -eq 0 ]; then
+              echo "ERRO: api nova nao saudavel em 8000. Tente rollback manual."
+              docker logs --tail 80 giro-de-leitos-api || true
+              exit 1
+            fi
+
+            echo "=== [api] limpando canary ==="
+            docker rm -f giro-api-canary 2>/dev/null || true
+
+            echo "=== [api] verificando bridge ainda conversa com a api ==="
+            sleep 2
+            docker logs giro-whatsapp-bridge --tail 10 | head -20 || true
+
+            echo "=== [api] OK. SHA novo: $SHA. anterior taggeado como giro-api:previous"
+          REMOTE_SCRIPT
+
+      - name: Build and swap Frontend (canary)
+        if: ${{ github.event_name == 'push' || inputs.component == 'frontend' || inputs.component == 'both' }}
+        run: |
+          ssh -o ServerAliveInterval=20 -o ServerAliveCountMax=180 \
+              -i ~/.ssh/id_ed25519 \
+              ${{ env.REMOTE }} bash -s << 'REMOTE_SCRIPT'
+            set -euo pipefail
+            cd /home/ubuntu/giro-de-leitos
+
+            SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "manual-$(date +%s)")
+            IMG_NEW="giro-frontend:$SHA"
+            IMG_PREV=$(docker inspect giro-de-leitos-frontend --format '{{.Config.Image}}' 2>/dev/null || echo "")
+
+            echo "=== [frontend] build $IMG_NEW ==="
+            docker build --pull -t "$IMG_NEW" -t giro-frontend:candidate -f frontend/Dockerfile frontend/
+
+            if [ -n "$IMG_PREV" ] && [ "$IMG_PREV" != "$IMG_NEW" ]; then
+              echo "=== [frontend] taggeando anterior como giro-frontend:previous ==="
+              docker tag "$IMG_PREV" giro-frontend:previous || true
+            fi
+
+            echo "=== [frontend] canary em 127.0.0.1:3051 ==="
+            docker rm -f giro-frontend-canary 2>/dev/null || true
+            docker run -d --name giro-frontend-canary \
+              -p 127.0.0.1:3051:3000 \
+              "$IMG_NEW"
+
+            echo "=== [frontend] healthcheck canary ==="
+            ok=0
+            for i in $(seq 1 40); do
+              if curl -fsS http://127.0.0.1:3051/ > /dev/null 2>&1; then
+                ok=1; echo "canary OK em ${i}s"; break
+              fi
+              sleep 1
+            done
+            if [ "$ok" -eq 0 ]; then
+              echo "ERRO: canary frontend nao saudavel"
+              docker logs --tail 80 giro-frontend-canary || true
+              docker rm -f giro-frontend-canary || true
+              exit 1
+            fi
+
+            echo "=== [frontend] swap em 127.0.0.1:3050 ==="
+            docker rm -f giro-de-leitos-frontend 2>/dev/null || true
+            docker run -d --name giro-de-leitos-frontend \
+              --restart unless-stopped \
+              -p 127.0.0.1:3050:3000 \
+              "$IMG_NEW"
+
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:3050/ > /dev/null 2>&1; then
+                ok=1; echo "frontend producao OK em ${i}s"; break
+              fi
+              sleep 1
+            done
+            if [ "$ok" -eq 0 ]; then
+              echo "ERRO: frontend novo nao saudavel em 3050"
+              docker logs --tail 80 giro-de-leitos-frontend || true
+              exit 1
+            fi
+
+            docker rm -f giro-frontend-canary 2>/dev/null || true
+            echo "=== [frontend] OK. SHA $SHA em 3050"
+          REMOTE_SCRIPT
+
+      - name: Notify Telegram (success)
+        if: success()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
+            echo "telegram secrets ausentes, pulando notificacao"; exit 0
+          fi
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=Giro de Leitos deploy OK -- ${GIT_SHA}" || true
+
+      - name: Notify Telegram (failure)
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          GIT_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
+            echo "telegram secrets ausentes, pulando notificacao"; exit 0
+          fi
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=Giro de Leitos deploy FALHOU -- ${GIT_SHA} -- ${RUN_URL}" || true

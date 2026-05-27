@@ -1,0 +1,119 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: "Componente a reverter"
+        required: true
+        type: choice
+        options: [both, api, frontend]
+        default: both
+      confirm:
+        description: "Digite 'ROLLBACK' para confirmar"
+        required: true
+        type: string
+
+concurrency:
+  group: giro-de-leitos-deploy
+  cancel-in-progress: false
+
+env:
+  REMOTE: ${{ secrets.PROD_SSH_USER }}@${{ secrets.PROD_SSH_HOST }}
+
+jobs:
+  rollback:
+    name: Rollback (giro-api:previous / giro-frontend:previous)
+    if: ${{ inputs.confirm == 'ROLLBACK' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.PROD_SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Rollback API
+        if: ${{ inputs.component == 'api' || inputs.component == 'both' }}
+        run: |
+          ssh -o ServerAliveInterval=20 -o ServerAliveCountMax=180 \
+              -i ~/.ssh/id_ed25519 \
+              ${{ env.REMOTE }} bash -s << 'REMOTE_SCRIPT'
+            set -euo pipefail
+            if ! docker image inspect giro-api:previous > /dev/null 2>&1; then
+              echo "ERRO: giro-api:previous nao existe. Nada para reverter."
+              exit 1
+            fi
+
+            echo "=== [api] swap para giro-api:previous ==="
+            docker rm -f giro-de-leitos-api 2>/dev/null || true
+            docker run -d --name giro-de-leitos-api \
+              --restart unless-stopped \
+              --network giro-de-leitos_default \
+              --env-file /home/ubuntu/giro-de-leitos/.deploy-env \
+              -p 127.0.0.1:8000:8000 \
+              giro-api:previous
+
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:8000/api/health > /dev/null 2>&1; then
+                ok=1; echo "rollback api OK em ${i}s"; break
+              fi
+              sleep 1
+            done
+            if [ "$ok" -eq 0 ]; then
+              echo "ERRO: api revertida nao saudavel"
+              docker logs --tail 80 giro-de-leitos-api || true
+              exit 1
+            fi
+          REMOTE_SCRIPT
+
+      - name: Rollback Frontend
+        if: ${{ inputs.component == 'frontend' || inputs.component == 'both' }}
+        run: |
+          ssh -o ServerAliveInterval=20 -o ServerAliveCountMax=180 \
+              -i ~/.ssh/id_ed25519 \
+              ${{ env.REMOTE }} bash -s << 'REMOTE_SCRIPT'
+            set -euo pipefail
+            if ! docker image inspect giro-frontend:previous > /dev/null 2>&1; then
+              echo "ERRO: giro-frontend:previous nao existe. Nada para reverter."
+              exit 1
+            fi
+
+            echo "=== [frontend] swap para giro-frontend:previous ==="
+            docker rm -f giro-de-leitos-frontend 2>/dev/null || true
+            docker run -d --name giro-de-leitos-frontend \
+              --restart unless-stopped \
+              -p 127.0.0.1:3050:3000 \
+              giro-frontend:previous
+
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:3050/ > /dev/null 2>&1; then
+                ok=1; echo "rollback frontend OK em ${i}s"; break
+              fi
+              sleep 1
+            done
+            if [ "$ok" -eq 0 ]; then
+              echo "ERRO: frontend revertido nao saudavel"
+              docker logs --tail 80 giro-de-leitos-frontend || true
+              exit 1
+            fi
+          REMOTE_SCRIPT
+
+      - name: Notify Telegram
+        if: always()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          STATUS: ${{ job.status }}
+          COMPONENT: ${{ inputs.component }}
+        run: |
+          if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
+            echo "telegram secrets ausentes, pulando"; exit 0
+          fi
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=Giro de Leitos ROLLBACK (${COMPONENT}): ${STATUS}" || true

@@ -12,6 +12,7 @@ services:
 
   parser-api:
     build: .
+    image: giro-api:latest
     container_name: giro-de-leitos-api
     restart: unless-stopped
     depends_on:
@@ -20,6 +21,7 @@ services:
       - default
       - repo_default
     environment:
+      # --- Integrações existentes ---
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ADMIN_CHAT_ID: ${TELEGRAM_ADMIN_CHAT_ID:-1438288563}
       TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
@@ -28,8 +30,20 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql://giro:giro_seguro_2026@postgres:5432/giro_de_leitos}
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # --- Comunicação com a bridge (sai da API para a bridge) ---
+      WHATSAPP_BRIDGE_URL: ${WHATSAPP_BRIDGE_URL:-http://whatsapp-bridge:3000}
+      # --- Auth / Crypto (fail-fast) ---
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET obrigatorio}
+      CPF_ENCRYPTION_KEY: ${CPF_ENCRYPTION_KEY:?CPF_ENCRYPTION_KEY obrigatorio}
+      CPF_HASH_PEPPER: ${CPF_HASH_PEPPER:?CPF_HASH_PEPPER obrigatorio}
+      # --- Seed admin inicial (idempotente, scripts/seed_admin.py) ---
+      ADMIN_INITIAL_EMAIL: ${ADMIN_INITIAL_EMAIL:-}
+      ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-}
+      ADMIN_INITIAL_NAME: ${ADMIN_INITIAL_NAME:-}
+      ADMIN_INITIAL_CPF: ${ADMIN_INITIAL_CPF:-}
+      ADMIN_INITIAL_PIN: ${ADMIN_INITIAL_PIN:-}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
 
   whatsapp-bridge:
     build: ./whatsapp-bridge
@@ -61,14 +75,16 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+    image: giro-frontend:latest
     container_name: giro-de-leitos-frontend
     restart: unless-stopped
-    depends_on:
-      - parser-api
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3050:3000"
     environment:
-      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://parser-api:8000}
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: "1"
+    networks:
+      - default
 
 volumes:
   giro_db_data_local:
