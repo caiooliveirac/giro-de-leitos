@@ -3,7 +3,11 @@ const withPWA = require('next-pwa')({
   dest: 'public',
   register: true,
   skipWaiting: true,
-  disable: process.env.NODE_ENV === 'development',
+  // Desabilitado temporariamente durante fase de bugfix:
+  // o SW gerado pelo next-pwa estava cacheando bundles antigos com bugs
+  // e dificultando a propagação de fixes. public/sw.js (kill-switch)
+  // assume o controle, limpa caches e se desregistra automaticamente.
+  disable: true,
 });
 
 const nextConfig = {
