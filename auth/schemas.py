@@ -182,6 +182,20 @@ class ApproveResponse(BaseModel):
     status: str
 
 
+class UnitMember(BaseModel):
+    id: UUID
+    name: str
+    role: str
+    status: str
+    cargo: Optional[str] = None
+    coren_crm: Optional[str] = None
+    phone: Optional[str] = None
+    photo_url: Optional[str] = None
+    cpf_masked: str
+    created_at: datetime
+    approved_at: Optional[datetime] = None
+
+
 # ---------------------------------------------------------------------------
 # Admin — units overview
 # ---------------------------------------------------------------------------

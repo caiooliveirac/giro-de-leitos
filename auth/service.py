@@ -686,6 +686,29 @@ def list_unit_staff(conn, unit_id: UUID | str) -> list[dict[str, Any]]:
         return cur.fetchall()
 
 
+def list_unit_members(conn, unit_id: UUID | str) -> list[dict[str, Any]]:
+    """All users (any status) tied to a unit. For admin team management."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, name, role, cargo, coren_crm, phone, photo_url, status,
+                   unit_id, cpf_encrypted, created_at, approved_at
+              FROM users
+             WHERE unit_id = %s AND role IN ('coordinator', 'professional')
+             ORDER BY
+                CASE status
+                    WHEN 'pending' THEN 0
+                    WHEN 'active' THEN 1
+                    WHEN 'suspended' THEN 2
+                    ELSE 3
+                END,
+                name ASC
+            """,
+            (str(unit_id),),
+        )
+        return cur.fetchall()
+
+
 def list_pending(conn, approver: dict[str, Any]) -> list[dict[str, Any]]:
     with conn.cursor() as cur:
         if approver["role"] == "admin":

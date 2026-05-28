@@ -46,6 +46,7 @@ from auth.schemas import (
     ShiftEnd,
     ShiftStart,
     ShiftStartResponse,
+    UnitMember,
     UserPublic,
 )
 from services import notifications
@@ -590,6 +591,32 @@ def list_admin_units(
             red_capacity=int(row.get("red_capacity") or 0),
         )
         for row in rows
+    ]
+
+
+@router.get("/admin/units/{unit_id}/users", response_model=list[UnitMember])
+def list_unit_members_endpoint(
+    unit_id: UUID,
+    admin=Depends(get_current_admin),
+    conn=Depends(get_db),
+):
+    """Admin-only: every user (any status) tied to the given UPA."""
+    rows = service.list_unit_members(conn, unit_id)
+    return [
+        UnitMember(
+            id=r["id"],
+            name=r["name"],
+            role=r["role"],
+            status=r["status"],
+            cargo=r.get("cargo"),
+            coren_crm=r.get("coren_crm"),
+            phone=r.get("phone"),
+            photo_url=r.get("photo_url"),
+            cpf_masked=_safe_cpf_masked(r.get("cpf_encrypted")),
+            created_at=r["created_at"],
+            approved_at=r.get("approved_at"),
+        )
+        for r in rows
     ]
 
 
