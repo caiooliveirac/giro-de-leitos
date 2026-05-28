@@ -36,7 +36,7 @@ jobs:
       - name: Install Python deps
         run: |
           pip install -r requirements.txt
-          pip install pytest eval_type_backport
+          pip install pytest httpx eval_type_backport
       - name: Run backend tests
         run: pytest tests/ -q
 
