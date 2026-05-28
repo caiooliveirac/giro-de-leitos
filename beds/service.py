@@ -251,20 +251,25 @@ def _fetch_parser_status(conn, unit_code: Optional[str]) -> Optional[dict[str, A
     if not unit_code:
         return None
     with conn.cursor() as cur:
+        # NOTE: current_unit_status does NOT have unit_match_* columns
+        # (those live in parsed_events). Join on last_event_id when available.
         cur.execute(
             """
-            SELECT received_at, updated_at, is_critical, payload,
-                   unit_match_method, unit_match_confidence, unit_matched_alias,
-                   red_occupied, red_capacity,
-                   yellow_occupied, yellow_capacity,
-                   isolation_total_occupied, isolation_total_capacity,
-                   isolation_female_occupied, isolation_female_capacity,
-                   isolation_male_occupied, isolation_male_capacity,
-                   isolation_pediatric_occupied, isolation_pediatric_capacity,
-                   has_orthopedist, has_surgeon, has_psychiatrist
-              FROM current_unit_status
-             WHERE unit_code = %s
-             ORDER BY received_at DESC
+            SELECT s.received_at, s.updated_at, s.is_critical, s.payload,
+                   pe.unit_match_method,
+                   pe.unit_match_confidence,
+                   pe.unit_matched_alias,
+                   s.red_occupied, s.red_capacity,
+                   s.yellow_occupied, s.yellow_capacity,
+                   s.isolation_total_occupied, s.isolation_total_capacity,
+                   s.isolation_female_occupied, s.isolation_female_capacity,
+                   s.isolation_male_occupied, s.isolation_male_capacity,
+                   s.isolation_pediatric_occupied, s.isolation_pediatric_capacity,
+                   s.has_orthopedist, s.has_surgeon, s.has_psychiatrist
+              FROM current_unit_status s
+              LEFT JOIN parsed_events pe ON pe.id = s.last_event_id
+             WHERE s.unit_code = %s
+             ORDER BY s.received_at DESC
              LIMIT 1
             """,
             (unit_code,),
