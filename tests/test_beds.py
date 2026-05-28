@@ -142,6 +142,51 @@ def test_project_counter_yellow_male():
     assert yellow_male["last_updated_by"] is None
 
 
+def test_payload_data_unwraps_envelope():
+    """Production payloads wrap parsed content in a ``{"data": {...}}`` envelope.
+    The inner dict must be returned; flat (legacy) payloads pass through.
+    """
+    from beds.service import _parser_payload_data
+
+    enveloped = {"payload": {"data": {"rooms": {"x": 1}, "raw_text": "hi"}, "type": "upa_update"}}
+    assert _parser_payload_data(enveloped) == {"rooms": {"x": 1}, "raw_text": "hi"}
+
+    flat = {"payload": {"rooms": {"x": 2}, "raw_text": "yo"}}
+    assert _parser_payload_data(flat) == {"rooms": {"x": 2}, "raw_text": "yo"}
+
+    # JSON-encoded string payloads are decoded too.
+    import json as _json
+
+    as_str = {"payload": _json.dumps({"data": {"rooms": {"x": 3}}})}
+    assert _parser_payload_data(as_str)["rooms"] == {"x": 3}
+
+    assert _parser_payload_data(None) == {}
+    assert _parser_payload_data({"payload": None}) == {}
+
+
+def test_yellow_split_extracted_from_enveloped_payload():
+    """Regression: yellow_male/yellow_female live under payload['data']['rooms'];
+    reading the top-level path used to yield 0/0 for every unit (amarela vazia).
+    """
+    from beds.service import _yellow_male_female_from_payload
+
+    parser_row = {
+        "payload": {
+            "data": {
+                "rooms": {
+                    "yellow_male": {"occupied": 6, "capacity": 6},
+                    "yellow_female": {"occupied": 6, "capacity": 6},
+                }
+            }
+        }
+    }
+    out = _yellow_male_female_from_payload(parser_row)
+    assert out["yellow_male_occupied"] == 6
+    assert out["yellow_male_capacity"] == 6
+    assert out["yellow_female_occupied"] == 6
+    assert out["yellow_female_capacity"] == 6
+
+
 def test_project_specialist_orthopedist_available():
     from beds.service import project_parser_state
 

@@ -8,6 +8,7 @@ the current row, ``VersionConflict`` is raised carrying the current state.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
@@ -247,6 +248,124 @@ def project_parser_state(
     }
 
 
+def _parser_payload_data(parser_row: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Return the inner parsed dict from a ``parsed_events`` /
+    ``current_unit_status`` payload.
+
+    Production wraps the parsed content in an envelope
+    ``{"data": {...}, "type", "source", "received_at"}`` — the actual fields
+    (``rooms``, ``raw_text``, ``reported_at``, ``specialists`` …) live under
+    ``data``. Older rows were flat. Return the inner ``data`` dict when present,
+    otherwise the payload itself, so both shapes work.
+    """
+    if not parser_row:
+        return {}
+    payload = parser_row.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            return {}
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data")
+    return data if isinstance(data, dict) else payload
+
+
+def _fetch_latest_manual_update(conn, unit_id: str) -> Optional[dict[str, Any]]:
+    """Return the most recent manual edit on this unit's giro across all
+    resources (beds/counters/specialists/exams), with the editor's name.
+    Returns None when no manual rows exist for the unit.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH latest AS (
+                SELECT last_updated_at AS at, last_updated_by AS by_id FROM beds         WHERE unit_id = %s
+                UNION ALL
+                SELECT last_updated_at, last_updated_by FROM counters    WHERE unit_id = %s
+                UNION ALL
+                SELECT last_updated_at, last_updated_by FROM specialists WHERE unit_id = %s
+                UNION ALL
+                SELECT last_updated_at, last_updated_by FROM exams       WHERE unit_id = %s
+            )
+            SELECT l.at, l.by_id, u.name AS by_name
+              FROM latest l
+              LEFT JOIN users u ON u.id = l.by_id
+             WHERE l.at IS NOT NULL
+             ORDER BY l.at DESC
+             LIMIT 1
+            """,
+            (unit_id, unit_id, unit_id, unit_id),
+        )
+        return cur.fetchone()
+
+
+def _normalize_source(source: Optional[str]) -> str:
+    """Map raw ``parsed_events.source`` to a stable category for the UI."""
+    if not source:
+        return "unknown"
+    s = source.lower()
+    if "whatsapp" in s:
+        return "whatsapp"
+    if s in ("manual", "web", "site", "frontend"):
+        return "manual_ingest"
+    return s
+
+
+def _build_provenance(
+    parser_row: Optional[dict[str, Any]],
+    manual_row: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Consolidate giro origin info for the UPA view.
+
+    Picks whichever of (parser snapshot, latest manual edit) is more recent
+    as ``latest`` — but always reports both so the UI can show history /
+    "última leitura via WhatsApp" alongside "última edição manual".
+    """
+    whatsapp_block: Optional[dict[str, Any]] = None
+    if parser_row:
+        data = _parser_payload_data(parser_row)
+        reported_at = data.get("reported_at")
+        raw_text = str(data.get("raw_text") or data.get("text") or "")
+        whatsapp_block = {
+            "source": _normalize_source(parser_row.get("source")),
+            "source_raw": parser_row.get("source"),
+            "received_at": parser_row.get("received_at"),
+            "reported_at": reported_at,
+            "raw_text_preview": raw_text[:200],
+        }
+
+    manual_block: Optional[dict[str, Any]] = None
+    if manual_row and manual_row.get("at"):
+        manual_block = {
+            "source": "site",
+            "received_at": manual_row.get("at"),
+            "reported_at": manual_row.get("at"),
+            "user_id": str(manual_row["by_id"]) if manual_row.get("by_id") else None,
+            "user_name": manual_row.get("by_name"),
+        }
+
+    candidates: list[tuple[datetime, str, dict[str, Any]]] = []
+    if whatsapp_block and whatsapp_block.get("received_at"):
+        candidates.append((whatsapp_block["received_at"], "whatsapp", whatsapp_block))
+    if manual_block and manual_block.get("received_at"):
+        candidates.append((manual_block["received_at"], "site", manual_block))
+
+    latest_kind: Optional[str] = None
+    latest_at: Optional[datetime] = None
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        latest_at, latest_kind, _ = candidates[0]
+
+    return {
+        "latest_kind": latest_kind,           # "whatsapp" | "site" | None
+        "latest_at": latest_at,                # the most recent of the two
+        "whatsapp": whatsapp_block,            # may be None
+        "manual": manual_block,                # may be None
+    }
+
+
 def _fetch_parser_status(conn, unit_code: Optional[str]) -> Optional[dict[str, Any]]:
     if not unit_code:
         return None
@@ -255,7 +374,7 @@ def _fetch_parser_status(conn, unit_code: Optional[str]) -> Optional[dict[str, A
         # (those live in parsed_events). Join on last_event_id when available.
         cur.execute(
             """
-            SELECT s.received_at, s.updated_at, s.is_critical, s.payload,
+            SELECT s.source, s.received_at, s.updated_at, s.is_critical, s.payload,
                    pe.unit_match_method,
                    pe.unit_match_confidence,
                    pe.unit_matched_alias,
@@ -292,15 +411,10 @@ def _yellow_male_female_from_payload(
     }
     if not parser_row:
         return out
-    payload = parser_row.get("payload") or {}
-    if isinstance(payload, str):
-        try:
-            import json as _json
-
-            payload = _json.loads(payload)
-        except Exception:
-            payload = {}
-    rooms = (payload.get("rooms") or {}) if isinstance(payload, dict) else {}
+    data = _parser_payload_data(parser_row)
+    rooms = data.get("rooms") or {}
+    if not isinstance(rooms, dict):
+        rooms = {}
     ymale = rooms.get("yellow_male") or {}
     yfem = rooms.get("yellow_female") or {}
     if isinstance(ymale, dict):
@@ -429,23 +543,17 @@ def get_unit_state(conn, unit_id: str) -> dict[str, Any]:
     # "última atualização via WhatsApp".
     parser_snapshot: Optional[dict[str, Any]] = None
     if parser_row:
-        raw_text = ""
-        payload = parser_row.get("payload") or {}
-        if isinstance(payload, str):
-            try:
-                import json as _json
-
-                payload = _json.loads(payload)
-            except Exception:
-                payload = {}
-        if isinstance(payload, dict):
-            raw_text = str(payload.get("raw_text") or payload.get("text") or "")
+        data = _parser_payload_data(parser_row)
+        raw_text = str(data.get("raw_text") or data.get("text") or "")
         parser_snapshot = {
             "received_at": parser_row.get("received_at"),
             "is_critical": bool(parser_row.get("is_critical")),
             "raw_text": raw_text[:200],
             "unit_match_method": parser_row.get("unit_match_method"),
         }
+
+    manual_latest = _fetch_latest_manual_update(conn, unit_id)
+    provenance = _build_provenance(parser_row, manual_latest)
 
     return {
         "unit": unit,
@@ -455,7 +563,55 @@ def get_unit_state(conn, unit_id: str) -> dict[str, Any]:
         "specialists": specialists,
         "exams": exams,
         "parser_snapshot": parser_snapshot,
+        "provenance": provenance,
     }
+
+
+def get_giro_history(conn, unit_id: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Return recent giro events (parser ingestions) for this unit, plus
+    a separate slice of the latest manual edits. The frontend uses this
+    behind a "ver histórico" affordance on the provenance badge.
+    """
+    unit = _get_unit(conn, unit_id)
+    unit_code = unit.get("code")
+
+    parser_history: list[dict[str, Any]] = []
+    if unit_code:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, source, received_at, payload,
+                       red_occupied, red_capacity,
+                       yellow_occupied, yellow_capacity,
+                       is_critical
+                  FROM parsed_events
+                 WHERE unit_code = %s
+                 ORDER BY received_at DESC
+                 LIMIT %s
+                """,
+                (unit_code, int(limit)),
+            )
+            rows = cur.fetchall()
+        for r in rows:
+            data = _parser_payload_data(r)
+            reported_at = data.get("reported_at")
+            raw_text = str(data.get("raw_text") or data.get("text") or "")
+            parser_history.append(
+                {
+                    "id": r["id"],
+                    "kind": "whatsapp",
+                    "source": _normalize_source(r.get("source")),
+                    "source_raw": r.get("source"),
+                    "received_at": r.get("received_at"),
+                    "reported_at": reported_at,
+                    "is_critical": bool(r.get("is_critical")),
+                    "raw_text_preview": raw_text[:200],
+                    "red": {"occupied": r.get("red_occupied"), "capacity": r.get("red_capacity")},
+                    "yellow": {"occupied": r.get("yellow_occupied"), "capacity": r.get("yellow_capacity")},
+                }
+            )
+
+    return parser_history
 
 
 # ---------------------------------------------------------------------------

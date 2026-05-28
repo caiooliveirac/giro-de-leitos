@@ -175,6 +175,20 @@ def read_unit_state(
     return _jsonable(state)
 
 
+@router.get("/unit/{unit_id}/giro-history")
+def read_giro_history(
+    unit_id: UUID,
+    limit: int = 10,
+    access=Depends(get_unit_read_access),
+    conn=Depends(get_db),
+):
+    try:
+        history = service.get_giro_history(conn, str(unit_id), limit=max(1, min(int(limit), 50)))
+    except service.NotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return _jsonable({"items": history})
+
+
 @router.get("/unit/{unit_id}/sectors/config")
 def read_sectors_config(
     unit_id: UUID,

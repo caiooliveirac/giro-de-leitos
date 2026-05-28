@@ -168,6 +168,42 @@ export interface ParserSnapshot {
   unit_match_method: string | null;
 }
 
+export interface ProvenanceWhatsApp {
+  source: 'whatsapp' | string;
+  source_raw: string | null;
+  received_at: string | null;
+  reported_at: string | null;
+  raw_text_preview: string;
+}
+
+export interface ProvenanceManual {
+  source: 'site';
+  received_at: string | null;
+  reported_at: string | null;
+  user_id: string | null;
+  user_name: string | null;
+}
+
+export interface GiroProvenance {
+  latest_kind: 'whatsapp' | 'site' | null;
+  latest_at: string | null;
+  whatsapp: ProvenanceWhatsApp | null;
+  manual: ProvenanceManual | null;
+}
+
+export interface GiroHistoryEntry {
+  id: number;
+  kind: 'whatsapp';
+  source: string;
+  source_raw: string | null;
+  received_at: string | null;
+  reported_at: string | null;
+  is_critical: boolean;
+  raw_text_preview: string;
+  red: { occupied: number | null; capacity: number | null };
+  yellow: { occupied: number | null; capacity: number | null };
+}
+
 export interface UnitState {
   unit: Unit;
   sectors_config: SectorConfig[];
@@ -177,6 +213,7 @@ export interface UnitState {
   exams: Exam[];
   updated_at?: string;
   parser_snapshot?: ParserSnapshot | null;
+  provenance?: GiroProvenance | null;
 }
 
 // ---------------------------------------------------------------------------

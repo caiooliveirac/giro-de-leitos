@@ -25,6 +25,7 @@ import { RedRoomBed } from '@/components/beds/RedRoomBed';
 import { CounterSector } from '@/components/beds/CounterSector';
 import { SpecialistCard } from '@/components/beds/SpecialistCard';
 import { ExamCard } from '@/components/beds/ExamCard';
+import { GiroProvenanceBadge } from '@/components/beds/GiroProvenanceBadge';
 
 const ADMIN_VIEW_KEY = 'gl_admin_viewing_unit';
 const SHIFT_UNIT_NAME_KEY = 'gl_unit_name';
@@ -223,6 +224,8 @@ function UnitGiro({ unitId }: { unitId: string }) {
 
   return (
     <>
+      <GiroProvenanceBadge unitId={unitId} provenance={data.provenance ?? null} />
+
       {enabledKeys.has('red_room') && redCapacity > 0 && (
         <Section title="Sala vermelha" subtitle="Leitos críticos com paciente identificado">
           <LayoutGroup>
