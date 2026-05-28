@@ -1,5 +1,6 @@
 'use client';
 
+import { useMemo } from 'react';
 import { create } from 'zustand';
 
 export type ToastVariant = 'default' | 'success' | 'error' | 'warning';
@@ -32,10 +33,13 @@ export const useToastStore = create<ToastState>((set) => ({
 
 export function useToast() {
   const push = useToastStore((s) => s.push);
-  return {
-    show: (message: string, variant: ToastVariant = 'default') => push(message, variant),
-    success: (message: string) => push(message, 'success'),
-    error: (message: string) => push(message, 'error'),
-    warning: (message: string) => push(message, 'warning'),
-  };
+  return useMemo(
+    () => ({
+      show: (message: string, variant: ToastVariant = 'default') => push(message, variant),
+      success: (message: string) => push(message, 'success'),
+      error: (message: string) => push(message, 'error'),
+      warning: (message: string) => push(message, 'warning'),
+    }),
+    [push],
+  );
 }
