@@ -34,7 +34,9 @@ jobs:
           python-version: '3.12'
           cache: pip
       - name: Install Python deps
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          pip install pytest eval_type_backport
       - name: Run backend tests
         run: pytest tests/ -q
 
