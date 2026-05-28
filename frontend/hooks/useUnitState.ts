@@ -14,8 +14,8 @@ import {
 import { UnitWebSocket, type UnitWsStatus, type UnitWsEvent } from '@/lib/ws';
 
 function mergeBed(state: UnitState, bed: Bed): UnitState {
-  const beds = state.beds.some((b) => b.id === bed.id)
-    ? state.beds.map((b) => (b.id === bed.id ? bed : b))
+  const beds = state.beds.some((b) => b.bed_number === bed.bed_number)
+    ? state.beds.map((b) => (b.bed_number === bed.bed_number ? bed : b))
     : [...state.beds, bed];
   return { ...state, beds, updated_at: bed.last_updated_at ?? state.updated_at };
 }

@@ -115,8 +115,6 @@ export interface Unit {
 export type ResourceSource = 'manual' | 'parser' | 'default';
 
 export interface Bed {
-  id: number;
-  unit_id: string;
   bed_number: number;
   patient_sigla: string | null;
   clinical_summary: string | null;
@@ -128,7 +126,6 @@ export interface Bed {
 }
 
 export interface Counter {
-  unit_id: string;
   sector_key: string;
   occupancy: number;
   capacity: number;
@@ -140,7 +137,6 @@ export interface Counter {
 export type SpecialistStatus = 'available' | 'unavailable' | 'on_call';
 
 export interface Specialist {
-  unit_id: string;
   sector_key: string;
   status: SpecialistStatus;
   last_updated_at: string;
@@ -151,13 +147,18 @@ export interface Specialist {
 export type ExamStatus = 'working' | 'unavailable';
 
 export interface Exam {
-  unit_id: string;
   sector_key: string;
   status: ExamStatus;
   unavailable_reason: string | null;
   last_updated_at: string;
   version: number;
   source?: ResourceSource;
+}
+
+export interface SectorConfig {
+  sector_key: string;
+  enabled: boolean;
+  capacity: number | null;
 }
 
 export interface ParserSnapshot {
@@ -169,11 +170,12 @@ export interface ParserSnapshot {
 
 export interface UnitState {
   unit: Unit;
+  sectors_config: SectorConfig[];
   beds: Bed[];
   counters: Counter[];
   specialists: Specialist[];
   exams: Exam[];
-  updated_at: string;
+  updated_at?: string;
   parser_snapshot?: ParserSnapshot | null;
 }
 

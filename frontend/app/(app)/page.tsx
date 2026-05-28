@@ -1,161 +1,306 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { LayoutGroup } from 'framer-motion';
-import type { Bed, ExamStatus, SpecialistStatus } from '@/lib/api';
-import { SECTORS } from '@/lib/sectors';
+import { useRouter } from 'next/navigation';
+import {
+  apiFetch,
+  apiMutate,
+  ApiError,
+  type Bed,
+  type Counter,
+  type Exam,
+  type SectorConfig,
+  type Specialist,
+} from '@/lib/api';
+import { SECTORS, type SectorKey } from '@/lib/sectors';
 import { useToast } from '@/lib/toast';
+import { useCurrentUser } from '@/hooks/useCurrentUser';
+import { useUnitState } from '@/hooks/useUnitState';
 import { TopBar } from '@/components/shared/TopBar';
 import { OfflineBanner } from '@/components/shared/OfflineBanner';
 import { ToastViewport } from '@/components/shared/ToastViewport';
+import { UnitPicker } from '@/components/admin/UnitPicker';
 import { RedRoomBed } from '@/components/beds/RedRoomBed';
 import { CounterSector } from '@/components/beds/CounterSector';
 import { SpecialistCard } from '@/components/beds/SpecialistCard';
 import { ExamCard } from '@/components/beds/ExamCard';
 
+const ADMIN_VIEW_KEY = 'gl_admin_viewing_unit';
+const SHIFT_UNIT_NAME_KEY = 'gl_unit_name';
+
+interface AdminUnit {
+  id: string;
+  code: string;
+  canonical_name: string;
+  slug: string;
+  active: boolean;
+  coordinator_count: number;
+  enabled_sector_count: number;
+  red_capacity: number;
+}
+
+export default function HomePage() {
+  const router = useRouter();
+  const { user, hydrated, isAdmin } = useCurrentUser();
+
+  useEffect(() => {
+    if (!hydrated) return;
+    if (!user) router.replace('/pair');
+  }, [hydrated, user, router]);
+
+  if (!hydrated) return null;
+  if (!user) return null;
+
+  if (isAdmin) return <AdminHome />;
+  return <ShiftHome unitId={user.unit_id ?? null} userName={user.name} />;
+}
+
 // ---------------------------------------------------------------------------
-// TODO Fase 7: substituir mocks por dados reais via useUnitState(unitId) +
-// mutações com If-Match/version. Por enquanto a tela é totalmente client-side
-// pra validação visual da estética iOS Health.
+// Admin: picker + giro de UPA selecionada
 // ---------------------------------------------------------------------------
-
-interface CounterMock {
-  key: string;
-  label: string;
-  occupancy: number;
-  capacity: number;
-  version: number;
-}
-
-interface SpecialistMock {
-  key: string;
-  label: string;
-  status: SpecialistStatus;
-}
-
-interface ExamMock {
-  key: string;
-  label: string;
-  status: ExamStatus;
-  unavailable_reason: string | null;
-}
-
-const NOW = () => new Date().toISOString();
-
-const MOCK_BEDS: Array<Bed | null> = [
-  {
-    id: 1,
-    unit_id: 'mock',
-    bed_number: 1,
-    patient_sigla: 'JCO',
-    clinical_summary: 'Dor torácica · suspeita IAM',
-    occupied_since: new Date(Date.now() - 1000 * 60 * 95).toISOString(),
-    last_updated_by: null,
-    last_updated_at: NOW(),
-    version: 1,
-  },
-  null,
-  {
-    id: 3,
-    unit_id: 'mock',
-    bed_number: 3,
-    patient_sigla: 'MSL',
-    clinical_summary: 'AVCi em janela · TC solicitada',
-    occupied_since: new Date(Date.now() - 1000 * 60 * 25).toISOString(),
-    last_updated_by: null,
-    last_updated_at: NOW(),
-    version: 1,
-  },
-  null,
-  {
-    id: 5,
-    unit_id: 'mock',
-    bed_number: 5,
-    patient_sigla: 'ABF',
-    clinical_summary: 'Sepse · ATB em curso',
-    occupied_since: new Date(Date.now() - 1000 * 60 * 60 * 4).toISOString(),
-    last_updated_by: null,
-    last_updated_at: NOW(),
-    version: 1,
-  },
-  null,
-];
-
-const MOCK_COUNTERS_YELLOW: CounterMock[] = [
-  { key: 'yellow_female', label: 'Feminino', occupancy: 4, capacity: 6, version: 1 },
-  { key: 'yellow_male', label: 'Masculino', occupancy: 5, capacity: 5, version: 1 },
-  { key: 'yellow_unisex', label: 'Unissex', occupancy: 3, capacity: 4, version: 1 },
-];
-
-const MOCK_COUNTERS_ISOLATION: CounterMock[] = [
-  { key: 'isolation_adult_m', label: 'Adulto M', occupancy: 1, capacity: 2, version: 1 },
-  { key: 'isolation_adult_f', label: 'Adulto F', occupancy: 2, capacity: 2, version: 1 },
-  { key: 'isolation_adult_unisex', label: 'Adulto unissex', occupancy: 0, capacity: 1, version: 1 },
-  { key: 'isolation_pediatric', label: 'Pediátrico', occupancy: 1, capacity: 2, version: 1 },
-];
-
-const MOCK_SPECIALISTS: SpecialistMock[] = [
-  { key: 'surgeon', label: 'Cirurgião', status: 'available' },
-  { key: 'orthopedist', label: 'Ortopedista', status: 'on_call' },
-  { key: 'dentist', label: 'Dentista', status: 'unavailable' },
-  { key: 'pediatrician', label: 'Pediatra', status: 'available' },
-];
-
-const MOCK_EXAMS: ExamMock[] = [
-  { key: 'xray', label: 'Raio-X', status: 'working', unavailable_reason: null },
-  { key: 'ecg', label: 'ECG', status: 'working', unavailable_reason: null },
-  { key: 'lab', label: 'Laboratório', status: 'unavailable', unavailable_reason: 'Sem reagente de troponina' },
-  { key: 'ultrasound', label: 'Ultrassom', status: 'working', unavailable_reason: null },
-  { key: 'tomography', label: 'Tomografia', status: 'unavailable', unavailable_reason: 'Em manutenção' },
-];
-
-export default function OperatorHomePage() {
+function AdminHome() {
+  const router = useRouter();
   const toast = useToast();
+  const { user } = useCurrentUser();
 
-  const beds = useMemo(() => MOCK_BEDS, []);
+  const [units, setUnits] = useState<AdminUnit[]>([]);
+  const [unitsLoading, setUnitsLoading] = useState(true);
+  const [selectedUnit, setSelectedUnit] = useState<string>('');
+
+  const loadUnits = useCallback(async () => {
+    setUnitsLoading(true);
+    try {
+      const rows = await apiFetch<AdminUnit[]>('/api/admin/units');
+      setUnits(rows);
+      let initial = '';
+      try {
+        initial = window.localStorage.getItem(ADMIN_VIEW_KEY) ?? '';
+      } catch {
+        /* ignore */
+      }
+      const valid = rows.find((u) => u.id === initial);
+      setSelectedUnit(valid ? valid.id : rows[0]?.id ?? '');
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        router.replace('/admin/login');
+        return;
+      }
+      toast.error(err instanceof ApiError ? err.message : 'Falha ao carregar UPAs');
+    } finally {
+      setUnitsLoading(false);
+    }
+  }, [router, toast]);
+
+  useEffect(() => {
+    void loadUnits();
+  }, [loadUnits]);
+
+  const onPick = (id: string) => {
+    setSelectedUnit(id);
+    try {
+      window.localStorage.setItem(ADMIN_VIEW_KEY, id);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const selected = units.find((u) => u.id === selectedUnit) ?? null;
+  const unitName = selected?.canonical_name ?? 'Selecione uma UPA';
 
   return (
     <>
       <OfflineBanner />
-      <TopBar unitName="UPA Centro" shiftLabel="Enf. Ana Lima" />
+      <TopBar unitName={unitName} shiftLabel={user ? `Admin · ${user.name}` : 'Admin'} />
 
       <main className="mx-auto w-full max-w-[520px] px-4 pb-24 pt-4">
-        {/* Sala vermelha — leitos individuais */}
+        <section className="mt-2">
+          <div className="mb-2 px-1">
+            <h2 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-ink-3">
+              UPA em exibição
+            </h2>
+          </div>
+          <UnitPicker
+            units={units}
+            value={selectedUnit}
+            onChange={onPick}
+            loading={unitsLoading}
+          />
+        </section>
+
+        {selectedUnit ? (
+          <UnitGiro unitId={selectedUnit} />
+        ) : (
+          !unitsLoading && (
+            <p className="mt-8 rounded-card border border-line bg-surface p-4 text-center text-sm text-ink-2">
+              Nenhuma UPA disponível. Cadastre uma no painel admin.
+            </p>
+          )
+        )}
+      </main>
+
+      <ToastViewport />
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Shift / profissional / coordenador: giro da própria unidade
+// ---------------------------------------------------------------------------
+function ShiftHome({ unitId, userName }: { unitId: string | null; userName: string }) {
+  const router = useRouter();
+  const [cachedName, setCachedName] = useState<string | null>(null);
+
+  useEffect(() => {
+    try {
+      setCachedName(window.localStorage.getItem(SHIFT_UNIT_NAME_KEY));
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!unitId) router.replace('/pair');
+  }, [unitId, router]);
+
+  if (!unitId) return null;
+
+  return (
+    <>
+      <OfflineBanner />
+      <TopBar unitName={cachedName ?? 'Plantão'} shiftLabel={userName} />
+      <main className="mx-auto w-full max-w-[520px] px-4 pb-24 pt-4">
+        <UnitGiro unitId={unitId} />
+      </main>
+      <ToastViewport />
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Visão "giro" comum: lê unit state e renderiza apenas sectors habilitados.
+// ---------------------------------------------------------------------------
+function UnitGiro({ unitId }: { unitId: string }) {
+  const toast = useToast();
+  const { data, isLoading, error } = useUnitState(unitId);
+
+  const enabledKeys = useMemo(() => {
+    const set = new Set<string>();
+    (data?.sectors_config ?? []).forEach((s) => s.enabled && set.add(s.sector_key));
+    return set;
+  }, [data?.sectors_config]);
+
+  const redCapacity = useMemo(() => {
+    const cfg = data?.sectors_config.find((s) => s.sector_key === 'red_room');
+    return cfg?.capacity ?? 0;
+  }, [data?.sectors_config]);
+
+  const bedsByNumber = useMemo(() => {
+    const map = new Map<number, Bed>();
+    (data?.beds ?? []).forEach((b) => map.set(b.bed_number, b));
+    return map;
+  }, [data?.beds]);
+
+  const countersByKey = useMemo(() => indexBy(data?.counters ?? [], (c) => c.sector_key), [data?.counters]);
+  const specialistsByKey = useMemo(() => indexBy(data?.specialists ?? [], (s) => s.sector_key), [data?.specialists]);
+  const examsByKey = useMemo(() => indexBy(data?.exams ?? [], (e) => e.sector_key), [data?.exams]);
+
+  if (isLoading && !data) return <GiroSkeleton />;
+  if (error) {
+    return (
+      <div className="mt-6 rounded-card border border-critical/30 bg-critical-soft p-4 text-sm text-critical-ink">
+        Falha ao carregar estado da unidade.
+      </div>
+    );
+  }
+  if (!data) return null;
+
+  const yellowKeys = filterEnabledByPrefix(enabledKeys, ['yellow_']);
+  const isolationKeys = filterEnabledByPrefix(enabledKeys, ['isolation_']);
+  const otherCounterKeys = filterEnabledByKey(enabledKeys, ['obituary', 'pediatric_observation']);
+  const specialistKeys = filterEnabledByType(enabledKeys, 'specialist');
+  const examKeys = filterEnabledByType(enabledKeys, 'exam');
+
+  return (
+    <>
+      {enabledKeys.has('red_room') && redCapacity > 0 && (
         <Section title="Sala vermelha" subtitle="Leitos críticos com paciente identificado">
           <LayoutGroup>
             <div className="space-y-3">
-              {beds.map((bed, idx) => {
-                const bedNumber = idx + 1;
+              {Array.from({ length: redCapacity }, (_, i) => i + 1).map((bedNumber) => {
+                const bed = bedsByNumber.get(bedNumber) ?? null;
                 return (
                   <RedRoomBed
                     key={bedNumber}
                     bed={bed}
                     bedNumber={bedNumber}
-                    onSave={(data) => {
-                      // TODO Fase 7: PUT /api/unit/{id}/beds/{n} com If-Match
-                      // eslint-disable-next-line no-console
-                      console.log('save bed', bedNumber, data);
-                      toast.success(`Leito ${bedNumber} salvo`);
+                    onSave={async ({ patient_sigla, clinical_summary }) => {
+                      try {
+                        await apiMutate(
+                          `/api/unit/${unitId}/beds/${bedNumber}`,
+                          {
+                            method: 'PUT',
+                            headers: ifMatch(bed?.version),
+                            body: JSON.stringify({ patient_sigla, clinical_summary }),
+                          },
+                          { offlineQueue: true },
+                        );
+                        toast.success(`Leito ${bedNumber} salvo`);
+                      } catch (err) {
+                        toast.error(apiErrorMsg(err, 'Falha ao salvar leito'));
+                      }
                     }}
-                    onDischarge={() => {
-                      // eslint-disable-next-line no-console
-                      console.log('discharge', bedNumber);
-                      toast.success(`Alta no leito ${bedNumber}`);
+                    onDischarge={async () => {
+                      try {
+                        await apiMutate(
+                          `/api/unit/${unitId}/beds/${bedNumber}/discharge`,
+                          { method: 'POST', headers: ifMatch(bed?.version) },
+                          { offlineQueue: true },
+                        );
+                        toast.success(`Alta no leito ${bedNumber}`);
+                      } catch (err) {
+                        toast.error(apiErrorMsg(err, 'Falha na alta'));
+                      }
                     }}
-                    onDeath={(pin) => {
-                      // eslint-disable-next-line no-console
-                      console.log('death', bedNumber, 'pin len', pin.length);
-                      toast.show(`Óbito registrado no leito ${bedNumber}`, 'warning');
+                    onDeath={async (pin) => {
+                      try {
+                        await apiMutate(`/api/unit/${unitId}/beds/${bedNumber}/death`, {
+                          method: 'POST',
+                          headers: { ...ifMatch(bed?.version), 'X-PIN-Confirm': pin },
+                        });
+                        toast.show(`Óbito registrado no leito ${bedNumber}`, 'warning');
+                      } catch (err) {
+                        toast.error(apiErrorMsg(err, 'Falha ao registrar óbito'));
+                        throw err;
+                      }
                     }}
-                    onTransfer={() => {
-                      // eslint-disable-next-line no-console
-                      console.log('transfer', bedNumber);
-                      toast.show(`Transferência no leito ${bedNumber}`, 'warning');
+                    onTransfer={async () => {
+                      try {
+                        await apiMutate(
+                          `/api/unit/${unitId}/beds/${bedNumber}/transfer`,
+                          {
+                            method: 'POST',
+                            headers: ifMatch(bed?.version),
+                            body: JSON.stringify({ destination: null }),
+                          },
+                          { offlineQueue: true },
+                        );
+                        toast.show(`Transferência no leito ${bedNumber}`, 'warning');
+                      } catch (err) {
+                        toast.error(apiErrorMsg(err, 'Falha na transferência'));
+                      }
                     }}
-                    onClear={() => {
-                      // eslint-disable-next-line no-console
-                      console.log('clear', bedNumber);
-                      toast.show(`Leito ${bedNumber} esvaziado`);
+                    onClear={async () => {
+                      try {
+                        await apiMutate(
+                          `/api/unit/${unitId}/beds/${bedNumber}/clear`,
+                          { method: 'POST', headers: ifMatch(bed?.version) },
+                          { offlineQueue: true },
+                        );
+                        toast.show(`Leito ${bedNumber} esvaziado`);
+                      } catch (err) {
+                        toast.error(apiErrorMsg(err, 'Falha ao esvaziar'));
+                      }
                     }}
                   />
                 );
@@ -163,85 +308,168 @@ export default function OperatorHomePage() {
             </div>
           </LayoutGroup>
         </Section>
+      )}
 
-        {/* Sala amarela — counters */}
+      {yellowKeys.length > 0 && (
         <Section title="Sala amarela" subtitle="Ocupação por gênero">
-          <div className="grid grid-cols-1 gap-3">
-            {MOCK_COUNTERS_YELLOW.map((c) => (
-              <CounterSector
-                key={c.key}
-                sector={{ ...c, icon: SECTORS[c.key as keyof typeof SECTORS]?.icon }}
-                onSave={(next) => {
-                  // eslint-disable-next-line no-console
-                  console.log('save counter', c.key, next);
-                  toast.success(`${c.label} atualizado`);
-                }}
-              />
-            ))}
-          </div>
+          <CounterList keys={yellowKeys} counters={countersByKey} unitId={unitId} />
         </Section>
+      )}
 
-        {/* Isolamento — counters */}
+      {isolationKeys.length > 0 && (
         <Section title="Isolamento" subtitle="Quartos com precaução">
-          <div className="grid grid-cols-1 gap-3">
-            {MOCK_COUNTERS_ISOLATION.map((c) => (
-              <CounterSector
-                key={c.key}
-                sector={{ ...c, icon: SECTORS[c.key as keyof typeof SECTORS]?.icon }}
-                onSave={(next) => {
-                  // eslint-disable-next-line no-console
-                  console.log('save counter', c.key, next);
-                  toast.success(`${c.label} atualizado`);
-                }}
-              />
-            ))}
-          </div>
+          <CounterList keys={isolationKeys} counters={countersByKey} unitId={unitId} />
         </Section>
+      )}
 
-        {/* Especialistas */}
-        <Section title="Especialistas" subtitle="Toque pra ciclar · pressione pra escolher">
+      {otherCounterKeys.length > 0 && (
+        <Section title="Outros setores">
+          <CounterList keys={otherCounterKeys} counters={countersByKey} unitId={unitId} />
+        </Section>
+      )}
+
+      {specialistKeys.length > 0 && (
+        <Section title="Especialistas" subtitle="Toque para alterar disponibilidade">
           <div className="grid grid-cols-2 gap-3">
-            {MOCK_SPECIALISTS.map((s) => (
-              <SpecialistCard
-                key={s.key}
-                sectorKey={s.key}
-                label={s.label}
-                status={s.status}
-                icon={SECTORS[s.key as keyof typeof SECTORS]?.icon}
-                onChange={(next) => {
-                  // eslint-disable-next-line no-console
-                  console.log('specialist', s.key, next);
-                  toast.success(`${s.label}: ${next}`);
-                }}
-              />
-            ))}
+            {specialistKeys.map((key) => {
+              const meta = SECTORS[key];
+              const sp = specialistsByKey.get(key);
+              return (
+                <SpecialistCard
+                  key={key}
+                  sectorKey={key}
+                  label={shortSpecialistLabel(meta.label)}
+                  status={sp?.status ?? 'unavailable'}
+                  icon={meta.icon}
+                  onChange={async (next) => {
+                    try {
+                      await apiMutate(
+                        `/api/unit/${unitId}/specialists/${key}`,
+                        {
+                          method: 'PUT',
+                          headers: ifMatch(sp?.version),
+                          body: JSON.stringify({ status: next }),
+                        },
+                        { offlineQueue: true },
+                      );
+                      toast.success(`${meta.label}: ${next}`);
+                    } catch (err) {
+                      toast.error(apiErrorMsg(err, 'Falha ao atualizar especialista'));
+                    }
+                  }}
+                />
+              );
+            })}
           </div>
         </Section>
+      )}
 
-        {/* Exames */}
+      {examKeys.length > 0 && (
         <Section title="Exames" subtitle="Disponibilidade de equipamentos">
           <div className="space-y-2.5">
-            {MOCK_EXAMS.map((e) => (
-              <ExamCard
-                key={e.key}
-                sectorKey={e.key}
-                label={e.label}
-                status={e.status}
-                unavailable_reason={e.unavailable_reason}
-                icon={SECTORS[e.key as keyof typeof SECTORS]?.icon}
-                onChange={(next) => {
-                  // eslint-disable-next-line no-console
-                  console.log('exam', e.key, next);
-                  toast.success(`${e.label} atualizado`);
-                }}
-              />
-            ))}
+            {examKeys.map((key) => {
+              const meta = SECTORS[key];
+              const ex = examsByKey.get(key);
+              return (
+                <ExamCard
+                  key={key}
+                  sectorKey={key}
+                  label={meta.label}
+                  status={ex?.status ?? 'working'}
+                  unavailable_reason={ex?.unavailable_reason ?? null}
+                  icon={meta.icon}
+                  onChange={async (next) => {
+                    try {
+                      await apiMutate(
+                        `/api/unit/${unitId}/exams/${key}`,
+                        {
+                          method: 'PUT',
+                          headers: ifMatch(ex?.version),
+                          body: JSON.stringify(next),
+                        },
+                        { offlineQueue: true },
+                      );
+                      toast.success(`${meta.label} atualizado`);
+                    } catch (err) {
+                      toast.error(apiErrorMsg(err, 'Falha ao atualizar exame'));
+                    }
+                  }}
+                />
+              );
+            })}
           </div>
         </Section>
-      </main>
+      )}
 
-      <ToastViewport />
+      {enabledKeys.size === 0 && (
+        <p className="mt-8 rounded-card border border-line bg-surface p-4 text-center text-sm text-ink-2">
+          Nenhum setor habilitado nesta UPA. Configure em <em>Setores</em>.
+        </p>
+      )}
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function CounterList({
+  keys,
+  counters,
+  unitId,
+}: {
+  keys: SectorKey[];
+  counters: Map<string, Counter>;
+  unitId: string;
+}) {
+  const toast = useToast();
+  return (
+    <div className="grid grid-cols-1 gap-3">
+      {keys.map((key) => {
+        const meta = SECTORS[key];
+        const c = counters.get(key);
+        return (
+          <CounterSector
+            key={key}
+            sector={{
+              key,
+              label: counterLabel(meta.label),
+              occupancy: c?.occupancy ?? 0,
+              capacity: c?.capacity ?? 0,
+              version: c?.version ?? 0,
+              icon: meta.icon,
+            }}
+            onSave={async (next) => {
+              try {
+                await apiMutate(
+                  `/api/unit/${unitId}/counters/${key}`,
+                  {
+                    method: 'PUT',
+                    headers: ifMatch(c?.version),
+                    body: JSON.stringify(next),
+                  },
+                  { offlineQueue: true },
+                );
+                toast.success(`${counterLabel(meta.label)} atualizado`);
+              } catch (err) {
+                toast.error(apiErrorMsg(err, 'Falha ao atualizar contador'));
+              }
+            }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function GiroSkeleton() {
+  return (
+    <div className="mt-6 space-y-4" aria-label="Carregando giro">
+      {[0, 1, 2].map((i) => (
+        <div key={i} className="skeleton-card h-24" />
+      ))}
+    </div>
   );
 }
 
@@ -267,4 +495,49 @@ function Section({
       {children}
     </section>
   );
+}
+
+function ifMatch(version: number | null | undefined): Record<string, string> {
+  if (typeof version !== 'number' || version <= 0) return {};
+  return { 'If-Match': String(version) };
+}
+
+function apiErrorMsg(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) {
+    if (err.status === 409) return 'Outro plantonista atualizou antes de você. Recarregando…';
+    return err.message || fallback;
+  }
+  return fallback;
+}
+
+function indexBy<T>(items: T[], key: (item: T) => string): Map<string, T> {
+  const map = new Map<string, T>();
+  for (const it of items) map.set(key(it), it);
+  return map;
+}
+
+function filterEnabledByPrefix(enabled: Set<string>, prefixes: string[]): SectorKey[] {
+  return (Object.keys(SECTORS) as SectorKey[])
+    .filter((k) => enabled.has(k) && prefixes.some((p) => k.startsWith(p)))
+    .sort((a, b) => SECTORS[a].order - SECTORS[b].order);
+}
+
+function filterEnabledByKey(enabled: Set<string>, keys: SectorKey[]): SectorKey[] {
+  return keys.filter((k) => enabled.has(k)).sort((a, b) => SECTORS[a].order - SECTORS[b].order);
+}
+
+function filterEnabledByType(enabled: Set<string>, type: 'specialist' | 'exam'): SectorKey[] {
+  return (Object.keys(SECTORS) as SectorKey[])
+    .filter((k) => enabled.has(k) && SECTORS[k].type === type)
+    .sort((a, b) => SECTORS[a].order - SECTORS[b].order);
+}
+
+function counterLabel(full: string): string {
+  // "Sala amarela — Feminino" → "Feminino"; "Isolamento adulto M" → keep
+  const dash = full.split(' — ');
+  return dash.length > 1 ? dash[1]! : full;
+}
+
+function shortSpecialistLabel(full: string): string {
+  return full;
 }
