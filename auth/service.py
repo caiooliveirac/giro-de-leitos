@@ -155,7 +155,8 @@ def find_user_by_username(conn, username: str) -> Optional[dict[str, Any]]:
         cur.execute(
             """
             SELECT id, name, role, status, unit_id, cargo, photo_url,
-                   cpf_encrypted, coren_crm, password_hash, pin_hash
+                   cpf_encrypted, coren_crm, password_hash, pin_hash,
+                   must_change_password
               FROM users
              WHERE LOWER(username) = LOWER(%s)
             """,
@@ -175,7 +176,8 @@ def find_user_by_cpf_digits(conn, cpf_digits: str) -> Optional[dict[str, Any]]:
         cur.execute(
             """
             SELECT id, name, role, status, unit_id, cargo, photo_url,
-                   cpf_encrypted, coren_crm, password_hash, pin_hash
+                   cpf_encrypted, coren_crm, password_hash, pin_hash,
+                   must_change_password
               FROM users
              WHERE cpf_hash = %s
             """,
@@ -692,7 +694,8 @@ def list_unit_members(conn, unit_id: UUID | str) -> list[dict[str, Any]]:
         cur.execute(
             """
             SELECT id, name, role, cargo, coren_crm, phone, photo_url, status,
-                   unit_id, cpf_encrypted, created_at, approved_at
+                   unit_id, cpf_encrypted, username, must_change_password,
+                   created_at, approved_at
               FROM users
              WHERE unit_id = %s AND role IN ('coordinator', 'professional')
              ORDER BY
@@ -707,6 +710,101 @@ def list_unit_members(conn, unit_id: UUID | str) -> list[dict[str, Any]]:
             (str(unit_id),),
         )
         return cur.fetchall()
+
+
+def _generate_temp_numeric_password() -> str:
+    """6-digit zero-padded numeric password. ~1M space — fine for a temp credential
+    paired with a forced change on next login. Avoids confusable look-alikes by
+    using all digits and no letters."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def admin_reset_user_password(
+    conn, admin: dict[str, Any], user_id: UUID | str
+) -> dict[str, Any]:
+    """Generate a temporary numeric password for a user. Sets must_change_password.
+
+    Returns ``{user_id, name, username, temp_password}``. Plaintext password is
+    only returned this one time — caller must surface it to the admin and never
+    persist it.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, name, role, status, username
+              FROM users
+             WHERE id = %s
+            """,
+            (str(user_id),),
+        )
+        user = cur.fetchone()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+    if user["role"] == "admin":
+        raise HTTPException(status_code=403, detail="Não é possível resetar senha de admin.")
+    if user["status"] == "pending":
+        raise HTTPException(
+            status_code=400,
+            detail="Cadastro ainda pendente. Aprove antes de resetar a senha.",
+        )
+
+    temp_password = _generate_temp_numeric_password()
+    new_hash = crypto.hash_password(temp_password)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE users
+               SET password_hash = %s,
+                   must_change_password = TRUE
+             WHERE id = %s
+            """,
+            (new_hash, str(user_id)),
+        )
+    return {
+        "user_id": str(user["id"]),
+        "name": user["name"],
+        "username": user.get("username"),
+        "temp_password": temp_password,
+    }
+
+
+_PASSWORD_MIN_LEN = 6
+
+
+def change_my_password(conn, user_id: UUID | str, new_password: str) -> None:
+    """Change the current user's password and clear must_change_password.
+
+    Caller is responsible for authenticating via session/device. We only refuse
+    if the new password is too short or identical to the current hash.
+    """
+    if not new_password or len(new_password) < _PASSWORD_MIN_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Senha precisa ter pelo menos {_PASSWORD_MIN_LEN} caracteres.",
+        )
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT password_hash FROM users WHERE id = %s",
+            (str(user_id),),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+    if row.get("password_hash") and crypto.verify_password(new_password, row["password_hash"]):
+        raise HTTPException(
+            status_code=400, detail="Escolha uma senha diferente da anterior."
+        )
+    new_hash = crypto.hash_password(new_password)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE users
+               SET password_hash = %s,
+                   must_change_password = FALSE
+             WHERE id = %s
+            """,
+            (new_hash, str(user_id)),
+        )
 
 
 def list_pending(conn, approver: dict[str, Any]) -> list[dict[str, Any]]:

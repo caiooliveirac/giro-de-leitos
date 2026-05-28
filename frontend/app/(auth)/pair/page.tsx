@@ -344,8 +344,13 @@ function SelfPairMode() {
       } catch {
         // ignore localStorage failures
       }
-      toast.success('Aparelho pareado · plantão iniciado');
-      router.push('/');
+      if (result.must_change_password) {
+        toast.warning('Senha temporária — escolha uma nova senha pra continuar');
+        router.push('/trocar-senha');
+      } else {
+        toast.success('Aparelho pareado · plantão iniciado');
+        router.push('/');
+      }
     } catch (err) {
       let msg = 'Não foi possível parear.';
       if (err instanceof ApiError) {

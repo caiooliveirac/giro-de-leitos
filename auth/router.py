@@ -28,8 +28,10 @@ from auth.deps import (
 )
 from auth.schemas import (
     AdminLogin,
+    AdminResetPasswordResponse,
     AdminUnit,
     ApproveResponse,
+    ChangeMyPasswordPayload,
     DeviceGenerateCodeRequest,
     DeviceGenerateCodeResponse,
     DevicePair,
@@ -274,6 +276,7 @@ def device_self_pair(
         session_id=result["session"]["id"],
         expires_at=result["session"]["expires_at"],
         user=_user_public(result["user"]),
+        must_change_password=bool(result["user"].get("must_change_password")),
     )
 
 
@@ -613,11 +616,60 @@ def list_unit_members_endpoint(
             phone=r.get("phone"),
             photo_url=r.get("photo_url"),
             cpf_masked=_safe_cpf_masked(r.get("cpf_encrypted")),
+            username=r.get("username"),
+            must_change_password=bool(r.get("must_change_password")),
             created_at=r["created_at"],
             approved_at=r.get("approved_at"),
         )
         for r in rows
     ]
+
+
+@router.post(
+    "/admin/users/{user_id}/reset-password",
+    response_model=AdminResetPasswordResponse,
+)
+def admin_reset_password_endpoint(
+    user_id: UUID,
+    request: Request,
+    admin=Depends(get_current_admin),
+    conn=Depends(get_db),
+):
+    """Admin-only: issue a temporary numeric password and force change on next login."""
+    result = service.admin_reset_user_password(conn, admin, user_id)
+    record_audit(
+        conn,
+        actor_user_id=admin["id"],
+        action="user.password.reset",
+        entity_type="user",
+        entity_id=str(user_id),
+        new_value={"forced_change": True},
+        **client_meta(request),
+    )
+    return AdminResetPasswordResponse(**result)
+
+
+@router.post("/auth/me/password")
+def change_my_password_endpoint(
+    payload: ChangeMyPasswordPayload,
+    request: Request,
+    ctx=Depends(get_current_session),
+    conn=Depends(get_db),
+):
+    """Change the authenticated user's password. Clears must_change_password."""
+    user_id = ctx["user"]["id"]
+    service.change_my_password(conn, user_id, payload.new_password)
+    record_audit(
+        conn,
+        actor_user_id=user_id,
+        session_id=ctx["session"]["id"],
+        device_id=ctx["device"]["device_id"],
+        action="user.password.change",
+        entity_type="user",
+        entity_id=str(user_id),
+        **client_meta(request),
+    )
+    return {"ok": True}
 
 
 @router.post("/users/{user_id}/suspend", response_model=ApproveResponse)

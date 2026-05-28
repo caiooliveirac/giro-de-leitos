@@ -3,8 +3,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
+  AlertTriangle,
   Check,
   Copy,
+  KeyRound,
   MessageCircle,
   Pause,
   Share2,
@@ -44,8 +46,17 @@ interface UnitMember {
   phone: string | null;
   photo_url: string | null;
   cpf_masked: string;
+  username: string | null;
+  must_change_password: boolean;
   created_at: string;
   approved_at: string | null;
+}
+
+interface ResetPasswordResponse {
+  user_id: string;
+  name: string;
+  username: string | null;
+  temp_password: string;
 }
 
 interface CoordPendingUser {
@@ -105,6 +116,8 @@ function AdminEquipe({ userName }: { userName: string | null }) {
   const [invite, setInvite] = useState<InviteCreateResponse | null>(null);
   const [busyInvite, setBusyInvite] = useState(false);
   const [inviteType, setInviteType] = useState<'professional' | 'coordinator'>('professional');
+  const [resetResult, setResetResult] = useState<ResetPasswordResponse | null>(null);
+  const [resetBusyId, setResetBusyId] = useState<string | null>(null);
 
   const loadUnits = useCallback(async () => {
     setUnitsLoading(true);
@@ -223,6 +236,22 @@ function AdminEquipe({ userName }: { userName: string | null }) {
     }
   };
 
+  const resetPassword = async (id: string) => {
+    setResetBusyId(id);
+    try {
+      const res = await apiFetch<ResetPasswordResponse>(
+        `/api/admin/users/${id}/reset-password`,
+        { method: 'POST' },
+      );
+      setResetResult(res);
+      void loadMembers(selectedUnit);
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : 'Falha ao resetar senha');
+    } finally {
+      setResetBusyId(null);
+    }
+  };
+
   const grouped = useMemo(() => groupMembers(members), [members]);
   const selectedUnitName =
     units.find((u) => u.id === selectedUnit)?.canonical_name ?? 'Equipe';
@@ -323,9 +352,17 @@ function AdminEquipe({ userName }: { userName: string | null }) {
               <MemberList
                 loading={membersLoading}
                 members={grouped.active}
+                showLogin
                 emptyText="Nenhum membro ativo."
                 actions={(m) => (
-                  <SuspendButton onSuspend={() => suspend(m.id)} label={`Suspender ${m.name}`} />
+                  <>
+                    <ResetPasswordButton
+                      busy={resetBusyId === m.id}
+                      onReset={() => resetPassword(m.id)}
+                      label={`Resetar senha de ${m.name}`}
+                    />
+                    <SuspendButton onSuspend={() => suspend(m.id)} label={`Suspender ${m.name}`} />
+                  </>
                 )}
               />
             </Section>
@@ -335,6 +372,7 @@ function AdminEquipe({ userName }: { userName: string | null }) {
                 <MemberList
                   loading={false}
                   members={grouped.suspended}
+                  showLogin
                   emptyText=""
                   actions={(m) => (
                     <ApproveButton
@@ -348,6 +386,9 @@ function AdminEquipe({ userName }: { userName: string | null }) {
           </>
         )}
       </main>
+
+      <ResetPasswordModal result={resetResult} onClose={() => setResetResult(null)} />
+
       <ToastViewport />
     </>
   );
@@ -517,11 +558,13 @@ function MemberList({
   members,
   emptyText,
   actions,
+  showLogin = false,
 }: {
   loading: boolean;
   members: UnitMember[];
   emptyText: string;
   actions: (m: UnitMember) => React.ReactNode;
+  showLogin?: boolean;
 }) {
   if (loading) {
     return (
@@ -554,13 +597,28 @@ function MemberList({
             <Avatar name={m.name} photoUrl={m.photo_url} />
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm font-semibold text-text-primary">
-                {m.name}{' '}
-                <RoleBadge role={m.role} />
+                {m.name} <RoleBadge role={m.role} />
+                {m.must_change_password && (
+                  <span
+                    className="ml-1 inline-flex items-center gap-1 rounded-full bg-warning-soft px-1.5 py-0.5 align-middle text-[10px] font-medium text-warning-ink"
+                    title="Senha temporária — usuário deve trocar no próximo login"
+                  >
+                    <AlertTriangle size={10} aria-hidden /> trocar senha
+                  </span>
+                )}
               </p>
               <p className="truncate text-xs text-text-secondary">
                 {m.cargo ?? '—'}
                 {m.coren_crm ? ` · ${m.coren_crm}` : ''}
               </p>
+              {showLogin && (
+                <p className="truncate text-[11px] font-medium text-text-secondary">
+                  Login:{' '}
+                  <span className="font-mono tabular-nums text-text-primary">
+                    {m.username ?? m.cpf_masked}
+                  </span>
+                </p>
+              )}
               <p className="truncate text-[11px] text-text-tertiary">
                 CPF {m.cpf_masked}
                 {m.phone ? ` · ${m.phone}` : ''}
@@ -685,6 +743,145 @@ function RejectButton({ onReject }: { onReject: () => void | Promise<void> }) {
       </AnimatePresence>
       <X size={18} className="relative" />
     </button>
+  );
+}
+
+function ResetPasswordButton({
+  onReset,
+  busy,
+  label,
+}: {
+  onReset: () => void | Promise<void>;
+  busy: boolean;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => void onReset()}
+      disabled={busy}
+      aria-label={label}
+      title={label}
+      className="flex h-10 w-10 items-center justify-center rounded-pill bg-accent-blue/10 text-accent-blue transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue hover:bg-accent-blue/20 disabled:opacity-50"
+    >
+      <KeyRound size={16} />
+    </button>
+  );
+}
+
+function ResetPasswordModal({
+  result,
+  onClose,
+}: {
+  result: ResetPasswordResponse | null;
+  onClose: () => void;
+}) {
+  const toast = useToast();
+
+  const copyPair = async () => {
+    if (!result) return;
+    const text = result.username
+      ? `Login: ${result.username}\nSenha temporária: ${result.temp_password}`
+      : `Senha temporária: ${result.temp_password}`;
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success('Login e senha copiados');
+    } catch {
+      toast.error('Não foi possível copiar');
+    }
+  };
+
+  const waText = result
+    ? result.username
+      ? `Acesso Giro:%0ALogin: ${result.username}%0ASenha temporária: ${result.temp_password}%0A%0AVocê precisará trocar a senha no primeiro login.`
+      : `Senha temporária Giro: ${result.temp_password}%0A%0AVocê precisará trocar a senha no primeiro login.`
+    : '';
+  const waUrl = result ? `https://wa.me/?text=${waText}` : '#';
+
+  return (
+    <AnimatePresence>
+      {result && (
+        <motion.div
+          key="reset-backdrop"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="fixed inset-0 z-50 flex items-end justify-center bg-black/45 backdrop-blur-sm sm:items-center"
+          onClick={onClose}
+        >
+          <motion.div
+            key="reset-card"
+            initial={{ y: 40, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: 40, opacity: 0 }}
+            transition={{ type: 'spring', stiffness: 320, damping: 32 }}
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-[520px] rounded-t-card border border-border bg-card p-5 sm:rounded-card"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-semibold text-text-primary">
+                  Senha temporária gerada
+                </h3>
+                <p className="mt-1 text-xs text-text-secondary">
+                  Para <strong>{result.name}</strong>. Anote ou envie agora — não vamos
+                  mostrar essa senha de novo.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Fechar"
+                className="flex h-8 w-8 items-center justify-center rounded-pill text-text-secondary transition hover:bg-border/40"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-2">
+              <div className="rounded-card border border-border bg-surface px-3 py-2.5">
+                <p className="text-[11px] uppercase tracking-wide text-text-tertiary">
+                  Login
+                </p>
+                <p className="mt-0.5 font-mono text-sm font-semibold text-text-primary">
+                  {result.username ?? '(usar CPF)'}
+                </p>
+              </div>
+              <div className="rounded-card border border-accent-blue/30 bg-accent-blue/5 px-3 py-3">
+                <p className="text-[11px] uppercase tracking-wide text-accent-blue">
+                  Senha temporária
+                </p>
+                <p className="mt-0.5 font-mono text-2xl font-semibold tabular-nums tracking-[0.2em] text-text-primary">
+                  {result.temp_password}
+                </p>
+              </div>
+              <p className="flex items-start gap-1.5 text-[11px] text-warning-ink">
+                <AlertTriangle size={12} className="mt-0.5 shrink-0" aria-hidden />
+                No próximo login, vai ser obrigatório escolher uma nova senha.
+              </p>
+            </div>
+
+            <div className="mt-4 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => void copyPair()}
+                className="flex items-center justify-center gap-1.5 rounded-pill border border-border bg-surface px-3 py-2.5 text-sm font-medium text-text-primary transition hover:bg-border/40"
+              >
+                <Copy size={14} /> Copiar
+              </button>
+              <a
+                href={waUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center justify-center gap-1.5 rounded-pill bg-accent-green px-3 py-2.5 text-sm font-semibold text-white"
+              >
+                <MessageCircle size={14} /> WhatsApp
+              </a>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 

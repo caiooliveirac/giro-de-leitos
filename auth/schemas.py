@@ -74,6 +74,7 @@ class DeviceSelfPairResponse(BaseModel):
     session_id: UUID
     expires_at: datetime
     user: "UserPublic"
+    must_change_password: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +193,21 @@ class UnitMember(BaseModel):
     phone: Optional[str] = None
     photo_url: Optional[str] = None
     cpf_masked: str
+    username: Optional[str] = None
+    must_change_password: bool = False
     created_at: datetime
     approved_at: Optional[datetime] = None
+
+
+class AdminResetPasswordResponse(BaseModel):
+    user_id: UUID
+    name: str
+    username: Optional[str] = None
+    temp_password: str
+
+
+class ChangeMyPasswordPayload(BaseModel):
+    new_password: str
 
 
 # ---------------------------------------------------------------------------

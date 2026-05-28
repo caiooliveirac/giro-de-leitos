@@ -218,6 +218,7 @@ export interface DeviceSelfPairResponse {
   unit_id: string;
   session_id: string;
   expires_at: string;
+  must_change_password: boolean;
   user: {
     id: string;
     name: string;
