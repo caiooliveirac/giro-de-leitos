@@ -32,10 +32,14 @@ export type SectorKey =
   | 'isolation_pediatric'
   | 'obituary'
   | 'pediatric_observation'
+  | 'medication_room'
+  | 'ward_internment'
+  | 'ward_pediatric_internment'
   | 'surgeon'
   | 'orthopedist'
   | 'dentist'
   | 'pediatrician'
+  | 'psychiatrist'
   | 'xray'
   | 'ecg'
   | 'lab'
@@ -111,27 +115,55 @@ export const SECTORS: Record<SectorKey, SectorMeta> = {
     icon: Baby,
     order: 10,
   },
-  surgeon: { key: 'surgeon', label: 'Cirurgião', type: 'specialist', icon: Scissors, order: 11 },
+  medication_room: {
+    key: 'medication_room',
+    label: 'Sala de medicação / verde',
+    type: 'counter',
+    icon: Syringe,
+    order: 11,
+  },
+  ward_internment: {
+    key: 'ward_internment',
+    label: 'Internamento',
+    type: 'counter',
+    icon: Users,
+    order: 12,
+  },
+  ward_pediatric_internment: {
+    key: 'ward_pediatric_internment',
+    label: 'Internamento pediátrico',
+    type: 'counter',
+    icon: Baby,
+    order: 13,
+  },
+  surgeon: { key: 'surgeon', label: 'Cirurgião', type: 'specialist', icon: Scissors, order: 14 },
   orthopedist: {
     key: 'orthopedist',
     label: 'Ortopedista',
     type: 'specialist',
     icon: Bone,
-    order: 12,
+    order: 15,
   },
-  dentist: { key: 'dentist', label: 'Dentista', type: 'specialist', icon: Pill, order: 13 },
+  dentist: { key: 'dentist', label: 'Dentista', type: 'specialist', icon: Pill, order: 16 },
   pediatrician: {
     key: 'pediatrician',
     label: 'Pediatra',
     type: 'specialist',
     icon: Stethoscope,
-    order: 14,
+    order: 17,
   },
-  xray: { key: 'xray', label: 'Raio-X', type: 'exam', icon: ScanLine, order: 15 },
-  ecg: { key: 'ecg', label: 'ECG', type: 'exam', icon: Activity, order: 16 },
-  lab: { key: 'lab', label: 'Laboratório', type: 'exam', icon: FlaskConical, order: 17 },
-  ultrasound: { key: 'ultrasound', label: 'Ultrassom', type: 'exam', icon: Waves, order: 18 },
-  tomography: { key: 'tomography', label: 'Tomografia', type: 'exam', icon: Scan, order: 19 },
+  psychiatrist: {
+    key: 'psychiatrist',
+    label: 'Psiquiatra',
+    type: 'specialist',
+    icon: Activity,
+    order: 18,
+  },
+  xray: { key: 'xray', label: 'Raio-X', type: 'exam', icon: ScanLine, order: 19 },
+  ecg: { key: 'ecg', label: 'ECG', type: 'exam', icon: HeartPulse, order: 20 },
+  lab: { key: 'lab', label: 'Laboratório', type: 'exam', icon: FlaskConical, order: 21 },
+  ultrasound: { key: 'ultrasound', label: 'Ultrassom', type: 'exam', icon: Waves, order: 22 },
+  tomography: { key: 'tomography', label: 'Tomografia', type: 'exam', icon: Scan, order: 23 },
 };
 
 export const SECTOR_LIST: SectorMeta[] = Object.values(SECTORS).sort((a, b) => a.order - b.order);

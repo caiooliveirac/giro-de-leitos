@@ -17,8 +17,11 @@ Regras (resumo):
   - isolation_adult_m / isolation_adult_f: enabled se cada capacity > 0
   - isolation_pediatric: enabled se isolation_pediatric_capacity > 0
   - specialists `orthopedist` e `surgeon`: enabled = True (todas UPAs)
-  - obituary, pediatric_observation, dentist, pediatrician, exames:
-    desabilitados (parser nao cobre — coord decide depois)
+  - dentist/pediatrician/psychiatrist: enabled onde o bloco ATENDIMENTO
+    reporta o sinal (payload.data.specialists / coluna has_psychiatrist)
+  - medication_room / ward_internment / ward_pediatric_internment: enabled
+    onde rooms.other_beds reporta capacity > 0
+  - obituary, pediatric_observation, exames: desabilitados (coord decide)
 
 NUNCA mexe em counters / beds / specialists / exams: deixa a projecao em
 memoria (fallback) cuidar deles. Conflitos com edicoes manuais futuras
@@ -63,6 +66,42 @@ def _payload_room_capacity(payload: dict | None, room_key: str) -> int | None:
     if isinstance(cap, int):
         return cap
     return None
+
+
+# Rótulos do parser (other_beds[].key) → sector_key sintético do app.
+_OTHER_BEDS_KEY_MAP = {
+    "other_medicacao": "medication_room",
+    "other_verde": "medication_room",
+    "other_internamento": "ward_internment",
+    "other_pediatria": "ward_pediatric_internment",
+}
+
+
+def _payload_other_beds_capacity(payload: dict | None) -> dict[str, int]:
+    """Soma capacidades de rooms.other_beds por sector_key sintético."""
+    out: dict[str, int] = {}
+    if not payload:
+        return out
+    rooms = (payload.get("data") or {}).get("rooms") if isinstance(payload.get("data"), dict) else None
+    other_beds = rooms.get("other_beds") if isinstance(rooms, dict) else None
+    if not isinstance(other_beds, list):
+        return out
+    for bed in other_beds:
+        if not isinstance(bed, dict):
+            continue
+        sector_key = _OTHER_BEDS_KEY_MAP.get(str(bed.get("key") or ""))
+        cap = bed.get("capacity")
+        if sector_key and isinstance(cap, int):
+            out[sector_key] = out.get(sector_key, 0) + cap
+    return out
+
+
+def _payload_specialist(payload: dict | None, has_key: str) -> bool:
+    """Lê data.specialists.<has_key> do payload (ex.: has_dentist)."""
+    if not payload:
+        return False
+    spec = (payload.get("data") or {}).get("specialists") if isinstance(payload.get("data"), dict) else None
+    return bool(spec.get(has_key)) if isinstance(spec, dict) else False
 
 
 def _compute_plan(row: dict) -> list[tuple[str, bool, int | None]]:
@@ -155,11 +194,20 @@ def _compute_plan(row: dict) -> list[tuple[str, bool, int | None]]:
     plan.append(("obituary", False, None))
     plan.append(("pediatric_observation", False, None))
 
-    # Type C: specialists
+    # Type B derivados de rooms.other_beds (sala medicação/verde, internamento,
+    # internamento pediátrico). Habilita onde o parser reporta capacity > 0.
+    other_caps = _payload_other_beds_capacity(payload)
+    for sector_key in ("medication_room", "ward_internment", "ward_pediatric_internment"):
+        cap = other_caps.get(sector_key)
+        plan.append((sector_key, bool(cap and cap > 0), cap if cap and cap > 0 else None))
+
+    # Type C: specialists. orthopedist/surgeon sempre; dentist/pediatra/psiquiatra
+    # habilitados onde o parser (bloco ATENDIMENTO) reporta o sinal.
     plan.append(("orthopedist", True, None))
     plan.append(("surgeon", True, None))
-    plan.append(("dentist", False, None))
-    plan.append(("pediatrician", False, None))
+    plan.append(("dentist", _payload_specialist(payload, "has_dentist"), None))
+    plan.append(("pediatrician", _payload_specialist(payload, "has_pediatrician"), None))
+    plan.append(("psychiatrist", bool(row.get("has_psychiatrist")), None))
 
     # Type D: exames — nada habilitado por padrao
     for exam in ("xray", "ecg", "lab", "ultrasound", "tomography"):

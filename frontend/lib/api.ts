@@ -214,6 +214,9 @@ export interface UnitState {
   updated_at?: string;
   parser_snapshot?: ParserSnapshot | null;
   provenance?: GiroProvenance | null;
+  red_room_assumed?: boolean;
+  red_room_assumed_by?: string | null;
+  red_room_assumed_at?: string | null;
 }
 
 // ---------------------------------------------------------------------------

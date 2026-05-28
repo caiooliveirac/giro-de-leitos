@@ -41,6 +41,8 @@ def test_beds_router_registered():
     assert "/api/unit/{unit_id}/counters/{sector_key}" in paths
     assert "/api/unit/{unit_id}/specialists/{sector_key}" in paths
     assert "/api/unit/{unit_id}/exams/{sector_key}" in paths
+    assert "/api/unit/{unit_id}/red-room/assume" in paths
+    assert "/api/unit/{unit_id}/red-room/release" in paths
 
 
 def test_unit_websocket_route_present():
@@ -187,6 +189,91 @@ def test_yellow_split_extracted_from_enveloped_payload():
     assert out["yellow_female_capacity"] == 6
 
 
+def test_project_red_room_patients_from_payload():
+    from beds.service import (
+        project_parser_state,
+        _red_room_patients_from_payload,
+    )
+
+    parser_row = {
+        "red_occupied": 3,
+        "red_capacity": 2,  # over-capacity: 3 pacientes em 2 leitos
+        "payload": {
+            "data": {
+                "rooms": {
+                    "red_room": {
+                        "patients": [
+                            {"sigla": "OPO", "age": "77a", "clinical_summary": "CRISE CONVULSIVA", "raw": "x"},
+                            {"sigla": "JBD", "age": "83 ANOS", "clinical_summary": "HEMORRAGIA", "raw": "y"},
+                            {"sigla": "MJS", "age": None, "clinical_summary": "AVC", "raw": "z"},
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    parser_row["red_room_patients"] = _red_room_patients_from_payload(parser_row)
+    out = project_parser_state(parser_row, _full_enabled_config())
+    beds = out["beds"]
+    # over-capacity: a grade cresce para mostrar todos os 3 pacientes ocupados.
+    assert len(beds) == 3
+    assert beds[0]["patient_sigla"] == "OPO"
+    assert "CRISE CONVULSIVA" in beds[0]["clinical_summary"]
+    assert "77a" in beds[0]["clinical_summary"]
+    assert beds[2]["patient_sigla"] == "MJS"
+    assert all(b["source"] == "parser" for b in beds)
+
+
+def test_project_other_beds_to_counters():
+    from beds.service import project_parser_state, _other_beds_from_payload
+
+    parser_row = {
+        "payload": {
+            "data": {
+                "rooms": {
+                    "other_beds": [
+                        {"key": "other_medicacao", "occupied": 5, "capacity": 9},
+                        {"key": "other_pediatria", "occupied": 4, "capacity": 8},
+                    ]
+                }
+            }
+        },
+    }
+    parser_row.update(_other_beds_from_payload(parser_row))
+    out = project_parser_state(parser_row, _full_enabled_config())
+    med = next(c for c in out["counters"] if c["sector_key"] == "medication_room")
+    ped = next(c for c in out["counters"] if c["sector_key"] == "ward_pediatric_internment")
+    assert (med["occupancy"], med["capacity"]) == (5, 9)
+    assert (ped["occupancy"], ped["capacity"]) == (4, 8)
+    assert med["source"] == "parser"
+
+
+def test_specialists_from_payload_includes_dentist_pediatrician():
+    from beds.service import project_parser_state, _specialists_from_payload
+
+    parser_row = {
+        "payload": {"data": {"specialists": {
+            "has_dentist": True, "has_pediatrician": True, "has_psychiatrist": False,
+        }}},
+    }
+    parser_row.update(_specialists_from_payload(parser_row))
+    out = project_parser_state(parser_row, _full_enabled_config())
+    by_key = {s["sector_key"]: s for s in out["specialists"]}
+    assert by_key["dentist"]["status"] == "available"
+    assert by_key["pediatrician"]["status"] == "available"
+    assert by_key["psychiatrist"]["status"] == "unavailable"
+
+
+def test_choose_beds_gate():
+    from beds.service import _choose_beds
+
+    manual = [{"bed_number": 1, "patient_sigla": "AAA"}]
+    projected = [{"bed_number": 1, "patient_sigla": "BBB"}]
+    # assumido → manual vence; não assumido → projeção ao vivo.
+    assert _choose_beds(True, manual, projected) is manual
+    assert _choose_beds(False, manual, projected) is projected
+
+
 def test_project_specialist_orthopedist_available():
     from beds.service import project_parser_state
 
@@ -198,10 +285,11 @@ def test_project_specialist_orthopedist_available():
     assert ortho["source"] == "parser"
     assert surg["status"] == "unavailable"
     assert surg["source"] == "parser"
-    # pediatrician/dentist have no parser source -> default + unavailable
+    # dentist/pediatrician/psychiatrist agora têm fonte no parser (bloco
+    # ATENDIMENTO). Sem flag no parser_row → unavailable, mas source "parser".
     ped = next(s for s in out["specialists"] if s["sector_key"] == "pediatrician")
     assert ped["status"] == "unavailable"
-    assert ped["source"] == "default"
+    assert ped["source"] == "parser"
 
 
 def test_project_red_room_beds():

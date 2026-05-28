@@ -143,6 +143,96 @@ class ParserRegressionTests(unittest.TestCase):
         self.assertIn("/resumo", reply)
         self.assertIn("UPA SAN MARTIN", reply)
 
+    # --- Sala vermelha: pacientes individuais --------------------------------
+    def test_red_room_patients_bulleted_with_age(self) -> None:
+        text = (
+            "🔴 SALA VERMELHA: (07/04)\n"
+            "* OPO, 77a, AA, CRISE CONVULSIVA SEC\n"
+            "* MLJN, 79a, MNR, TUMOR INFECTADO, DISPNEIA\n"
+            "🟡 SALA AMARELA: (10/12)\n"
+        )
+        patients = parse_whatsapp_message(text)["rooms"]["red_room"]["patients"]
+        self.assertEqual(len(patients), 2)
+        self.assertEqual(patients[0]["sigla"], "OPO")
+        self.assertEqual(patients[0]["age"], "77a")
+        self.assertIn("CRISE CONVULSIVA", patients[0]["clinical_summary"])
+        self.assertEqual(patients[1]["sigla"], "MLJN")
+
+    def test_red_room_patients_asterisk_sigla_blank_separated(self) -> None:
+        text = (
+            "🔴 SALA VERMELHA: (02/07)\n\n"
+            "• *JBD* 83 ANOS, HEMORRAGIA, HAS, EM AA.\n\n"
+            "• *MS-DCL* 17 ANOS, EPILEPSIA, GLASGOW 14\n\n"
+            "🟡 SALA AMARELA\n"
+        )
+        patients = parse_whatsapp_message(text)["rooms"]["red_room"]["patients"]
+        self.assertEqual([p["sigla"] for p in patients], ["JBD", "MS-DCL"])
+
+    def test_red_room_patients_numbered_and_dotted_sigla(self) -> None:
+        text = (
+            "🔴 SALA VERMELHA:(3/2)\n\n"
+            "1- *J.N.N*, 71a, AA, GLASGOW: 15: SD: IR.\n"
+            "2- *M.J.S*, 51a, AA, SD: AVC\n"
+            "3- *C.S.B* (EM OBSERVAÇÃO)\n\n"
+            "🟡 SALA\n"
+        )
+        patients = parse_whatsapp_message(text)["rooms"]["red_room"]["patients"]
+        self.assertEqual([p["sigla"] for p in patients], ["J.N.N", "M.J.S", "C.S.B"])
+        self.assertIsNone(patients[2]["age"])
+
+    def test_red_room_note_line_is_not_a_patient(self) -> None:
+        text = (
+            "🔴 SALA VERMELHA: (01/02)\n"
+            "• *ABC* 40 ANOS, SEPSE\n"
+            "• *OBS*: INFORMAMOS QUE TEMOS 09 PACIENTES AGUARDANDO\n"
+            "🟡 SALA AMARELA\n"
+        )
+        patients = parse_whatsapp_message(text)["rooms"]["red_room"]["patients"]
+        self.assertEqual([p["sigla"] for p in patients], ["ABC"])
+
+    def test_red_room_no_patients_warns(self) -> None:
+        text = "🔴 SALA VERMELHA: (02/04)\n🟡 SALA AMARELA: (00/12)\n"
+        parsed = parse_whatsapp_message(text)
+        self.assertEqual(parsed["rooms"]["red_room"]["patients"], [])
+        self.assertIn("Pacientes da Sala Vermelha não detalhados no texto.", parsed["warnings"])
+
+    def test_red_room_strips_leito_label_to_find_sigla(self) -> None:
+        text = (
+            "🔴 *SALA VERMELHA:* (02/03)\n"
+            "* *LEITO-01:* I.V.M.S., 44 ANOS, AA | IAM\n"
+            "* *CORR-01:* N.S., 60 ANOS, AA | CRISE CONVULSIVA\n"
+            "🟡 SALA AMARELA\n"
+        )
+        patients = parse_whatsapp_message(text)["rooms"]["red_room"]["patients"]
+        self.assertEqual([p["sigla"] for p in patients], ["I.V.M.S", "N.S"])
+
+    def test_red_room_obs_with_age_is_patient_not_note(self) -> None:
+        # "OBS" é nota quando seguido de ":" sem idade, mas paciente real
+        # quando vem com idade ("1. OBS, 96 anos, ...").
+        text = "🔴 SALA VERMELHA: (01/04)\n1. OBS, 96 anos, SD: DRC\n🟡 SALA AMARELA\n"
+        patients = parse_whatsapp_message(text)["rooms"]["red_room"]["patients"]
+        self.assertEqual([p["sigla"] for p in patients], ["OBS"])
+        self.assertEqual(patients[0]["age"], "96 anos")
+
+    def test_red_room_vitals_line_does_not_cut_patient_list(self) -> None:
+        # Linha de sinais vitais com "PA: 128" não deve encerrar o bloco.
+        text = (
+            "🔴 SALA VERMELHA: (02/02)\n"
+            "1 - RSS, MASCULINO, 46 ANOS,\n"
+            "SSVV: PA: 128 X 90MMHG; FC:95 BPM\n\n"
+            "2- PBJ, MASCULINO, 91 ANOS,\n"
+            "🟡 SALA AMARELA: (04/04)\n"
+        )
+        patients = parse_whatsapp_message(text)["rooms"]["red_room"]["patients"]
+        self.assertEqual([p["sigla"] for p in patients], ["RSS", "PBJ"])
+
+    def test_specialists_dentist_and_pediatrician_from_atendimento(self) -> None:
+        spec = parse_whatsapp_message(VALERIA_TEXT)["specialists"]
+        self.assertTrue(spec["has_dentist"])
+        self.assertTrue(spec["has_pediatrician"])
+        self.assertTrue(spec["has_psychiatrist"])
+        self.assertFalse(spec["has_orthopedist"])
+
 
 if __name__ == "__main__":
     unittest.main()

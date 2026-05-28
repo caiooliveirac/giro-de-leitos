@@ -115,12 +115,23 @@ COUNTER_PARSER_MAP: dict[str, tuple[str, str]] = {
     "isolation_adult_f": ("isolation_female_occupied", "isolation_female_capacity"),
     "isolation_adult_unisex": ("isolation_total_occupied", "isolation_total_capacity"),
     "isolation_pediatric": ("isolation_pediatric_occupied", "isolation_pediatric_capacity"),
+    # Setores derivados de ``rooms.other_beds`` (sem coluna própria em
+    # current_unit_status). As chaves sintéticas abaixo são preenchidas em
+    # ``_other_beds_from_payload`` e mescladas no parser_row antes da projeção.
+    "medication_room": ("medication_room_occupied", "medication_room_capacity"),
+    "ward_internment": ("ward_internment_occupied", "ward_internment_capacity"),
+    "ward_pediatric_internment": ("ward_ped_internment_occupied", "ward_ped_internment_capacity"),
 }
 
-# Type-C specialists whose presence is reflected in ``current_unit_status``.
+# Type-C specialists. surgeon/orthopedist/psychiatrist têm coluna em
+# current_unit_status; dentist/pediatrician vêm do payload (mesclados no
+# parser_row). Os valores efetivos são lidos de ``parser_row[<has_*>]``.
 SPECIALIST_PARSER_MAP: dict[str, str] = {
     "orthopedist": "has_orthopedist",
     "surgeon": "has_surgeon",
+    "psychiatrist": "has_psychiatrist",
+    "dentist": "has_dentist",
+    "pediatrician": "has_pediatrician",
 }
 
 
@@ -219,19 +230,35 @@ def project_parser_state(
     if red_cfg and red_cfg.get("enabled"):
         red_capacity = 0
         red_occupied = 0
+        patients: list[dict[str, Any]] = []
         if parser_row:
             red_capacity = parser_row.get("red_capacity") or 0
             red_occupied = parser_row.get("red_occupied") or 0
-        # Cap occupied at capacity to keep invariants sane.
-        if red_capacity and red_occupied > red_capacity:
-            red_occupied = red_capacity
-        for n in range(1, red_capacity + 1):
-            occupied = n <= red_occupied
+            patients = parser_row.get("red_room_patients") or []
+        # A sala vermelha frequentemente opera em over-capacity (ocupado >
+        # capacidade). Mostramos TODOS os pacientes ocupados — a grade cresce
+        # além da capacidade configurada; o frontend marca os excedentes.
+        n_beds = min(max(red_capacity, red_occupied, len(patients)), 60)
+        for n in range(1, n_beds + 1):
+            patient = patients[n - 1] if n <= len(patients) else None
+            if patient:
+                sigla = patient.get("sigla") or "—"
+                parts = [patient.get("age"), patient.get("clinical_summary")]
+                summary = " · ".join(p for p in parts if p) or patient.get("raw") or "Aguardando detalhamento"
+                occupied = True
+            elif n <= red_occupied:
+                sigla = "—"
+                summary = "Aguardando detalhamento"
+                occupied = True
+            else:
+                sigla = None
+                summary = None
+                occupied = False
             beds.append(
                 {
                     "bed_number": n,
-                    "patient_sigla": "—" if occupied else None,
-                    "clinical_summary": "Aguardando detalhamento" if occupied else None,
+                    "patient_sigla": sigla if occupied else None,
+                    "clinical_summary": summary if occupied else None,
                     "occupied_since": None,
                     "version": 0,
                     "last_updated_at": received_at,
@@ -426,6 +453,97 @@ def _yellow_male_female_from_payload(
     return out
 
 
+# Rótulos do parser (``other_beds[].key``) → sector_key sintético do app.
+_OTHER_BEDS_KEY_MAP: dict[str, str] = {
+    "other_medicacao": "medication_room",
+    "other_verde": "medication_room",
+    "other_internamento": "ward_internment",
+    "other_pediatria": "ward_pediatric_internment",
+}
+
+
+def _other_beds_from_payload(parser_row: Optional[dict[str, Any]]) -> dict[str, int | None]:
+    """Mapeia ``rooms.other_beds`` (medicação/verde, internamento, internamento
+    pediátrico) para as colunas sintéticas esperadas por ``COUNTER_PARSER_MAP``.
+    """
+    out: dict[str, int | None] = {}
+    data = _parser_payload_data(parser_row)
+    rooms = data.get("rooms") if isinstance(data.get("rooms"), dict) else {}
+    other_beds = rooms.get("other_beds") if isinstance(rooms, dict) else None
+    if not isinstance(other_beds, list):
+        return out
+    col_prefix = {
+        "medication_room": "medication_room",
+        "ward_internment": "ward_internment",
+        "ward_pediatric_internment": "ward_ped_internment",
+    }
+    for bed in other_beds:
+        if not isinstance(bed, dict):
+            continue
+        sector_key = _OTHER_BEDS_KEY_MAP.get(str(bed.get("key") or ""))
+        if not sector_key:
+            continue
+        prefix = col_prefix[sector_key]
+        # Se houver mais de um other_bed para o mesmo setor, soma as ocupações.
+        occ = out.get(f"{prefix}_occupied") or 0
+        cap = out.get(f"{prefix}_capacity") or 0
+        out[f"{prefix}_occupied"] = occ + (bed.get("occupied") or 0)
+        out[f"{prefix}_capacity"] = cap + (bed.get("capacity") or 0)
+    return out
+
+
+def _specialists_from_payload(parser_row: Optional[dict[str, Any]]) -> dict[str, bool]:
+    """Lê ``data.specialists`` do payload (inclui dentist/pediatrician que não
+    têm coluna em current_unit_status). Só retorna chaves presentes.
+    """
+    data = _parser_payload_data(parser_row)
+    spec = data.get("specialists")
+    if not isinstance(spec, dict):
+        return {}
+    out: dict[str, bool] = {}
+    for key in ("has_surgeon", "has_orthopedist", "has_psychiatrist", "has_dentist", "has_pediatrician"):
+        if key in spec:
+            out[key] = bool(spec[key])
+    return out
+
+
+def _red_room_patients_from_payload(parser_row: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extrai a lista de pacientes da sala vermelha de ``rooms.red_room.patients``."""
+    data = _parser_payload_data(parser_row)
+    rooms = data.get("rooms") if isinstance(data.get("rooms"), dict) else {}
+    red = rooms.get("red_room") if isinstance(rooms, dict) else None
+    patients = red.get("patients") if isinstance(red, dict) else None
+    return patients if isinstance(patients, list) else []
+
+
+def _fetch_red_room_takeover(conn, unit_id: str) -> Optional[dict[str, Any]]:
+    """Estado do takeover da sala vermelha (com nome de quem assumiu)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT t.assumed_at, t.released_at, t.assumed_by, u.name AS assumed_by_name
+              FROM unit_sector_takeover t
+              LEFT JOIN users u ON u.id = t.assumed_by
+             WHERE t.unit_id = %s AND t.sector_key = 'red_room'
+            """,
+            (unit_id,),
+        )
+        return cur.fetchone()
+
+
+def _choose_beds(
+    assumed: bool,
+    manual_rows: list[dict[str, Any]],
+    projected_beds: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Decide a fonte dos leitos da vermelha (puro, testável sem DB).
+
+    Assumido → linhas manuais (controle do plantonista). Não assumido →
+    projeção ao vivo do parser, ignorando linhas manuais antigas.
+    """
+    return manual_rows if assumed else projected_beds
+
+
 def get_unit_state(conn, unit_id: str) -> dict[str, Any]:
     """Return the full state of a unit — sectors, beds, counters, specs, exams.
 
@@ -465,6 +583,9 @@ def get_unit_state(conn, unit_id: str) -> dict[str, Any]:
     if parser_row:
         parser_row_for_projection = dict(parser_row)
         parser_row_for_projection.update(_yellow_male_female_from_payload(parser_row))
+        parser_row_for_projection.update(_other_beds_from_payload(parser_row))
+        parser_row_for_projection.update(_specialists_from_payload(parser_row))
+        parser_row_for_projection["red_room_patients"] = _red_room_patients_from_payload(parser_row)
 
     # beds (red_room only — Type A) — manual rows first.
     with conn.cursor() as cur:
@@ -536,8 +657,12 @@ def get_unit_state(conn, unit_id: str) -> dict[str, Any]:
         if pe["sector_key"] not in have_exam_keys:
             exams.append(pe)
 
-    if not beds_rows:
-        beds_rows = projected["beds"]
+    # Sala vermelha: gate de takeover. Sem takeover → projeta AO VIVO do parser
+    # (re-semeia a cada giro), ignorando linhas manuais antigas. Com takeover →
+    # a edição manual vence (parser para de sobrescrever).
+    takeover = _fetch_red_room_takeover(conn, unit_id)
+    red_assumed = bool(takeover and takeover.get("released_at") is None)
+    beds_rows = _choose_beds(red_assumed, beds_rows, projected["beds"])
 
     # parser_snapshot — small payload for the frontend to render
     # "última atualização via WhatsApp".
@@ -564,6 +689,9 @@ def get_unit_state(conn, unit_id: str) -> dict[str, Any]:
         "exams": exams,
         "parser_snapshot": parser_snapshot,
         "provenance": provenance,
+        "red_room_assumed": red_assumed,
+        "red_room_assumed_by": (takeover or {}).get("assumed_by_name") if red_assumed else None,
+        "red_room_assumed_at": (takeover or {}).get("assumed_at") if red_assumed else None,
     }
 
 
@@ -756,6 +884,11 @@ def upsert_bed(
         previous_value=_serialize_bed(current) if current else None,
         new_value=_serialize_bed(new_row),
     )
+    # Rede de segurança: editar um leito implica assumir a vermelha, para que o
+    # próximo giro não sobrescreva o que o plantonista digitou.
+    tk = _fetch_red_room_takeover(conn, unit_id)
+    if not (tk and tk.get("released_at") is None):
+        _set_red_room_takeover(conn, unit_id, actor_id)
     return _serialize_bed(new_row)
 
 
@@ -834,6 +967,108 @@ def bed_clear(conn, unit_id, bed_number, actor, expected_version=None):
         str(actor["id"]) if actor.get("id") else None,
         expected_version, "bed.clear",
     )
+
+
+# ---------------------------------------------------------------------------
+# Sala vermelha — takeover ("assumir giro")
+# ---------------------------------------------------------------------------
+def _project_red_beds(conn, unit_id: str) -> list[dict[str, Any]]:
+    """Projeta os leitos da sala vermelha a partir do último giro (sem gate)."""
+    unit = _get_unit(conn, unit_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT sector_key, enabled, capacity FROM unit_sectors_config WHERE unit_id = %s",
+            (unit_id,),
+        )
+        by_key = {r["sector_key"]: r for r in cur.fetchall()}
+    sectors_config = [
+        {
+            "sector_key": key,
+            "enabled": bool(by_key[key]["enabled"]) if key in by_key else False,
+            "capacity": by_key[key].get("capacity") if key in by_key else None,
+        }
+        for key in VALID_SECTOR_KEYS
+    ]
+    parser_row = _fetch_parser_status(conn, unit.get("code"))
+    pr: Optional[dict[str, Any]] = None
+    if parser_row:
+        pr = dict(parser_row)
+        pr.update(_yellow_male_female_from_payload(parser_row))
+        pr["red_room_patients"] = _red_room_patients_from_payload(parser_row)
+    return project_parser_state(pr, sectors_config)["beds"]
+
+
+def _set_red_room_takeover(conn, unit_id: str, actor_id: Optional[str]) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO unit_sector_takeover (unit_id, sector_key, assumed_by, assumed_at, released_at)
+            VALUES (%s, 'red_room', %s, NOW(), NULL)
+            ON CONFLICT (unit_id, sector_key) DO UPDATE
+                SET assumed_by = EXCLUDED.assumed_by, assumed_at = NOW(), released_at = NULL
+            """,
+            (unit_id, actor_id),
+        )
+
+
+def assume_red_room(conn, unit_id: str, actor: dict[str, Any]) -> dict[str, Any]:
+    """Plantonista assume a sala vermelha: congela a leitura ao vivo do parser
+    em linhas editáveis e trava o re-seed automático.
+    """
+    _get_unit(conn, unit_id)
+    if not _red_room_enabled(conn, unit_id):
+        raise ValueError("setor red_room desabilitado para esta unidade")
+    actor_id = str(actor["id"]) if actor.get("id") else None
+
+    projected = _project_red_beds(conn, unit_id)
+    with conn.cursor() as cur:
+        for bed in projected:
+            if not bed.get("patient_sigla"):
+                continue
+            cur.execute(
+                """
+                INSERT INTO beds (unit_id, bed_number, patient_sigla, clinical_summary,
+                                  occupied_since, last_updated_by, last_updated_at, version)
+                VALUES (%s, %s, %s, %s, NULL, %s, NOW(), 1)
+                ON CONFLICT (unit_id, bed_number) DO NOTHING
+                """,
+                (unit_id, bed["bed_number"], bed["patient_sigla"], bed.get("clinical_summary"), actor_id),
+            )
+    _set_red_room_takeover(conn, unit_id, actor_id)
+    record_audit(
+        conn,
+        actor_user_id=actor_id,
+        action="red_room.assume",
+        entity_type="unit",
+        entity_id=str(unit_id),
+        previous_value=None,
+        new_value={"assumed": True, "seeded_beds": len([b for b in projected if b.get("patient_sigla")])},
+    )
+    return {"assumed": True}
+
+
+def release_red_room(conn, unit_id: str, actor: dict[str, Any]) -> dict[str, Any]:
+    """Libera a sala vermelha: apaga os leitos manuais e volta ao modo ao vivo
+    (próximo giro re-semeia).
+    """
+    _get_unit(conn, unit_id)
+    actor_id = str(actor["id"]) if actor.get("id") else None
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM beds WHERE unit_id = %s", (unit_id,))
+        cur.execute(
+            "UPDATE unit_sector_takeover SET released_at = NOW() WHERE unit_id = %s AND sector_key = 'red_room'",
+            (unit_id,),
+        )
+    record_audit(
+        conn,
+        actor_user_id=actor_id,
+        action="red_room.release",
+        entity_type="unit",
+        entity_id=str(unit_id),
+        previous_value={"assumed": True},
+        new_value={"assumed": False},
+    )
+    return {"assumed": False}
 
 
 # ---------------------------------------------------------------------------

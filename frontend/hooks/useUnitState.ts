@@ -65,6 +65,12 @@ export function useUnitState(unitId: string | null) {
     const queryKey = ['unit-state', unitId] as const;
 
     const applyEvent = (evt: UnitWsEvent) => {
+      // Takeover da vermelha muda a fonte dos leitos (parser ↔ manual);
+      // re-busca o estado completo em vez de fazer merge incremental.
+      if (evt.type === 'red_room_assumed' || evt.type === 'red_room_released') {
+        queryClient.invalidateQueries({ queryKey });
+        return;
+      }
       queryClient.setQueryData<UnitState | null>(queryKey, (prev) => {
         if (!prev) return prev;
         const payload = evt.payload as any;

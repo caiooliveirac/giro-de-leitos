@@ -254,6 +254,9 @@ async def put_bed(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     await _broadcast(str(unit_id), "bed_updated", result)
+    # Editar um leito assume a vermelha (rede de segurança no service) — avisa
+    # outros dispositivos para saírem do modo "ao vivo".
+    await _broadcast(str(unit_id), "red_room_assumed", {"assumed": True})
     return _jsonable(result)
 
 
@@ -340,6 +343,39 @@ async def post_bed_clear(
     except service.NotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     await _broadcast(str(unit_id), "bed_updated", result)
+    return _jsonable(result)
+
+
+# ---------------------------------------------------------------------------
+# Sala vermelha — takeover ("assumir giro")
+# ---------------------------------------------------------------------------
+@router.post("/unit/{unit_id}/red-room/assume")
+async def post_red_room_assume(
+    unit_id: UUID,
+    access=Depends(get_unit_mutation_access),
+    conn=Depends(get_db),
+):
+    try:
+        result = service.assume_red_room(conn, str(unit_id), access["actor"] or {})
+    except service.NotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    await _broadcast(str(unit_id), "red_room_assumed", result)
+    return _jsonable(result)
+
+
+@router.post("/unit/{unit_id}/red-room/release")
+async def post_red_room_release(
+    unit_id: UUID,
+    access=Depends(get_unit_mutation_access),
+    conn=Depends(get_db),
+):
+    try:
+        result = service.release_red_room(conn, str(unit_id), access["actor"] or {})
+    except service.NotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    await _broadcast(str(unit_id), "red_room_released", result)
     return _jsonable(result)
 
 

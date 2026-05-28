@@ -183,7 +183,7 @@ function ShiftHome({ unitId, userName }: { unitId: string | null; userName: stri
 // ---------------------------------------------------------------------------
 function UnitGiro({ unitId }: { unitId: string }) {
   const toast = useToast();
-  const { data, isLoading, error } = useUnitState(unitId);
+  const { data, isLoading, error, refetch } = useUnitState(unitId);
 
   const enabledKeys = useMemo(() => {
     const set = new Set<string>();
@@ -216,9 +216,38 @@ function UnitGiro({ unitId }: { unitId: string }) {
   }
   if (!data) return null;
 
+  const redAssumed = data.red_room_assumed ?? false;
+  const maxBedNumber = (data.beds ?? []).reduce((m, b) => Math.max(m, b.bed_number), 0);
+  const redBedCount = Math.max(redCapacity, maxBedNumber);
+
+  const assumeRedRoom = async () => {
+    try {
+      await apiMutate(`/api/unit/${unitId}/red-room/assume`, { method: 'POST' });
+      await refetch();
+      toast.success('Você assumiu a sala vermelha · edição liberada');
+    } catch (err) {
+      toast.error(apiErrorMsg(err, 'Falha ao assumir o giro'));
+    }
+  };
+  const releaseRedRoom = async () => {
+    try {
+      await apiMutate(`/api/unit/${unitId}/red-room/release`, { method: 'POST' });
+      await refetch();
+      toast.show('Sala vermelha de volta ao modo ao vivo (WhatsApp)');
+    } catch (err) {
+      toast.error(apiErrorMsg(err, 'Falha ao liberar o giro'));
+    }
+  };
+
   const yellowKeys = filterEnabledByPrefix(enabledKeys, ['yellow_']);
   const isolationKeys = filterEnabledByPrefix(enabledKeys, ['isolation_']);
-  const otherCounterKeys = filterEnabledByKey(enabledKeys, ['obituary', 'pediatric_observation']);
+  const otherCounterKeys = filterEnabledByKey(enabledKeys, [
+    'medication_room',
+    'ward_internment',
+    'ward_pediatric_internment',
+    'pediatric_observation',
+    'obituary',
+  ]);
   const specialistKeys = filterEnabledByType(enabledKeys, 'specialist');
   const examKeys = filterEnabledByType(enabledKeys, 'exam');
 
@@ -226,17 +255,47 @@ function UnitGiro({ unitId }: { unitId: string }) {
     <>
       <GiroProvenanceBadge unitId={unitId} provenance={data.provenance ?? null} />
 
-      {enabledKeys.has('red_room') && redCapacity > 0 && (
+      {enabledKeys.has('red_room') && redBedCount > 0 && (
         <Section title="Sala vermelha" subtitle="Leitos críticos com paciente identificado">
+          {redAssumed ? (
+            <div className="mb-3 flex items-center justify-between gap-3 rounded-card border border-line bg-surface px-3.5 py-2.5">
+              <span className="min-w-0 text-[12px] leading-tight text-ink-2">
+                Em edição manual
+                {data.red_room_assumed_by ? <> · assumido por {data.red_room_assumed_by}</> : null}
+              </span>
+              <button
+                type="button"
+                onClick={() => void releaseRedRoom()}
+                className="shrink-0 rounded-full border border-line px-3 py-1.5 text-[12px] font-medium text-ink-2"
+              >
+                Voltar ao ao vivo
+              </button>
+            </div>
+          ) : (
+            <div className="mb-3 flex items-center justify-between gap-3 rounded-card border border-warning/35 bg-warning-soft px-3.5 py-2.5 text-warning-ink">
+              <span className="min-w-0 text-[12px] font-medium leading-tight">
+                Ao vivo via WhatsApp · assuma para editar os leitos
+              </span>
+              <button
+                type="button"
+                onClick={() => void assumeRedRoom()}
+                className="shrink-0 rounded-full bg-warning px-3 py-1.5 text-[12px] font-semibold text-[var(--ink-on-color)]"
+              >
+                Assumir giro
+              </button>
+            </div>
+          )}
           <LayoutGroup>
             <div className="space-y-3">
-              {Array.from({ length: redCapacity }, (_, i) => i + 1).map((bedNumber) => {
+              {Array.from({ length: redBedCount }, (_, i) => i + 1).map((bedNumber) => {
                 const bed = bedsByNumber.get(bedNumber) ?? null;
                 return (
                   <RedRoomBed
                     key={bedNumber}
                     bed={bed}
                     bedNumber={bedNumber}
+                    live={!redAssumed}
+                    isExtra={bedNumber > redCapacity}
                     onSave={async ({ patient_sigla, clinical_summary }) => {
                       try {
                         await apiMutate(

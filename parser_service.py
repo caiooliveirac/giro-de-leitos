@@ -110,6 +110,36 @@ SPECIALIST_RULES = {
             re.compile(r"(?im)psiquiatr(?:a|ia)[ \t]*[\)\]]?[ \t]*[:\-]?[ \t]*[\(\[]?[ \t]*❌"),
         ],
     },
+    "has_dentist": {
+        "keywords": ["dentista", "odontologia", "odonto"],
+        "available": [
+            re.compile(r"(?i)(?:dentista|odontolog(?:ia|o))\s*[:\-]?\s*(sim|presente|dispon[ií]vel)"),
+            re.compile(r"(?i)com\s+(?:dentista|odontolog(?:ia|o))"),
+            re.compile(r"(?im)^\s*[\(\[]?\s*✅\s*[\)\]]?\s*(?:dentista|odontolog(?:ia|o))"),
+            re.compile(r"(?im)(?:dentista|odontolog(?:ia|o))[ \t]*[\)\]]?[ \t]*[:\-]?[ \t]*[\(\[]?[ \t]*✅"),
+        ],
+        "unavailable": [
+            re.compile(r"(?i)sem\s+(?:dentista|odontolog(?:ia|o))"),
+            re.compile(r"(?i)(?:dentista|odontolog(?:ia|o))\s*[:\-]?\s*(n[aã]o|ausente|indispon[ií]vel)"),
+            re.compile(r"(?im)^\s*[\(\[]?\s*❌\s*[\)\]]?\s*(?:dentista|odontolog(?:ia|o))"),
+            re.compile(r"(?im)(?:dentista|odontolog(?:ia|o))[ \t]*[\)\]]?[ \t]*[:\-]?[ \t]*[\(\[]?[ \t]*❌"),
+        ],
+    },
+    "has_pediatrician": {
+        "keywords": ["pediatria", "pediatra"],
+        "available": [
+            re.compile(r"(?i)pediatr(?:a|ia)\s*[:\-]?\s*(sim|presente|dispon[ií]vel)"),
+            re.compile(r"(?i)com\s+pediatr(?:a|ia)"),
+            re.compile(r"(?im)^\s*[\(\[]?\s*✅\s*[\)\]]?\s*pediatr(?:a|ia)"),
+            re.compile(r"(?im)pediatr(?:a|ia)[ \t]*[\)\]]?[ \t]*[:\-]?[ \t]*[\(\[]?[ \t]*✅"),
+        ],
+        "unavailable": [
+            re.compile(r"(?i)sem\s+pediatr(?:a|ia)"),
+            re.compile(r"(?i)pediatr(?:a|ia)\s*[:\-]?\s*(n[aã]o|ausente|indispon[ií]vel)"),
+            re.compile(r"(?im)^\s*[\(\[]?\s*❌\s*[\)\]]?\s*pediatr(?:a|ia)"),
+            re.compile(r"(?im)pediatr(?:a|ia)[ \t]*[\)\]]?[ \t]*[:\-]?[ \t]*[\(\[]?[ \t]*❌"),
+        ],
+    },
 }
 
 
@@ -283,6 +313,101 @@ def _extract_red_room(lines: list[str]) -> dict[str, Any] | None:
         return None
 
     return _build_capacity(*ratio)
+
+
+# --- Sala vermelha: pacientes individuais ---------------------------------
+# Marcador de início de linha-paciente (bullets variados ou numeração).
+_REDROOM_BULLET = re.compile(r"^\s*(?:[\-•▪︎▪️*✱·◾◽‣◦]+|\d+\s*[\-.)])\s*")
+# Rótulo de posição que precede a sigla real em algumas UPAs: "LEITO-01:",
+# "CORR-01:", "BOX 2:" — removido para capturar a sigla que vem depois.
+_REDROOM_POS_LABEL = re.compile(
+    r"^\*?\s*(?:LEITO|CORR(?:EDOR)?|BOX)[\s\-]*\d*\s*:?\s*\*?\s*", re.IGNORECASE
+)
+# Sigla: iniciais maiúsculas com pontos/hífen internos (OPO, J.N.N, MS-DCL),
+# opcionalmente entre asteriscos do WhatsApp. NÃO inclui espaços (separa da idade).
+_REDROOM_SIGLA = re.compile(
+    r"^\s*\*?\s*([A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ.\-]*[A-ZÀ-ÖØ-Þ]|[A-ZÀ-ÖØ-Þ])\*?"
+)
+# Termos que indicam que a seção da vermelha acabou (próximo setor).
+_REDROOM_STOP_TERMS = (
+    "amarela", "enfermaria", "medicacao", "verde", "isolamento",
+    "internamento", "obito", "obitario", "exames", "atendimento",
+    "corredor", "triagem",
+)
+# "Siglas" que na verdade são notas/cabeçalhos/rótulos, não pacientes.
+_REDROOM_NOTE_SIGLAS = {
+    "obs", "obc", "info", "informamos", "nota", "ps", "leito", "leitos",
+    "total", "obito", "vaga", "vagas", "sala", "adm", "cid", "ssvv",
+    "sinais", "tax", "data", "spo", "hgt", "box",
+}
+
+
+def _extract_red_room_patients(lines: list[str]) -> list[dict[str, Any]]:
+    """Extrai pacientes individuais da Sala Vermelha do texto livre.
+
+    Cada item: ``{sigla, age, clinical_summary, raw}``. Tolerante por design —
+    nunca levanta exceção. Linha-paciente não-parseável vira
+    ``{sigla: None, raw, clinical_summary: <linha>}``. Seção ausente/sem
+    pacientes → ``[]`` (a projeção cai para leitos-placeholder pela contagem).
+    """
+    red_index = _find_section_index(lines, "sala", "vermelha", exclude_terms=("atualizacao", "amarela"))
+    if red_index is None:
+        red_index = _find_line_index(lines, "sala", "vermelha")
+    if red_index is None:
+        return []
+
+    patients: list[dict[str, Any]] = []
+    for raw_line in lines[red_index + 1 : red_index + 1 + 60]:
+        line = raw_line.strip()
+        if not line:
+            # vários giros separam pacientes por linha em branco — apenas pula.
+            continue
+        normalized = _normalize_for_match(line)
+        # Só encerra em marcadores de outra sala (_REDROOM_STOP_TERMS). NÃO usa
+        # _is_section_header: ele casa "pa " (de "PA: 128 mmHg" em sinais vitais)
+        # e cortaria o bloco no meio dos pacientes.
+        if any(term in normalized for term in _REDROOM_STOP_TERMS):
+            break
+
+        bullet_match = _REDROOM_BULLET.match(line)
+        core = line[bullet_match.end():] if bullet_match else line
+        # Remove rótulo de posição ("LEITO-01:", "CORR-01:") para chegar à sigla.
+        label_match = _REDROOM_POS_LABEL.match(core)
+        had_label = label_match is not None
+        if had_label:
+            core = core[label_match.end():]
+        sigla_match = _REDROOM_SIGLA.match(core)
+        sigla = sigla_match.group(1).strip(".") if sigla_match else None
+
+        had_marker = bullet_match is not None or had_label
+        age_search = AGE_PATTERN.search(core)
+        is_patient = sigla is not None and (had_marker or age_search is not None)
+        # Filtra "siglas"-nota (OBS:, ADM, SSVV...) SÓ quando não há idade — uma
+        # linha com idade é paciente mesmo que a sigla coincida ("1. OBS, 96 anos").
+        is_note = (
+            sigla is not None
+            and age_search is None
+            and _normalize_for_match(sigla) in _REDROOM_NOTE_SIGLAS
+        )
+        if not is_patient or is_note:
+            continue
+
+        rest = core[sigla_match.end():]
+        age = age_search.group(0).strip() if (age_search and age_search.start() >= sigla_match.end()) else None
+        clinical = rest
+        if age and age in clinical:
+            clinical = clinical.replace(age, " ", 1)
+        clinical = re.sub(r"\s+", " ", clinical).strip(" ,;:.-*•")
+        patients.append(
+            {
+                "sigla": sigla or None,
+                "age": age,
+                "clinical_summary": clinical or None,
+                "raw": line,
+            }
+        )
+
+    return patients
 
 
 def _extract_reported_datetime(text: str, fallback: datetime | None = None) -> datetime | None:
@@ -708,6 +833,9 @@ def parse_whatsapp_message(text: str) -> dict[str, Any]:
     lines = text.splitlines()
     upa_name = _extract_upa_name(text)
     red_room = _extract_red_room(lines)
+    red_room_patients = _extract_red_room_patients(lines)
+    if red_room is not None:
+        red_room["patients"] = red_room_patients
     yellow_male, yellow_female, yellow_room = _extract_yellow_room(lines, upa_name)
     isolation_male, isolation_female, isolation_pediatric, isolation_total = _extract_isolation_rooms(lines)
     other_beds = _extract_other_beds(lines)
@@ -723,6 +851,8 @@ def parse_whatsapp_message(text: str) -> dict[str, Any]:
         warnings.append("Nome da UPA não identificado no payload.")
     if not red_room:
         warnings.append("Capacidade da Sala Vermelha não identificada.")
+    elif red_room.get("occupied", 0) > 0 and not red_room_patients:
+        warnings.append("Pacientes da Sala Vermelha não detalhados no texto.")
     if not yellow_room and not _unit_has_fixed_no_yellow(upa_name) and not _has_explicit_no_yellow(lines):
         warnings.append("Capacidade da Sala Amarela não identificada.")
     if not reported_at:

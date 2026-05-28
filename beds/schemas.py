@@ -23,10 +23,14 @@ VALID_SECTOR_KEYS: tuple[str, ...] = (
     "isolation_pediatric",
     "obituary",
     "pediatric_observation",
+    "medication_room",
+    "ward_internment",
+    "ward_pediatric_internment",
     "surgeon",
     "orthopedist",
     "dentist",
     "pediatrician",
+    "psychiatrist",
     "xray",
     "ecg",
     "lab",
@@ -45,12 +49,16 @@ SECTOR_TYPE_B_COUNTERS: frozenset[str] = frozenset({
     "isolation_pediatric",
     "obituary",
     "pediatric_observation",
+    "medication_room",
+    "ward_internment",
+    "ward_pediatric_internment",
 })
 SECTOR_TYPE_C_SPECIALISTS: frozenset[str] = frozenset({
     "surgeon",
     "orthopedist",
     "dentist",
     "pediatrician",
+    "psychiatrist",
 })
 SECTOR_TYPE_D_EXAMS: frozenset[str] = frozenset({
     "xray",

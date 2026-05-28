@@ -16,6 +16,10 @@ interface RedRoomBedProps {
   onDeath: (pin: string) => void | Promise<void>;
   onTransfer: () => void | Promise<void>;
   onClear: () => void | Promise<void>;
+  /** Modo somente-leitura: dado ao vivo do WhatsApp, não editável até "assumir". */
+  live?: boolean;
+  /** Leito acima da capacidade configurada (over-capacity). */
+  isExtra?: boolean;
 }
 
 // Tags fiéis ao design/src/data.jsx TAG_OPTIONS.
@@ -39,6 +43,8 @@ export function RedRoomBed({
   onDeath,
   onTransfer,
   onClear,
+  live = false,
+  isExtra = false,
 }: RedRoomBedProps) {
   const isOccupied = Boolean(bed && bed.patient_sigla);
   const [expanded, setExpanded] = useState(false);
@@ -122,11 +128,13 @@ export function RedRoomBed({
         <motion.button
           layout
           type="button"
-          onClick={toggle}
-          aria-expanded={expanded}
-          aria-label={`Leito ${bedNumber} ${isOccupied ? 'ocupado' : 'vago'}`}
-          whileTap={{ scale: 0.97 }}
-          className="flex w-full items-center gap-3.5 px-4 py-4 text-left focus-visible:outline-none"
+          onClick={live ? undefined : toggle}
+          aria-expanded={live ? undefined : expanded}
+          aria-label={`Leito ${bedNumber}${isExtra ? ' (extra)' : ''} ${isOccupied ? 'ocupado' : 'vago'}`}
+          whileTap={live ? undefined : { scale: 0.97 }}
+          className={`flex w-full items-center gap-3.5 px-4 py-4 text-left focus-visible:outline-none ${
+            live ? 'cursor-default' : ''
+          }`}
         >
           <div
             className={`flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-[14px] text-[19px] font-semibold tabular-nums ${
@@ -139,8 +147,15 @@ export function RedRoomBed({
           <div className="min-w-0 flex-1">
             {isOccupied ? (
               <>
-                <div className="text-[17px] font-semibold tracking-wider tabular-nums text-ink">
-                  {bed?.patient_sigla}
+                <div className="flex items-center gap-2">
+                  <span className="text-[17px] font-semibold tracking-wider tabular-nums text-ink">
+                    {bed?.patient_sigla}
+                  </span>
+                  {isExtra && (
+                    <span className="rounded-full bg-critical-soft px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-critical-ink">
+                      extra
+                    </span>
+                  )}
                 </div>
                 <div className="mt-0.5 truncate text-[13px] text-ink-2">
                   {bed?.clinical_summary || '—'}
@@ -150,7 +165,7 @@ export function RedRoomBed({
               <>
                 <div className="text-[17px] font-medium text-ink-3">Leito vago</div>
                 <div className="mt-0.5 text-[13px] text-ink-3">
-                  Toque para adicionar paciente
+                  {live ? '—' : 'Toque para adicionar paciente'}
                 </div>
               </>
             )}
@@ -161,13 +176,13 @@ export function RedRoomBed({
               {formatRelative(bed.occupied_since)}
             </div>
           )}
-          {!isOccupied && (
+          {!isOccupied && !live && (
             <div className="shrink-0 text-base font-semibold text-[var(--accent)]">+</div>
           )}
         </motion.button>
 
         <AnimatePresence initial={false}>
-          {expanded && (
+          {!live && expanded && (
             <motion.div
               key="body"
               layout
