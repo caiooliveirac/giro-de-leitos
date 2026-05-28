@@ -69,31 +69,39 @@ def _payload_room_capacity(payload: dict | None, room_key: str) -> int | None:
 
 
 # Rótulos do parser (other_beds[].key) → sector_key sintético do app.
+# NB: other_verde vem rotulado como "internamento" → mapeia p/ internamento.
 _OTHER_BEDS_KEY_MAP = {
     "other_medicacao": "medication_room",
-    "other_verde": "medication_room",
     "other_internamento": "ward_internment",
+    "other_verde": "ward_internment",
     "other_pediatria": "ward_pediatric_internment",
 }
 
 
-def _payload_other_beds_capacity(payload: dict | None) -> dict[str, int]:
-    """Soma capacidades de rooms.other_beds por sector_key sintético."""
-    out: dict[str, int] = {}
+def _payload_other_beds(payload: dict | None) -> dict[str, int]:
+    """Capacidade efetiva por sector_key sintético de rooms.other_beds.
+
+    Habilita o setor quando ELE EXISTE no giro (occ ou cap > 0) — salas de
+    medicação/internamento muitas vezes são contagem sem capacidade fixa.
+    Capacidade efetiva = max(capacity, occupied) para exibição sã.
+    """
+    acc: dict[str, tuple[int, int]] = {}
     if not payload:
-        return out
+        return {}
     rooms = (payload.get("data") or {}).get("rooms") if isinstance(payload.get("data"), dict) else None
     other_beds = rooms.get("other_beds") if isinstance(rooms, dict) else None
     if not isinstance(other_beds, list):
-        return out
+        return {}
     for bed in other_beds:
         if not isinstance(bed, dict):
             continue
         sector_key = _OTHER_BEDS_KEY_MAP.get(str(bed.get("key") or ""))
-        cap = bed.get("capacity")
-        if sector_key and isinstance(cap, int):
-            out[sector_key] = out.get(sector_key, 0) + cap
-    return out
+        if not sector_key:
+            continue
+        occ0, cap0 = acc.get(sector_key, (0, 0))
+        acc[sector_key] = (occ0 + (bed.get("occupied") or 0), cap0 + (bed.get("capacity") or 0))
+    # capacity efetiva = max(cap, occ); só inclui setores presentes (occ ou cap).
+    return {k: max(cap, occ) for k, (occ, cap) in acc.items() if (occ > 0 or cap > 0)}
 
 
 def _payload_specialist(payload: dict | None, has_key: str) -> bool:
@@ -195,11 +203,11 @@ def _compute_plan(row: dict) -> list[tuple[str, bool, int | None]]:
     plan.append(("pediatric_observation", False, None))
 
     # Type B derivados de rooms.other_beds (sala medicação/verde, internamento,
-    # internamento pediátrico). Habilita onde o parser reporta capacity > 0.
-    other_caps = _payload_other_beds_capacity(payload)
+    # internamento pediátrico). Habilita onde o setor existe no giro.
+    other_caps = _payload_other_beds(payload)
     for sector_key in ("medication_room", "ward_internment", "ward_pediatric_internment"):
         cap = other_caps.get(sector_key)
-        plan.append((sector_key, bool(cap and cap > 0), cap if cap and cap > 0 else None))
+        plan.append((sector_key, sector_key in other_caps, cap))
 
     # Type C: specialists. orthopedist/surgeon sempre; dentist/pediatra/psiquiatra
     # habilitados onde o parser (bloco ATENDIMENTO) reporta o sinal.

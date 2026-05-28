@@ -454,17 +454,29 @@ def _yellow_male_female_from_payload(
 
 
 # Rótulos do parser (``other_beds[].key``) → sector_key sintético do app.
+# NB: ``other_verde`` vem rotulado como "internamento" nas mensagens, então
+# mapeia para internamento (não para a sala de medicação).
 _OTHER_BEDS_KEY_MAP: dict[str, str] = {
     "other_medicacao": "medication_room",
-    "other_verde": "medication_room",
     "other_internamento": "ward_internment",
+    "other_verde": "ward_internment",
     "other_pediatria": "ward_pediatric_internment",
+}
+
+_OTHER_BEDS_COL_PREFIX: dict[str, str] = {
+    "medication_room": "medication_room",
+    "ward_internment": "ward_internment",
+    "ward_pediatric_internment": "ward_ped_internment",
 }
 
 
 def _other_beds_from_payload(parser_row: Optional[dict[str, Any]]) -> dict[str, int | None]:
     """Mapeia ``rooms.other_beds`` (medicação/verde, internamento, internamento
     pediátrico) para as colunas sintéticas esperadas por ``COUNTER_PARSER_MAP``.
+
+    Salas de medicação/internamento muitas vezes vêm como contagem de pacientes
+    sem capacidade fixa (capacity=0). Para não exibir "5/0" como over eterno,
+    a capacidade efetiva é ``max(capacity, occupied)``.
     """
     out: dict[str, int | None] = {}
     data = _parser_payload_data(parser_row)
@@ -472,23 +484,18 @@ def _other_beds_from_payload(parser_row: Optional[dict[str, Any]]) -> dict[str, 
     other_beds = rooms.get("other_beds") if isinstance(rooms, dict) else None
     if not isinstance(other_beds, list):
         return out
-    col_prefix = {
-        "medication_room": "medication_room",
-        "ward_internment": "ward_internment",
-        "ward_pediatric_internment": "ward_ped_internment",
-    }
     for bed in other_beds:
         if not isinstance(bed, dict):
             continue
         sector_key = _OTHER_BEDS_KEY_MAP.get(str(bed.get("key") or ""))
         if not sector_key:
             continue
-        prefix = col_prefix[sector_key]
-        # Se houver mais de um other_bed para o mesmo setor, soma as ocupações.
-        occ = out.get(f"{prefix}_occupied") or 0
-        cap = out.get(f"{prefix}_capacity") or 0
-        out[f"{prefix}_occupied"] = occ + (bed.get("occupied") or 0)
-        out[f"{prefix}_capacity"] = cap + (bed.get("capacity") or 0)
+        prefix = _OTHER_BEDS_COL_PREFIX[sector_key]
+        # Soma quando há mais de um other_bed para o mesmo setor.
+        occ = (out.get(f"{prefix}_occupied") or 0) + (bed.get("occupied") or 0)
+        cap = (out.get(f"{prefix}_capacity") or 0) + (bed.get("capacity") or 0)
+        out[f"{prefix}_occupied"] = occ
+        out[f"{prefix}_capacity"] = max(cap, occ)
     return out
 
 
