@@ -182,4 +182,18 @@ class ApproveResponse(BaseModel):
     status: str
 
 
+# ---------------------------------------------------------------------------
+# Admin — units overview
+# ---------------------------------------------------------------------------
+class AdminUnit(BaseModel):
+    id: UUID
+    code: str
+    canonical_name: str
+    slug: str
+    active: bool
+    coordinator_count: int = 0
+    enabled_sector_count: int = 0
+    red_capacity: int = 0
+
+
 DeviceSelfPairResponse.model_rebuild()

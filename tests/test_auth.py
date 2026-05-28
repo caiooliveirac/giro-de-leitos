@@ -113,9 +113,34 @@ def test_router_registered():
         "/api/users/{user_id}/approve",
         "/api/users/{user_id}/reject",
         "/api/users/{user_id}/suspend",
+        "/api/admin/units",
     }
     missing = expected - paths
     assert not missing, f"rotas faltando: {missing}"
+
+
+def test_admin_units_requires_auth(client):
+    resp = client.get("/api/admin/units")
+    assert resp.status_code == 401
+
+
+def test_admin_unit_schema_shape():
+    from auth.schemas import AdminUnit
+
+    sample = AdminUnit(
+        id=uuid.uuid4(),
+        code="upa-x",
+        canonical_name="UPA X",
+        slug="upa-x",
+        active=True,
+        coordinator_count=3,
+        enabled_sector_count=5,
+        red_capacity=4,
+    )
+    assert isinstance(sample.coordinator_count, int)
+    assert sample.coordinator_count == 3
+    assert sample.enabled_sector_count == 5
+    assert sample.red_capacity == 4
 
 
 def test_admin_login_invalid(client):

@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { motion } from 'framer-motion';
 import { Save } from 'lucide-react';
 import { apiFetch, ApiError } from '@/lib/api';
@@ -17,13 +18,26 @@ interface SectorConfig {
   capacity: number | null;
 }
 
+interface AdminUnit {
+  id: string;
+  canonical_name: string;
+}
+
 export default function ConfigurarPage() {
   const toast = useToast();
-  const { user, hydrated, isCoordinator } = useCurrentUser();
-  const unitId = user?.unit_id ?? null;
+  const searchParams = useSearchParams();
+  const { user, hydrated, isCoordinator, isAdmin } = useCurrentUser();
+
+  // Admins may override unit via ?unit_id=<id>. Coordinators always use their own unit.
+  const queryUnitId = searchParams?.get('unit_id') ?? null;
+  const unitId = isAdmin
+    ? queryUnitId || user?.unit_id || null
+    : user?.unit_id ?? null;
+
   const [items, setItems] = useState<Record<string, SectorConfig>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [unitName, setUnitName] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!unitId) {
@@ -40,7 +54,7 @@ export default function ConfigurarPage() {
           map[meta.key] = {
             sector_key: meta.key,
             enabled: false,
-            capacity: meta.type === 'counter' ? 0 : null,
+            capacity: meta.type === 'counter' || meta.key === 'red_room' ? 0 : null,
           };
         }
       }
@@ -53,9 +67,31 @@ export default function ConfigurarPage() {
     }
   }, [unitId, toast]);
 
+  // Fetch UPA display name (admin uses /api/admin/units; coord uses /state).
+  const loadUnitName = useCallback(async () => {
+    if (!unitId) return;
+    try {
+      if (isAdmin) {
+        const list = await apiFetch<AdminUnit[]>('/api/admin/units');
+        const match = list.find((u) => u.id === unitId);
+        if (match) setUnitName(match.canonical_name);
+      } else {
+        const state = await apiFetch<{ unit?: { canonical_name?: string } }>(
+          `/api/unit/${unitId}/state`,
+        );
+        if (state?.unit?.canonical_name) setUnitName(state.unit.canonical_name);
+      }
+    } catch {
+      // header label is non-critical
+    }
+  }, [unitId, isAdmin]);
+
   useEffect(() => {
-    if (hydrated) void load();
-  }, [hydrated, load]);
+    if (hydrated) {
+      void load();
+      void loadUnitName();
+    }
+  }, [hydrated, load, loadUnitName]);
 
   const toggle = (key: SectorKey, enabled: boolean) => {
     setItems((prev) => ({
@@ -65,14 +101,33 @@ export default function ConfigurarPage() {
   };
 
   const setCapacity = (key: SectorKey, capacity: number) => {
+    const safe = Number.isFinite(capacity) && capacity >= 0 ? Math.floor(capacity) : 0;
     setItems((prev) => ({
       ...prev,
-      [key]: { ...prev[key], capacity: Number.isFinite(capacity) ? capacity : 0 },
+      [key]: { ...prev[key], capacity: safe },
     }));
   };
 
   const save = async () => {
     if (!unitId) return;
+
+    // Client-side validation.
+    const redRoom = items['red_room'];
+    if (redRoom?.enabled && (!redRoom.capacity || redRoom.capacity <= 0)) {
+      toast.warning('Sala vermelha ativada exige capacidade > 0.');
+      return;
+    }
+    for (const m of SECTOR_LIST) {
+      const cfg = items[m.key];
+      if (!cfg) continue;
+      if (cfg.enabled && m.type === 'counter') {
+        if (cfg.capacity == null || cfg.capacity < 0) {
+          toast.warning(`Capacidade inválida em ${m.label}.`);
+          return;
+        }
+      }
+    }
+
     setSaving(true);
     try {
       const payload = {
@@ -80,7 +135,7 @@ export default function ConfigurarPage() {
           sector_key: m.key,
           enabled: items[m.key]?.enabled ?? false,
           capacity:
-            m.type === 'counter'
+            m.type === 'counter' || m.key === 'red_room'
               ? Number.isFinite(items[m.key]?.capacity ?? NaN)
                 ? items[m.key]?.capacity
                 : 0
@@ -116,12 +171,22 @@ export default function ConfigurarPage() {
     );
   }
 
+  const topBarLabel = unitName
+    ? `Configurando: ${unitName}`
+    : 'Configurar setores';
+
   return (
     <>
       <OfflineBanner />
-      <TopBar unitName="Configurar setores" shiftLabel={user?.name ?? null} />
+      <TopBar unitName={topBarLabel} shiftLabel={user?.name ?? null} />
 
       <main className="mx-auto w-full max-w-[520px] px-4 pb-28 pt-4">
+        {isAdmin && queryUnitId && (
+          <div className="mb-3 rounded-card border border-accent-blue/30 bg-accent-blue/5 px-3 py-2 text-xs text-text-secondary">
+            Modo admin: editando setores de <strong>{unitName ?? queryUnitId}</strong>.
+          </div>
+        )}
+
         {loading && (
           <p className="text-center text-sm text-text-secondary">Carregando configuração…</p>
         )}
@@ -185,6 +250,7 @@ function Group({
           const cfg = items[m.key];
           const Icon = m.icon;
           const enabled = cfg?.enabled ?? false;
+          const showCapacity = enabled && (m.type === 'counter' || m.key === 'red_room');
           return (
             <div
               key={m.key}
@@ -200,7 +266,7 @@ function Group({
                 </p>
               </div>
 
-              {m.type === 'counter' && enabled && (
+              {showCapacity && (
                 <input
                   type="number"
                   min={0}

@@ -28,6 +28,7 @@ from auth.deps import (
 )
 from auth.schemas import (
     AdminLogin,
+    AdminUnit,
     ApproveResponse,
     DeviceGenerateCodeRequest,
     DeviceGenerateCodeResponse,
@@ -533,6 +534,63 @@ def reject_user_endpoint(user_id: UUID, request: Request, conn=Depends(get_db)):
         payload={"user_id": str(result["id"])},
     )
     return ApproveResponse(id=result["id"], status=result["status"])
+
+
+# ---------------------------------------------------------------------------
+# Admin — units overview
+# ---------------------------------------------------------------------------
+@router.get("/admin/units", response_model=list[AdminUnit])
+def list_admin_units(
+    admin=Depends(get_current_admin),
+    conn=Depends(get_db),
+):
+    """Return every registered unit with aggregate counts for the admin panel."""
+    sql = """
+        SELECT
+            u.id,
+            u.code,
+            u.canonical_name,
+            u.slug,
+            u.active,
+            COALESCE(c.coord_count, 0) AS coordinator_count,
+            COALESCE(s.enabled_count, 0) AS enabled_sector_count,
+            COALESCE(r.red_capacity, 0) AS red_capacity
+        FROM units u
+        LEFT JOIN (
+            SELECT unit_id, COUNT(*) AS coord_count
+            FROM users
+            WHERE role = 'coordinator' AND status = 'active'
+            GROUP BY unit_id
+        ) c ON c.unit_id = u.id
+        LEFT JOIN (
+            SELECT unit_id, COUNT(*) AS enabled_count
+            FROM unit_sectors_config
+            WHERE enabled = TRUE
+            GROUP BY unit_id
+        ) s ON s.unit_id = u.id
+        LEFT JOIN (
+            SELECT unit_id, COALESCE(capacity, 0) AS red_capacity
+            FROM unit_sectors_config
+            WHERE sector_key = 'red_room' AND enabled = TRUE
+        ) r ON r.unit_id = u.id
+        ORDER BY u.canonical_name ASC
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        rows = cur.fetchall() or []
+    return [
+        AdminUnit(
+            id=row["id"],
+            code=row["code"],
+            canonical_name=row["canonical_name"],
+            slug=row["slug"],
+            active=row["active"],
+            coordinator_count=int(row.get("coordinator_count") or 0),
+            enabled_sector_count=int(row.get("enabled_sector_count") or 0),
+            red_capacity=int(row.get("red_capacity") or 0),
+        )
+        for row in rows
+    ]
 
 
 @router.post("/users/{user_id}/suspend", response_model=ApproveResponse)

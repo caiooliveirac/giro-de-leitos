@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useRouter } from 'next/navigation';
-import { Building2, Check, Copy, MessageCircle, Plus, UserRound, X } from 'lucide-react';
+import { Building2, Check, Copy, MessageCircle, Settings2, UserRound, X } from 'lucide-react';
 import { apiFetch, ApiError } from '@/lib/api';
 import { useToast } from '@/lib/toast';
 import { useCurrentUser } from '@/hooks/useCurrentUser';
@@ -12,10 +12,15 @@ import { OfflineBanner } from '@/components/shared/OfflineBanner';
 import { ToastViewport } from '@/components/shared/ToastViewport';
 import { qrImageUrl } from '@/lib/qr';
 
-interface UnitMock {
+interface AdminUnit {
   id: string;
-  name: string;
-  coordinators: number;
+  code: string;
+  canonical_name: string;
+  slug: string;
+  active: boolean;
+  coordinator_count: number;
+  enabled_sector_count: number;
+  red_capacity: number;
 }
 
 interface PendingUser {
@@ -37,21 +42,14 @@ interface InviteCreateResponse {
   expires_at: string;
 }
 
-// TODO Fase 7: substituir por GET /api/units quando endpoint existir.
-const MOCK_UNITS: UnitMock[] = [
-  { id: '00000000-0000-0000-0000-000000000001', name: 'UPA Centro', coordinators: 2 },
-  { id: '00000000-0000-0000-0000-000000000002', name: 'UPA Norte', coordinators: 1 },
-];
-
 export default function AdminPage() {
   const router = useRouter();
   const toast = useToast();
   const { user, hydrated, isAdmin } = useCurrentUser();
   const [pending, setPending] = useState<PendingUser[]>([]);
-  const [units] = useState<UnitMock[]>(MOCK_UNITS);
-  const [selectedUnit, setSelectedUnit] = useState<string>(MOCK_UNITS[0]?.id ?? '');
-  const [newUnitName, setNewUnitName] = useState('');
-  const [creatingNewUnit, setCreatingNewUnit] = useState(false);
+  const [units, setUnits] = useState<AdminUnit[]>([]);
+  const [unitsLoading, setUnitsLoading] = useState(true);
+  const [selectedUnit, setSelectedUnit] = useState<string>('');
   const [invite, setInvite] = useState<InviteCreateResponse | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -62,10 +60,29 @@ export default function AdminPage() {
     }
   }, [hydrated, isAdmin, router]);
 
-  const load = useCallback(async () => {
+  const loadUnits = useCallback(async () => {
+    setUnitsLoading(true);
+    try {
+      const rows = await apiFetch<AdminUnit[]>('/api/admin/units');
+      setUnits(rows);
+      if (rows.length > 0) {
+        setSelectedUnit((cur) => cur || rows[0].id);
+      }
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        router.replace('/admin/login');
+        return;
+      }
+      const msg = err instanceof ApiError ? err.message : 'Falha ao carregar UPAs';
+      toast.error(msg);
+    } finally {
+      setUnitsLoading(false);
+    }
+  }, [router, toast]);
+
+  const loadPending = useCallback(async () => {
     try {
       const p = await apiFetch<PendingUser[]>('/api/users/pending');
-      // Filter coordinator-only pending for admin clarity.
       setPending(p.filter((u) => u.role === 'coordinator'));
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
@@ -78,17 +95,16 @@ export default function AdminPage() {
   }, [router, toast]);
 
   useEffect(() => {
-    if (hydrated && isAdmin) void load();
-  }, [hydrated, isAdmin, load]);
+    if (hydrated && isAdmin) {
+      void loadUnits();
+      void loadPending();
+    }
+  }, [hydrated, isAdmin, loadUnits, loadPending]);
 
   const inviteCoordinator = async () => {
-    if (!selectedUnit && !newUnitName) {
-      toast.error('Escolha ou crie uma UPA');
+    if (!selectedUnit) {
+      toast.error('Escolha uma UPA');
       return;
-    }
-    if (creatingNewUnit) {
-      // TODO Fase 7: POST /api/admin/units para criar UPA antes de gerar convite.
-      toast.warning('Criação de UPA ainda não implementada — convite usará UPA selecionada.');
     }
     setBusy(true);
     try {
@@ -111,6 +127,7 @@ export default function AdminPage() {
       await apiFetch(`/api/users/${id}/approve`, { method: 'POST' });
       toast.success('Coordenador aprovado');
       setPending((p) => p.filter((u) => u.id !== id));
+      void loadUnits();
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : 'Falha ao aprovar';
       toast.error(msg);
@@ -128,6 +145,10 @@ export default function AdminPage() {
     }
   };
 
+  const goToConfigure = (unitId: string) => {
+    router.push(`/configurar?unit_id=${unitId}`);
+  };
+
   if (!hydrated) return null;
   if (!isAdmin) return null;
 
@@ -142,52 +163,30 @@ export default function AdminPage() {
           subtitle="Selecione a UPA destino e gere o link"
         >
           <div className="rounded-card border border-border bg-card p-4 space-y-3">
-            {!creatingNewUnit && (
-              <label className="block">
-                <span className="mb-1.5 block text-xs font-medium text-text-secondary">
-                  UPA destino
-                </span>
-                <select
-                  value={selectedUnit}
-                  onChange={(e) => setSelectedUnit(e.target.value)}
-                  className="w-full rounded-xl border border-border bg-surface px-3.5 py-3 text-base text-text-primary focus:border-accent-blue focus:outline-none focus:ring-2 focus:ring-accent-blue/30"
-                >
-                  {units.map((u) => (
-                    <option key={u.id} value={u.id}>
-                      {u.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
-
-            {creatingNewUnit && (
-              <label className="block">
-                <span className="mb-1.5 block text-xs font-medium text-text-secondary">
-                  Nome da nova UPA
-                </span>
-                <input
-                  value={newUnitName}
-                  onChange={(e) => setNewUnitName(e.target.value)}
-                  className="w-full rounded-xl border border-border bg-surface px-3.5 py-3 text-base text-text-primary focus:border-accent-blue focus:outline-none focus:ring-2 focus:ring-accent-blue/30"
-                  placeholder="UPA Bairro Novo"
-                />
-              </label>
-            )}
-
-            <button
-              type="button"
-              onClick={() => setCreatingNewUnit((v) => !v)}
-              className="flex items-center gap-1.5 text-xs font-medium text-accent-blue hover:underline"
-            >
-              <Plus size={14} />
-              {creatingNewUnit ? 'Usar UPA existente' : 'Criar nova UPA'}
-            </button>
+            <label className="block">
+              <span className="mb-1.5 block text-xs font-medium text-text-secondary">
+                UPA destino
+              </span>
+              <select
+                value={selectedUnit}
+                onChange={(e) => setSelectedUnit(e.target.value)}
+                disabled={unitsLoading || units.length === 0}
+                className="w-full rounded-xl border border-border bg-surface px-3.5 py-3 text-base text-text-primary focus:border-accent-blue focus:outline-none focus:ring-2 focus:ring-accent-blue/30 disabled:opacity-50"
+              >
+                {unitsLoading && <option>Carregando UPAs…</option>}
+                {!unitsLoading && units.length === 0 && <option>Nenhuma UPA cadastrada</option>}
+                {units.map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.canonical_name}
+                  </option>
+                ))}
+              </select>
+            </label>
 
             {!invite && (
               <button
                 type="button"
-                disabled={busy}
+                disabled={busy || !selectedUnit}
                 onClick={inviteCoordinator}
                 className="w-full rounded-pill bg-accent-blue px-5 py-3 text-base font-semibold text-white disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
               >
@@ -198,25 +197,41 @@ export default function AdminPage() {
           </div>
         </Section>
 
-        <Section title="UPAs ativas" subtitle="Painel global de unidades">
-          {/* TODO Fase 7: GET /api/units com contagens reais. */}
+        <Section title="UPAs ativas" subtitle={`${units.length} unidade(s) cadastrada(s)`}>
           <div className="space-y-2">
-            {units.map((u) => (
-              <div
-                key={u.id}
-                className="flex items-center gap-3 rounded-card border border-border bg-card px-3 py-2.5"
-              >
-                <div className="flex h-10 w-10 items-center justify-center rounded-pill bg-accent-blue/10 text-accent-blue">
-                  <Building2 size={18} />
+            {unitsLoading && <UnitsSkeleton />}
+            {!unitsLoading && units.length === 0 && (
+              <p className="rounded-card border border-border bg-card p-4 text-center text-sm text-text-secondary">
+                Nenhuma UPA cadastrada ainda.
+              </p>
+            )}
+            {!unitsLoading &&
+              units.map((u) => (
+                <div
+                  key={u.id}
+                  className="flex items-center gap-3 rounded-card border border-border bg-card px-3 py-2.5"
+                >
+                  <div className="flex h-10 w-10 items-center justify-center rounded-pill bg-accent-blue/10 text-accent-blue">
+                    <Building2 size={18} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-semibold text-text-primary">
+                      {u.canonical_name}
+                    </p>
+                    <p className="truncate text-xs text-text-secondary">
+                      {u.coordinator_count} coord · {u.enabled_sector_count} setores · sala vermelha {u.red_capacity}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => goToConfigure(u.id)}
+                    aria-label={`Configurar setores de ${u.canonical_name}`}
+                    className="flex items-center gap-1.5 rounded-pill border border-border bg-surface px-3 py-2 text-xs font-medium text-text-primary transition hover:bg-border/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+                  >
+                    <Settings2 size={14} /> Setores
+                  </button>
                 </div>
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-semibold text-text-primary">{u.name}</p>
-                  <p className="truncate text-xs text-text-secondary">
-                    {u.coordinators} coordenador(es)
-                  </p>
-                </div>
-              </div>
-            ))}
+              ))}
           </div>
         </Section>
 
@@ -236,6 +251,7 @@ export default function AdminPage() {
                 user={p}
                 onApprove={() => approve(p.id)}
                 onReject={() => reject(p.id)}
+                onConfigureUnit={p.unit_id ? () => goToConfigure(p.unit_id as string) : undefined}
               />
             ))}
           </div>
@@ -243,6 +259,26 @@ export default function AdminPage() {
       </main>
       <ToastViewport />
     </>
+  );
+}
+
+function UnitsSkeleton() {
+  return (
+    <div className="space-y-2">
+      {[0, 1, 2].map((i) => (
+        <div
+          key={i}
+          className="flex items-center gap-3 rounded-card border border-border bg-card px-3 py-2.5 animate-pulse"
+        >
+          <div className="h-10 w-10 rounded-pill bg-border/60" />
+          <div className="flex-1 space-y-2">
+            <div className="h-3 w-2/3 rounded bg-border/60" />
+            <div className="h-2 w-1/2 rounded bg-border/40" />
+          </div>
+          <div className="h-7 w-20 rounded-pill bg-border/40" />
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -311,10 +347,12 @@ function PendingCard({
   user,
   onApprove,
   onReject,
+  onConfigureUnit,
 }: {
   user: PendingUser;
   onApprove: () => void | Promise<void>;
   onReject: () => void | Promise<void>;
+  onConfigureUnit?: () => void;
 }) {
   const [rejectProgress, setRejectProgress] = useState(0);
   const rafRef = useRef<number | null>(null);
@@ -364,6 +402,15 @@ function PendingCard({
             {user.coren_crm ? ` · ${user.coren_crm}` : ''}
           </p>
           <p className="truncate text-xs text-text-tertiary">CPF {user.cpf_masked}</p>
+          {onConfigureUnit && (
+            <button
+              type="button"
+              onClick={onConfigureUnit}
+              className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-accent-blue hover:underline"
+            >
+              <Settings2 size={12} /> Ver setores da UPA
+            </button>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <button
