@@ -10,6 +10,7 @@ import { useCurrentUser } from '@/hooks/useCurrentUser';
 import { TopBar } from '@/components/shared/TopBar';
 import { OfflineBanner } from '@/components/shared/OfflineBanner';
 import { ToastViewport } from '@/components/shared/ToastViewport';
+import { UnitPicker } from '@/components/admin/UnitPicker';
 import { qrImageUrl } from '@/lib/qr';
 
 interface AdminUnit {
@@ -163,25 +164,17 @@ export default function AdminPage() {
           subtitle="Selecione a UPA destino e gere o link"
         >
           <div className="rounded-card border border-border bg-card p-4 space-y-3">
-            <label className="block">
+            <div>
               <span className="mb-1.5 block text-xs font-medium text-text-secondary">
                 UPA destino
               </span>
-              <select
+              <UnitPicker
+                units={units}
                 value={selectedUnit}
-                onChange={(e) => setSelectedUnit(e.target.value)}
-                disabled={unitsLoading || units.length === 0}
-                className="w-full rounded-xl border border-border bg-surface px-3.5 py-3 text-base text-text-primary focus:border-accent-blue focus:outline-none focus:ring-2 focus:ring-accent-blue/30 disabled:opacity-50"
-              >
-                {unitsLoading && <option>Carregando UPAs…</option>}
-                {!unitsLoading && units.length === 0 && <option>Nenhuma UPA cadastrada</option>}
-                {units.map((u) => (
-                  <option key={u.id} value={u.id}>
-                    {u.canonical_name}
-                  </option>
-                ))}
-              </select>
-            </label>
+                onChange={setSelectedUnit}
+                loading={unitsLoading}
+              />
+            </div>
 
             {!invite && (
               <button

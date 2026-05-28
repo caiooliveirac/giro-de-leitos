@@ -1,9 +1,10 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { motion } from 'framer-motion';
-import { Save } from 'lucide-react';
+import { ArrowLeft, Save } from 'lucide-react';
 import { apiFetch, ApiError } from '@/lib/api';
 import { useToast } from '@/lib/toast';
 import { useCurrentUser } from '@/hooks/useCurrentUser';
@@ -161,13 +162,34 @@ export default function ConfigurarPage() {
     return groups;
   }, []);
 
-  if (hydrated && !isCoordinator) {
+  if (hydrated && !isCoordinator && !isAdmin) {
     return (
       <main className="mx-auto min-h-dvh w-full max-w-[520px] px-4 pt-12 text-center">
         <p className="text-sm text-text-secondary">
           Apenas coordenadores e admins podem configurar setores.
         </p>
       </main>
+    );
+  }
+
+  if (hydrated && isAdmin && !unitId) {
+    return (
+      <>
+        <OfflineBanner />
+        <TopBar unitName="Configurar setores" shiftLabel={user?.name ?? null} />
+        <main className="mx-auto min-h-dvh w-full max-w-[520px] px-4 pt-12 text-center">
+          <p className="rounded-card border border-border bg-card p-4 text-sm text-text-secondary">
+            Selecione uma UPA na tela admin para configurar seus setores.
+          </p>
+          <Link
+            href="/admin"
+            className="mt-4 inline-flex items-center gap-1.5 rounded-pill bg-accent-blue px-5 py-2.5 text-sm font-semibold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+          >
+            <ArrowLeft size={14} /> Ir para Admin
+          </Link>
+        </main>
+        <ToastViewport />
+      </>
     );
   }
 

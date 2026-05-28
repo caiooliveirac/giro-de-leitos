@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
   Check,
@@ -48,8 +49,15 @@ interface InviteCreateResponse {
 }
 
 export default function EquipePage() {
+  const router = useRouter();
   const toast = useToast();
-  const { user, hydrated, isCoordinator } = useCurrentUser();
+  const { user, hydrated, isCoordinator, isAdmin } = useCurrentUser();
+
+  useEffect(() => {
+    if (hydrated && isAdmin) {
+      router.replace('/admin');
+    }
+  }, [hydrated, isAdmin, router]);
   const [pending, setPending] = useState<PendingUser[]>([]);
   const [staff, setStaff] = useState<StaffUser[]>([]);
   const [invite, setInvite] = useState<InviteCreateResponse | null>(null);
@@ -113,11 +121,15 @@ export default function EquipePage() {
     }
   };
 
+  if (hydrated && isAdmin) {
+    return null;
+  }
+
   if (hydrated && !isCoordinator) {
     return (
       <main className="mx-auto min-h-dvh w-full max-w-[520px] px-4 pt-12 text-center">
         <p className="text-sm text-text-secondary">
-          Apenas coordenadores e admins podem acessar essa tela.
+          Apenas coordenadores podem acessar essa tela.
         </p>
       </main>
     );
