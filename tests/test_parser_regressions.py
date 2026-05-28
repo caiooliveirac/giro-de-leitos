@@ -226,6 +226,20 @@ class ParserRegressionTests(unittest.TestCase):
         patients = parse_whatsapp_message(text)["rooms"]["red_room"]["patients"]
         self.assertEqual([p["sigla"] for p in patients], ["RSS", "PBJ"])
 
+    def test_red_room_sigla_dash_status_without_age(self) -> None:
+        # Formato "SIGLA - status" sem marcador nem idade (centro maria).
+        text = (
+            "🔴 SALA VERMELHA: (03/02)\n\n"
+            "TBDESDS - EM OBSERVAÇÃO\n\n"
+            "SSB - EM OBSERVAÇÃO\n\n"
+            "ICS - AGUARDA CONDUTA\n\n"
+            "OBS: 03 PACIENTES AGUARDANDO REGULAÇÃO\n\n"
+            "🟡 SALA AMARELA: (12/12)\n"
+        )
+        patients = parse_whatsapp_message(text)["rooms"]["red_room"]["patients"]
+        self.assertEqual([p["sigla"] for p in patients], ["TBDESDS", "SSB", "ICS"])
+        self.assertIn("OBSERVAÇÃO", patients[0]["clinical_summary"])
+
     def test_specialists_dentist_and_pediatrician_from_atendimento(self) -> None:
         spec = parse_whatsapp_message(VALERIA_TEXT)["specialists"]
         self.assertTrue(spec["has_dentist"])

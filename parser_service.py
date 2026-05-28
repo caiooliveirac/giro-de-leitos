@@ -338,7 +338,7 @@ _REDROOM_STOP_TERMS = (
 _REDROOM_NOTE_SIGLAS = {
     "obs", "obc", "info", "informamos", "nota", "ps", "leito", "leitos",
     "total", "obito", "vaga", "vagas", "sala", "adm", "cid", "ssvv",
-    "sinais", "tax", "data", "spo", "hgt", "box",
+    "sinais", "tax", "data", "spo", "hgt", "box", "sd",
 }
 
 
@@ -381,7 +381,11 @@ def _extract_red_room_patients(lines: list[str]) -> list[dict[str, Any]]:
 
         had_marker = bullet_match is not None or had_label
         age_search = AGE_PATTERN.search(core)
-        is_patient = sigla is not None and (had_marker or age_search is not None)
+        # Formato "SIGLA - status" (sem marcador nem idade), ex.:
+        # "TBDESDS - EM OBSERVAÇÃO". Travessão logo após a sigla = paciente.
+        rest_after_sigla = core[sigla_match.end():].lstrip() if sigla_match else ""
+        has_dash_sep = rest_after_sigla[:1] in ("-", "–", "—")
+        is_patient = sigla is not None and (had_marker or age_search is not None or has_dash_sep)
         # Filtra "siglas"-nota (OBS:, ADM, SSVV...) SÓ quando não há idade — uma
         # linha com idade é paciente mesmo que a sigla coincida ("1. OBS, 96 anos").
         is_note = (
