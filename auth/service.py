@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -14,7 +15,10 @@ from auth.cpf import validate_cpf
 from auth.deps import DEVICE_TOKEN_TTL, PAIRING_CODE_TTL, SHIFT_TOKEN_TTL
 
 INVITE_TTL = timedelta(days=7)
-INVITE_RATE_PER_HOUR = 10
+# Per-creator cap on invites/hour. Default raised for unit onboarding (an admin
+# legitimately generates one coordinator link per unit in a single sitting);
+# overridable via env for special cases.
+INVITE_RATE_PER_HOUR = int(os.getenv("INVITE_RATE_PER_HOUR", "50"))
 
 
 # ---------------------------------------------------------------------------
