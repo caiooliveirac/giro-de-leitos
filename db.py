@@ -887,16 +887,13 @@ def get_dashboard_metrics(period: str = "all", unit_code: str | None = None) -> 
             xray_unit_sql, xray_unit_params = (" AND entity_id = %s", [f"{unit_id}:xray"])
             cs_unit_sql, cs_unit_params = (" AND unit_code = %s", [unit_code])
 
-        # --- Eventos de leito (audit_log): óbitos/altas/transferências/pacientes ---
+        # --- Eventos de leito (audit_log): óbitos/altas/transferências ---
         cur.execute(
             f"""
             SELECT
               COUNT(*) FILTER (WHERE action='bed.death')     AS deaths,
               COUNT(*) FILTER (WHERE action='bed.discharge') AS discharges,
-              COUNT(*) FILTER (WHERE action='bed.transfer')  AS transfers,
-              COUNT(DISTINCT new_value->>'patient_sigla')
-                FILTER (WHERE action='bed.update'
-                        AND COALESCE(new_value->>'patient_sigla','') <> '') AS red_patients
+              COUNT(*) FILTER (WHERE action='bed.transfer')  AS transfers
             FROM audit_log
             WHERE entity_type='bed'{bed_unit_sql}{p_created}
             """,
@@ -910,10 +907,7 @@ def get_dashboard_metrics(period: str = "all", unit_code: str | None = None) -> 
             SELECT split_part(entity_id, ':', 1) AS unit_id,
               COUNT(*) FILTER (WHERE action='bed.death')     AS deaths,
               COUNT(*) FILTER (WHERE action='bed.discharge') AS discharges,
-              COUNT(*) FILTER (WHERE action='bed.transfer')  AS transfers,
-              COUNT(DISTINCT new_value->>'patient_sigla')
-                FILTER (WHERE action='bed.update'
-                        AND COALESCE(new_value->>'patient_sigla','') <> '') AS red_patients
+              COUNT(*) FILTER (WHERE action='bed.transfer')  AS transfers
             FROM audit_log
             WHERE entity_type='bed'{bed_unit_sql}{p_created}
             GROUP BY 1
@@ -921,6 +915,32 @@ def get_dashboard_metrics(period: str = "all", unit_code: str | None = None) -> 
             bed_unit_params,
         )
         bed_by_unit = {r["unit_id"]: r for r in cur.fetchall()}
+
+        # --- Pacientes distintos que estiveram na sala vermelha ---
+        # Fonte real: lista de pacientes do giro (parser do WhatsApp), em
+        # payload.data.rooms.red_room.patients[].sigla. Conta siglas distintas
+        # por unidade no período (aproxima "pacientes diferentes que passaram").
+        red_patients_sql = """
+            FROM parsed_events pe
+            CROSS JOIN LATERAL jsonb_array_elements(
+                CASE WHEN jsonb_typeof(pe.payload->'data'->'rooms'->'red_room'->'patients')='array'
+                     THEN pe.payload->'data'->'rooms'->'red_room'->'patients'
+                     ELSE '[]'::jsonb END) AS pat
+            WHERE COALESCE(pat->>'sigla','') <> ''
+        """
+        cur.execute(
+            f"SELECT COUNT(DISTINCT (pe.unit_code, pat->>'sigla')) AS red_patients "
+            f"{red_patients_sql}{pe_unit_sql}{p_received}",
+            pe_unit_params,
+        )
+        red_total = cur.fetchone() or {}
+
+        cur.execute(
+            f"SELECT pe.unit_code, COUNT(DISTINCT pat->>'sigla') AS red_patients "
+            f"{red_patients_sql}{pe_unit_sql}{p_received} GROUP BY pe.unit_code",
+            pe_unit_params,
+        )
+        red_by_unit = {r["unit_code"]: r for r in cur.fetchall()}
 
         # --- Ocupação (parsed_events): amarela / isolamento + nº de giros ---
         cur.execute(
@@ -1024,7 +1044,7 @@ def get_dashboard_metrics(period: str = "all", unit_code: str | None = None) -> 
     yellow_current = sum((r["yellow_occupied"] or 0) for r in cur_status.values()) if cur_status else None
     iso_current = sum((r["isolation_total_occupied"] or 0) for r in cur_status.values()) if cur_status else None
     totals = {
-        "red_patients": int(bed.get("red_patients") or 0),
+        "red_patients": int(red_total.get("red_patients") or 0),
         "deaths": int(bed.get("deaths") or 0),
         "discharges": int(bed.get("discharges") or 0),
         "transfers": int(bed.get("transfers") or 0),
@@ -1040,7 +1060,7 @@ def get_dashboard_metrics(period: str = "all", unit_code: str | None = None) -> 
     }
 
     # ---- monta breakdown por unidade (une todas as fontes por code) ----
-    codes = set(occ_by_unit) | set(ortho_by_unit) | set(cur_status)
+    codes = set(occ_by_unit) | set(ortho_by_unit) | set(cur_status) | set(red_by_unit)
     codes |= {id_to_unit[uid]["code"] for uid in bed_by_unit if uid in id_to_unit}
     codes |= {id_to_unit[uid]["code"] for uid in xray_by_unit if uid in id_to_unit}
     by_unit = []
@@ -1054,7 +1074,7 @@ def get_dashboard_metrics(period: str = "all", unit_code: str | None = None) -> 
         by_unit.append({
             "unit_code": code,
             "unit_name": code_to_name.get(code, code),
-            "red_patients": int(b.get("red_patients") or 0),
+            "red_patients": int(red_by_unit.get(code, {}).get("red_patients") or 0),
             "deaths": int(b.get("deaths") or 0),
             "discharges": int(b.get("discharges") or 0),
             "transfers": int(b.get("transfers") or 0),
