@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { useRouter } from 'next/navigation';
 import {
   LayoutDashboard,
+  BarChart3,
   Settings2,
   Users,
   ShieldCheck,
@@ -54,6 +55,13 @@ export function NavDrawer({ open, onClose }: NavDrawerProps) {
       description: 'Convites e aprovações da unidade',
       icon: Users,
       visible: isCoordinator,
+    },
+    {
+      href: '/dashboard',
+      label: 'Indicadores',
+      description: 'Histórico e estatísticas dos giros',
+      icon: BarChart3,
+      visible: isAdmin,
     },
     {
       href: '/admin',

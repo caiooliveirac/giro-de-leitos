@@ -9,12 +9,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi.concurrency import run_in_threadpool
-from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from db import get_latest_events, get_latest_status_by_unit, get_parsed_event, get_pending_unit_confirmations, get_recent_alerts, get_registered_units, init_db, is_database_configured, resolve_pending_unit_confirmation, save_event, update_unit_reported_at, delete_event, admin_update_event, get_event_detail
+from db import get_dashboard_metrics, get_latest_events, get_latest_status_by_unit, get_parsed_event, get_pending_unit_confirmations, get_recent_alerts, get_registered_units, init_db, is_database_configured, resolve_pending_unit_confirmation, save_event, update_unit_reported_at, delete_event, admin_update_event, get_event_detail
+from auth.deps import get_current_admin
 from parser_service import parse_whatsapp_message
 from units import resolve_unit_from_text, resolve_unit_name
 
@@ -742,6 +743,24 @@ async def get_summary() -> dict[str, Any]:
         "units": units,
         "pending_unit_confirmations": pending_unit_confirmations,
     }
+
+
+@app.get("/api/dashboard/metrics", summary="Indicadores agregados dos giros (admin)")
+async def dashboard_metrics(
+    period: str = "all",
+    unit: str | None = None,
+    admin: dict[str, Any] = Depends(get_current_admin),
+) -> dict[str, Any]:
+    if not is_database_configured():
+        return {
+            "status": "disabled",
+            "message": "Banco não configurado para persistência.",
+            "totals": {},
+            "by_unit": [],
+        }
+
+    data = await run_in_threadpool(get_dashboard_metrics, period, unit)
+    return {"status": "ok", **data}
 
 
 @app.get("/api/alerts", summary="Alertas recentes de mudanças relevantes")

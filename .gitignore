@@ -1,5 +1,11 @@
 # Credentials / secrets
 .env
+.env.local
+.env.*.local
+
+# Python venv / build
+.venv/
+*.tsbuildinfo
 
 # Python
 __pycache__/

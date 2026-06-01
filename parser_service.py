@@ -239,6 +239,7 @@ def _is_section_header(line: str) -> bool:
         "exames",
         "obito",
         "obitario",
+        "obituario",
         "triagem",
         "atendimento",
         "unidade",
@@ -331,7 +332,7 @@ _REDROOM_SIGLA = re.compile(
 # Termos que indicam que a seção da vermelha acabou (próximo setor).
 _REDROOM_STOP_TERMS = (
     "amarela", "enfermaria", "medicacao", "verde", "isolamento",
-    "internamento", "obito", "obitario", "exames", "atendimento",
+    "internamento", "obito", "obitario", "obituario", "exames", "atendimento",
     "corredor", "triagem",
 )
 # "Siglas" que na verdade são notas/cabeçalhos/rótulos, não pacientes.

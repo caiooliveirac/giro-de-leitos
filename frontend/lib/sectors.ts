@@ -107,7 +107,7 @@ export const SECTORS: Record<SectorKey, SectorMeta> = {
     icon: Baby,
     order: 8,
   },
-  obituary: { key: 'obituary', label: 'Óbitário', type: 'counter', icon: Skull, order: 9 },
+  obituary: { key: 'obituary', label: 'Obituário', type: 'counter', icon: Skull, order: 9 },
   pediatric_observation: {
     key: 'pediatric_observation',
     label: 'Observação pediátrica',

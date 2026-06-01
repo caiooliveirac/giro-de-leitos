@@ -838,6 +838,238 @@ def get_latest_events(limit: int = 50) -> list[dict[str, Any]]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Dashboard / indicadores (agregação do histórico já preservado)
+# ---------------------------------------------------------------------------
+def _period_clause(period: str, column: str) -> str:
+    """Fragmento SQL seguro (period é whitelist) filtrando ``column`` por janela."""
+    if period == "today":
+        return f" AND {column} >= date_trunc('day', now())"
+    if period == "7d":
+        return f" AND {column} >= now() - interval '7 days'"
+    if period == "30d":
+        return f" AND {column} >= now() - interval '30 days'"
+    return ""  # all
+
+
+def _round1(value: Any) -> float | None:
+    return round(float(value), 1) if value is not None else None
+
+
+def get_dashboard_metrics(period: str = "all", unit_code: str | None = None) -> dict[str, Any]:
+    """Indicadores agregados dos giros. Deriva de parsed_events + audit_log,
+    sem tabela nova. Filtra por janela de tempo e (opcional) por unidade."""
+    if period not in ("today", "7d", "30d", "all"):
+        period = "all"
+    if not DATABASE_URL:
+        return {"period": period, "unit": unit_code, "totals": {}, "by_unit": []}
+
+    p_created = _period_clause(period, "created_at")
+    p_received = _period_clause(period, "received_at")
+
+    with _connect() as conn, conn.cursor() as cur:
+        # Mapa unidade: id -> (code, name) e code -> name
+        cur.execute("SELECT id, code, canonical_name FROM units")
+        units = cur.fetchall()
+        id_to_unit = {str(u["id"]): u for u in units}
+        code_to_id = {u["code"]: str(u["id"]) for u in units}
+        code_to_name = {u["code"]: u["canonical_name"] for u in units}
+
+        unit_id = code_to_id.get(unit_code) if unit_code else None
+        # Cláusulas/params por filtro de unidade
+        bed_unit_sql, bed_unit_params = ("", [])
+        pe_unit_sql, pe_unit_params = ("", [])
+        xray_unit_sql, xray_unit_params = ("", [])
+        cs_unit_sql, cs_unit_params = ("", [])
+        if unit_code:
+            bed_unit_sql, bed_unit_params = (" AND entity_id LIKE %s", [f"{unit_id}:%"])
+            pe_unit_sql, pe_unit_params = (" AND unit_code = %s", [unit_code])
+            xray_unit_sql, xray_unit_params = (" AND entity_id = %s", [f"{unit_id}:xray"])
+            cs_unit_sql, cs_unit_params = (" AND unit_code = %s", [unit_code])
+
+        # --- Eventos de leito (audit_log): óbitos/altas/transferências/pacientes ---
+        cur.execute(
+            f"""
+            SELECT
+              COUNT(*) FILTER (WHERE action='bed.death')     AS deaths,
+              COUNT(*) FILTER (WHERE action='bed.discharge') AS discharges,
+              COUNT(*) FILTER (WHERE action='bed.transfer')  AS transfers,
+              COUNT(DISTINCT new_value->>'patient_sigla')
+                FILTER (WHERE action='bed.update'
+                        AND COALESCE(new_value->>'patient_sigla','') <> '') AS red_patients
+            FROM audit_log
+            WHERE entity_type='bed'{bed_unit_sql}{p_created}
+            """,
+            bed_unit_params,
+        )
+        bed = cur.fetchone() or {}
+
+        # por unidade
+        cur.execute(
+            f"""
+            SELECT split_part(entity_id, ':', 1) AS unit_id,
+              COUNT(*) FILTER (WHERE action='bed.death')     AS deaths,
+              COUNT(*) FILTER (WHERE action='bed.discharge') AS discharges,
+              COUNT(*) FILTER (WHERE action='bed.transfer')  AS transfers,
+              COUNT(DISTINCT new_value->>'patient_sigla')
+                FILTER (WHERE action='bed.update'
+                        AND COALESCE(new_value->>'patient_sigla','') <> '') AS red_patients
+            FROM audit_log
+            WHERE entity_type='bed'{bed_unit_sql}{p_created}
+            GROUP BY 1
+            """,
+            bed_unit_params,
+        )
+        bed_by_unit = {r["unit_id"]: r for r in cur.fetchall()}
+
+        # --- Ocupação (parsed_events): amarela / isolamento + nº de giros ---
+        cur.execute(
+            f"""
+            SELECT AVG(yellow_occupied) AS yellow_avg, MAX(yellow_occupied) AS yellow_max,
+                   AVG(isolation_total_occupied) AS iso_avg, COUNT(*) AS giros
+            FROM parsed_events
+            WHERE TRUE{pe_unit_sql}{p_received}
+            """,
+            pe_unit_params,
+        )
+        occ = cur.fetchone() or {}
+
+        cur.execute(
+            f"""
+            SELECT unit_code,
+                   AVG(yellow_occupied) AS yellow_avg, MAX(yellow_occupied) AS yellow_max,
+                   AVG(isolation_total_occupied) AS iso_avg, COUNT(*) AS giros
+            FROM parsed_events
+            WHERE TRUE{pe_unit_sql}{p_received}
+            GROUP BY unit_code
+            """,
+            pe_unit_params,
+        )
+        occ_by_unit = {r["unit_code"]: r for r in cur.fetchall()}
+
+        # --- Dias com / sem ortopedista (último giro de cada dia) ---
+        cur.execute(
+            f"""
+            WITH per_day AS (
+              SELECT DISTINCT ON (unit_code, date(received_at))
+                     unit_code, date(received_at) AS d, has_orthopedist
+              FROM parsed_events
+              WHERE TRUE{pe_unit_sql}{p_received}
+              ORDER BY unit_code, date(received_at), received_at DESC
+            )
+            SELECT
+              COUNT(*) FILTER (WHERE has_orthopedist IS FALSE) AS days_no_ortho,
+              COUNT(*) FILTER (WHERE has_orthopedist IS TRUE)  AS days_with_ortho
+            FROM per_day
+            """,
+            pe_unit_params,
+        )
+        ortho = cur.fetchone() or {}
+
+        cur.execute(
+            f"""
+            WITH per_day AS (
+              SELECT DISTINCT ON (unit_code, date(received_at))
+                     unit_code, date(received_at) AS d, has_orthopedist
+              FROM parsed_events
+              WHERE TRUE{pe_unit_sql}{p_received}
+              ORDER BY unit_code, date(received_at), received_at DESC
+            )
+            SELECT unit_code,
+              COUNT(*) FILTER (WHERE has_orthopedist IS FALSE) AS days_no_ortho,
+              COUNT(*) FILTER (WHERE has_orthopedist IS TRUE)  AS days_with_ortho
+            FROM per_day GROUP BY unit_code
+            """,
+            pe_unit_params,
+        )
+        ortho_by_unit = {r["unit_code"]: r for r in cur.fetchall()}
+
+        # --- Dias com radiografia fora (best-effort: exam.update xray indisponível) ---
+        cur.execute(
+            f"""
+            SELECT COUNT(DISTINCT date(created_at)) AS days_xray_out
+            FROM audit_log
+            WHERE action='exam.update' AND entity_id LIKE '%%:xray'
+              AND new_value->>'status' = 'unavailable'{xray_unit_sql}{p_created}
+            """,
+            xray_unit_params,
+        )
+        xray = cur.fetchone() or {}
+
+        cur.execute(
+            f"""
+            SELECT split_part(entity_id, ':', 1) AS unit_id,
+                   COUNT(DISTINCT date(created_at)) AS days_xray_out
+            FROM audit_log
+            WHERE action='exam.update' AND entity_id LIKE '%%:xray'
+              AND new_value->>'status' = 'unavailable'{xray_unit_sql}{p_created}
+            GROUP BY 1
+            """,
+            xray_unit_params,
+        )
+        xray_by_unit = {r["unit_id"]: r for r in cur.fetchall()}
+
+        # --- Ocupação atual (current_unit_status) ---
+        cur.execute(
+            f"""
+            SELECT unit_code, yellow_occupied, isolation_total_occupied, red_occupied
+            FROM current_unit_status
+            WHERE TRUE{cs_unit_sql}
+            """,
+            cs_unit_params,
+        )
+        cur_status = {r["unit_code"]: r for r in cur.fetchall()}
+
+    # ---- monta totals ----
+    yellow_current = sum((r["yellow_occupied"] or 0) for r in cur_status.values()) if cur_status else None
+    iso_current = sum((r["isolation_total_occupied"] or 0) for r in cur_status.values()) if cur_status else None
+    totals = {
+        "red_patients": int(bed.get("red_patients") or 0),
+        "deaths": int(bed.get("deaths") or 0),
+        "discharges": int(bed.get("discharges") or 0),
+        "transfers": int(bed.get("transfers") or 0),
+        "yellow_avg": _round1(occ.get("yellow_avg")),
+        "yellow_max": int(occ["yellow_max"]) if occ.get("yellow_max") is not None else None,
+        "yellow_current": yellow_current,
+        "isolation_avg": _round1(occ.get("iso_avg")),
+        "isolation_current": iso_current,
+        "days_no_ortho": int(ortho.get("days_no_ortho") or 0),
+        "days_with_ortho": int(ortho.get("days_with_ortho") or 0),
+        "days_xray_out": int(xray.get("days_xray_out") or 0),
+        "giros_count": int(occ.get("giros") or 0),
+    }
+
+    # ---- monta breakdown por unidade (une todas as fontes por code) ----
+    codes = set(occ_by_unit) | set(ortho_by_unit) | set(cur_status)
+    codes |= {id_to_unit[uid]["code"] for uid in bed_by_unit if uid in id_to_unit}
+    codes |= {id_to_unit[uid]["code"] for uid in xray_by_unit if uid in id_to_unit}
+    by_unit = []
+    for code in sorted(codes):
+        uid = code_to_id.get(code)
+        b = bed_by_unit.get(uid, {}) if uid else {}
+        o = occ_by_unit.get(code, {})
+        ort = ortho_by_unit.get(code, {})
+        xr = xray_by_unit.get(uid, {}) if uid else {}
+        cs = cur_status.get(code, {})
+        by_unit.append({
+            "unit_code": code,
+            "unit_name": code_to_name.get(code, code),
+            "red_patients": int(b.get("red_patients") or 0),
+            "deaths": int(b.get("deaths") or 0),
+            "discharges": int(b.get("discharges") or 0),
+            "transfers": int(b.get("transfers") or 0),
+            "yellow_avg": _round1(o.get("yellow_avg")),
+            "yellow_current": cs.get("yellow_occupied"),
+            "isolation_current": cs.get("isolation_total_occupied"),
+            "days_no_ortho": int(ort.get("days_no_ortho") or 0),
+            "days_with_ortho": int(ort.get("days_with_ortho") or 0),
+            "days_xray_out": int(xr.get("days_xray_out") or 0),
+            "giros_count": int(o.get("giros") or 0),
+        })
+
+    return {"period": period, "unit": unit_code, "totals": totals, "by_unit": by_unit}
+
+
 def get_registered_units() -> list[dict[str, Any]]:
     if not DATABASE_URL:
         return seed_units()
