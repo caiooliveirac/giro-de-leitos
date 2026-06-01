@@ -611,6 +611,10 @@ def _extract_yellow_room(lines: list[str], upa_name: str | None = None) -> tuple
 
     yellow_index = _find_section_index(lines, "sala", "amarela", exclude_terms=("atualizacao", "vermelha"))
     if yellow_index is None:
+        # Algumas unidades (ex.: UPA San Martin) rotulam a amarela adulta como
+        # "ENFERMARIAS" (marcada com 🟡), com o total numa linha à parte.
+        yellow_index = _find_section_index(lines, "enfermaria", exclude_terms=("pediatr", "vermelha"))
+    if yellow_index is None:
         yellow_index = _find_line_index(lines, "sala", "amarela")
     if yellow_index is None:
         global_male_room, global_female_room, global_gendered_match = _extract_gendered_yellow_details(lines)
@@ -634,6 +638,7 @@ def _extract_yellow_room(lines: list[str], upa_name: str | None = None) -> tuple
 
     male_ratio: tuple[int, int] | None = None
     female_ratio: tuple[int, int] | None = None
+    total_ratio: tuple[int, int] | None = None
 
     for line in _collect_section_lines(lines, yellow_index):
         normalized = _normalize_for_match(line)
@@ -644,6 +649,9 @@ def _extract_yellow_room(lines: list[str], upa_name: str | None = None) -> tuple
             male_ratio = ratio
         elif "feminin" in normalized:
             female_ratio = ratio
+        elif "pediatr" not in normalized and total_ratio is None:
+            # total da amarela numa linha própria (ex.: "ENFERMARIAS:" seguido de "(13/12)")
+            total_ratio = ratio
 
     global_male_room, global_female_room, global_gendered_match = _extract_gendered_yellow_details(section_lines)
     if male_ratio or female_ratio:
@@ -654,6 +662,8 @@ def _extract_yellow_room(lines: list[str], upa_name: str | None = None) -> tuple
             _build_capacity(*female_ratio) if female_ratio else global_female_room,
             _build_capacity(occupied, capacity),
         )
+    if total_ratio is not None:
+        return global_male_room, global_female_room, _build_capacity(*total_ratio)
 
     return global_male_room, global_female_room, global_gendered_match or _extract_yellow_room_fallback(lines)
 
