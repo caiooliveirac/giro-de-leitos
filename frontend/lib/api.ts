@@ -11,6 +11,31 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Pulls a human-readable message out of an error body. FastAPI sends two shapes:
+ * HTTPException → `{ detail: "texto" }`, and validation (422) →
+ * `{ detail: [{ loc, msg, type }, ...] }`. Naively stringifying the array gives
+ * "[object Object]", so we join the `msg` fields instead.
+ */
+function extractErrorMessage(body: unknown): string | null {
+  if (!body || typeof body !== 'object' || !('detail' in body)) return null;
+  const detail = (body as { detail: unknown }).detail;
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    const msgs = detail
+      .map((d) =>
+        d && typeof d === 'object' && 'msg' in d
+          ? String((d as { msg: unknown }).msg)
+          : typeof d === 'string'
+            ? d
+            : null,
+      )
+      .filter((m): m is string => Boolean(m));
+    if (msgs.length) return msgs.join(' · ');
+  }
+  return null;
+}
+
 export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (!headers.has('Content-Type') && init.body && !(init.body instanceof FormData)) {
@@ -30,7 +55,7 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
 
   if (!res.ok) {
     const message =
-      (isJson && body && typeof body === 'object' && 'detail' in body && String((body as { detail: unknown }).detail)) ||
+      extractErrorMessage(isJson ? body : null) ||
       res.statusText ||
       'Request failed';
     throw new ApiError(message, res.status, body);

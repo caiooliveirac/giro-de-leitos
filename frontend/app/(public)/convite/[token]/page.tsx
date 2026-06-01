@@ -56,6 +56,39 @@ function calcStrength(pw: string): 0 | 1 | 2 | 3 | 4 {
 }
 const STRENGTH_LABEL = ['', 'fraca', 'média', 'boa', 'forte'];
 
+// Avatars don't need full camera resolution. Downscale to a small square and
+// re-encode as JPEG so the resulting data URL stays small enough for the API
+// (a raw camera data URL is multiple MB and blows past the backend limit).
+const AVATAR_MAX_PX = 256;
+
+function downscaleImage(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('read failed'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('decode failed'));
+      img.onload = () => {
+        const scale = Math.min(1, AVATAR_MAX_PX / Math.max(img.width, img.height));
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          reject(new Error('no canvas context'));
+          return;
+        }
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', 0.82));
+      };
+      img.src = reader.result as string;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 function initialsOf(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
   if (!parts.length) return '';
@@ -311,22 +344,22 @@ function Step1({
   onNext: () => void;
   onBack: () => void;
 }) {
+  const toast = useToast();
   const fileRef = useRef<HTMLInputElement | null>(null);
   const canNext =
     data.name.trim().length >= 3 &&
     data.cargo &&
     (!PROF_ROLES.has(data.cargo) || data.coren_crm.trim().length >= 3);
 
-  const handlePhoto = (e: ChangeEvent<HTMLInputElement>) => {
+  const handlePhoto = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        onChange({ photo_data_url: reader.result, photo_initials: '' });
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const dataUrl = await downscaleImage(file);
+      onChange({ photo_data_url: dataUrl, photo_initials: '' });
+    } catch {
+      toast.error('Não foi possível processar a foto. Tente outra imagem.');
+    }
   };
 
   return (
