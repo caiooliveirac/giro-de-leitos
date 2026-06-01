@@ -529,6 +529,17 @@ def _extract_gendered_yellow_details(
 
     for index, line in enumerate(lines):
         normalized = _normalize_for_match(line)
+
+        # Ao entrar em seções que não são da amarela/observação adulta (isolamento,
+        # medicação, internamento, etc.), interrompe a coleta por gênero. Isso evita
+        # capturar "FEMININO/MASCULINO" do ISOLAMENTO como se fossem da amarela
+        # (bug: a amarela acabava virando o ratio do isolamento, ex.: "02/02").
+        if any(term in normalized for term in (
+            "isolamento", "isolamentos", "medicacao", "verde",
+            "internamento", "exames", "obito", "obituario", "covid",
+        )):
+            break
+
         is_adult_yellow_line = (
             ("amarela" in normalized or "observacao" in normalized)
             and "pediatri" not in normalized
@@ -598,20 +609,27 @@ def _extract_yellow_room(lines: list[str], upa_name: str | None = None) -> tuple
     if _has_explicit_no_yellow(lines) or _unit_has_fixed_no_yellow(upa_name):
         return None, None, None
 
-    global_male_room, global_female_room, global_gendered_match = _extract_gendered_yellow_details(lines)
     yellow_index = _find_section_index(lines, "sala", "amarela", exclude_terms=("atualizacao", "vermelha"))
     if yellow_index is None:
         yellow_index = _find_line_index(lines, "sala", "amarela")
     if yellow_index is None:
+        global_male_room, global_female_room, global_gendered_match = _extract_gendered_yellow_details(lines)
         fallback_room = _extract_yellow_room_fallback(lines)
         if fallback_room:
             global_male_room, global_female_room, global_gendered_match = _extract_gendered_yellow_details(lines, fallback_room)
         return global_male_room, global_female_room, global_gendered_match or fallback_room
 
+    # Escopa a leitura dos detalhes por gênero à seção da amarela. Outras seções
+    # (ISOLAMENTO, p.ex.) também usam os rótulos FEMININO/MASCULINO; varrendo a
+    # mensagem inteira, ratios de outra seção (ex.: "(1/1) FEMININO" do
+    # isolamento) eram capturados como se fossem da amarela e sobrescreviam o
+    # total correto (bug: amarela "(20/18)" virava "02/02").
+    section_lines = [lines[yellow_index], *_collect_section_lines(lines, yellow_index)]
+
     current_line_ratio = _extract_ratio(lines[yellow_index])
     if current_line_ratio is not None:
         total_room = _build_capacity(*current_line_ratio)
-        global_male_room, global_female_room, global_gendered_match = _extract_gendered_yellow_details(lines, total_room)
+        global_male_room, global_female_room, global_gendered_match = _extract_gendered_yellow_details(section_lines, total_room)
         return global_male_room, global_female_room, global_gendered_match or total_room
 
     male_ratio: tuple[int, int] | None = None
@@ -627,6 +645,7 @@ def _extract_yellow_room(lines: list[str], upa_name: str | None = None) -> tuple
         elif "feminin" in normalized:
             female_ratio = ratio
 
+    global_male_room, global_female_room, global_gendered_match = _extract_gendered_yellow_details(section_lines)
     if male_ratio or female_ratio:
         occupied = (male_ratio[0] if male_ratio else 0) + (female_ratio[0] if female_ratio else 0)
         capacity = (male_ratio[1] if male_ratio else 0) + (female_ratio[1] if female_ratio else 0)
