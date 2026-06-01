@@ -130,7 +130,9 @@ class InviteAccept(BaseModel):
     coren_crm: Optional[str] = Field(default=None, max_length=40)
     password: str = Field(min_length=8, max_length=128)
     pin: str = Field(min_length=4, max_length=8)
-    photo_url: Optional[str] = Field(default=None, max_length=500)
+    # Frontend downscales the avatar to a small JPEG data URL (~15-35 KB).
+    # 500_000 leaves headroom for that while still bounding the payload.
+    photo_url: Optional[str] = Field(default=None, max_length=500_000)
     lgpd_accepted: bool = False
 
     @field_validator("lgpd_accepted")
