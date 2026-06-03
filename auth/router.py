@@ -6,7 +6,7 @@ import re
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
 
 from auth import service
 from auth.audit import record_audit
@@ -27,9 +27,11 @@ from auth.deps import (
     set_session_cookie,
 )
 from auth.schemas import (
+    AdminCoordinator,
     AdminLogin,
     AdminResetPasswordResponse,
     AdminUnit,
+    ApproveRequest,
     ApproveResponse,
     ChangeMyPasswordPayload,
     DeviceGenerateCodeRequest,
@@ -45,6 +47,7 @@ from auth.schemas import (
     InvitePreview,
     PendingUser,
     PinVerify,
+    SetUnitRequest,
     ShiftEnd,
     ShiftStart,
     ShiftStartResponse,
@@ -495,16 +498,25 @@ def list_pending_endpoint(request: Request, conn=Depends(get_db)):
 
 
 @router.post("/users/{user_id}/approve", response_model=ApproveResponse)
-def approve_user_endpoint(user_id: UUID, request: Request, conn=Depends(get_db)):
+def approve_user_endpoint(
+    user_id: UUID,
+    request: Request,
+    payload: ApproveRequest | None = Body(default=None),
+    conn=Depends(get_db),
+):
     approver = _current_inviter(request, conn)
-    result = service.approve_user(conn, approver, user_id)
+    unit_id = payload.unit_id if payload else None
+    result = service.approve_user(conn, approver, user_id, unit_id=unit_id)
     record_audit(
         conn,
         actor_user_id=approver["id"],
         action="user.approve",
         entity_type="user",
         entity_id=str(user_id),
-        new_value={"status": "active"},
+        new_value={
+            "status": "active",
+            "unit_id": str(result["unit_id"]) if result.get("unit_id") else None,
+        },
         **client_meta(request),
     )
     notifications.enqueue(
@@ -623,6 +635,52 @@ def list_unit_members_endpoint(
         )
         for r in rows
     ]
+
+
+@router.get("/admin/coordinators", response_model=list[AdminCoordinator])
+def list_coordinators_endpoint(
+    admin=Depends(get_current_admin),
+    conn=Depends(get_db),
+):
+    """Admin-only: visão global de todos os coordenadores e suas UPAs."""
+    rows = service.list_coordinators(conn)
+    return [
+        AdminCoordinator(
+            id=r["id"],
+            name=r["name"],
+            status=r["status"],
+            cargo=r.get("cargo"),
+            cpf_masked=_safe_cpf_masked(r.get("cpf_encrypted")),
+            username=r.get("username"),
+            unit_id=r.get("unit_id"),
+            unit_name=r.get("unit_name"),
+            created_at=r["created_at"],
+            approved_at=r.get("approved_at"),
+        )
+        for r in rows
+    ]
+
+
+@router.patch("/admin/users/{user_id}/unit", response_model=ApproveResponse)
+def set_user_unit_endpoint(
+    user_id: UUID,
+    payload: SetUnitRequest,
+    request: Request,
+    admin=Depends(get_current_admin),
+    conn=Depends(get_db),
+):
+    """Admin-only: (re)atribui a UPA de um coordenador/profissional."""
+    result = service.set_user_unit(conn, admin, user_id, payload.unit_id)
+    record_audit(
+        conn,
+        actor_user_id=admin["id"],
+        action="user.unit.set",
+        entity_type="user",
+        entity_id=str(user_id),
+        new_value={"unit_id": str(payload.unit_id)},
+        **client_meta(request),
+    )
+    return ApproveResponse(id=result["id"], status=result["status"])
 
 
 @router.post(

@@ -10,7 +10,6 @@ import { useCurrentUser } from '@/hooks/useCurrentUser';
 import { TopBar } from '@/components/shared/TopBar';
 import { OfflineBanner } from '@/components/shared/OfflineBanner';
 import { ToastViewport } from '@/components/shared/ToastViewport';
-import { UnitPicker } from '@/components/admin/UnitPicker';
 import { qrImageUrl } from '@/lib/qr';
 
 interface AdminUnit {
@@ -35,6 +34,19 @@ interface PendingUser {
   created_at: string;
 }
 
+interface AdminCoordinator {
+  id: string;
+  name: string;
+  status: string;
+  cargo: string | null;
+  cpf_masked: string;
+  username: string | null;
+  unit_id: string | null;
+  unit_name: string | null;
+  created_at: string;
+  approved_at: string | null;
+}
+
 interface InviteCreateResponse {
   id: string;
   token: string;
@@ -50,7 +62,7 @@ export default function AdminPage() {
   const [pending, setPending] = useState<PendingUser[]>([]);
   const [units, setUnits] = useState<AdminUnit[]>([]);
   const [unitsLoading, setUnitsLoading] = useState(true);
-  const [selectedUnit, setSelectedUnit] = useState<string>('');
+  const [coordinators, setCoordinators] = useState<AdminCoordinator[]>([]);
   const [invite, setInvite] = useState<InviteCreateResponse | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -66,9 +78,6 @@ export default function AdminPage() {
     try {
       const rows = await apiFetch<AdminUnit[]>('/api/admin/units');
       setUnits(rows);
-      if (rows.length > 0) {
-        setSelectedUnit((cur) => cur || rows[0].id);
-      }
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         router.replace('/admin/login');
@@ -95,23 +104,34 @@ export default function AdminPage() {
     }
   }, [router, toast]);
 
+  const loadCoordinators = useCallback(async () => {
+    try {
+      const rows = await apiFetch<AdminCoordinator[]>('/api/admin/coordinators');
+      setCoordinators(rows);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        router.replace('/admin/login');
+        return;
+      }
+      const msg = err instanceof ApiError ? err.message : 'Falha ao carregar coordenadores';
+      toast.error(msg);
+    }
+  }, [router, toast]);
+
   useEffect(() => {
     if (hydrated && isAdmin) {
       void loadUnits();
       void loadPending();
+      void loadCoordinators();
     }
-  }, [hydrated, isAdmin, loadUnits, loadPending]);
+  }, [hydrated, isAdmin, loadUnits, loadPending, loadCoordinators]);
 
   const inviteCoordinator = async () => {
-    if (!selectedUnit) {
-      toast.error('Escolha uma UPA');
-      return;
-    }
     setBusy(true);
     try {
       const res = await apiFetch<InviteCreateResponse>('/api/invites', {
         method: 'POST',
-        body: JSON.stringify({ type: 'coordinator', target_unit_id: selectedUnit }),
+        body: JSON.stringify({ type: 'coordinator' }),
       });
       setInvite(res);
       toast.success('Convite de coordenador gerado');
@@ -123,12 +143,20 @@ export default function AdminPage() {
     }
   };
 
-  const approve = async (id: string) => {
+  const approve = async (id: string, unitId: string) => {
+    if (!unitId) {
+      toast.error('Escolha a UPA do coordenador antes de aprovar');
+      return;
+    }
     try {
-      await apiFetch(`/api/users/${id}/approve`, { method: 'POST' });
+      await apiFetch(`/api/users/${id}/approve`, {
+        method: 'POST',
+        body: JSON.stringify({ unit_id: unitId }),
+      });
       toast.success('Coordenador aprovado');
       setPending((p) => p.filter((u) => u.id !== id));
       void loadUnits();
+      void loadCoordinators();
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : 'Falha ao aprovar';
       toast.error(msg);
@@ -140,8 +168,24 @@ export default function AdminPage() {
       await apiFetch(`/api/users/${id}/reject`, { method: 'POST' });
       toast.warning('Cadastro rejeitado');
       setPending((p) => p.filter((u) => u.id !== id));
+      void loadCoordinators();
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : 'Falha ao rejeitar';
+      toast.error(msg);
+    }
+  };
+
+  const changeUnit = async (id: string, unitId: string) => {
+    try {
+      await apiFetch(`/api/admin/users/${id}/unit`, {
+        method: 'PATCH',
+        body: JSON.stringify({ unit_id: unitId }),
+      });
+      toast.success('UPA atualizada');
+      void loadUnits();
+      void loadCoordinators();
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : 'Falha ao trocar UPA';
       toast.error(msg);
     }
   };
@@ -161,32 +205,63 @@ export default function AdminPage() {
       <main className="mx-auto w-full max-w-[520px] px-4 pb-24 pt-4">
         <Section
           title="Convidar coordenador"
-          subtitle="Selecione a UPA destino e gere o link"
+          subtitle="Um link serve para qualquer coordenador — você define a UPA ao aprovar"
         >
           <div className="rounded-card border border-border bg-card p-4 space-y-3">
-            <div>
-              <span className="mb-1.5 block text-xs font-medium text-text-secondary">
-                UPA destino
-              </span>
-              <UnitPicker
-                units={units}
-                value={selectedUnit}
-                onChange={setSelectedUnit}
-                loading={unitsLoading}
-              />
-            </div>
-
             {!invite && (
               <button
                 type="button"
-                disabled={busy || !selectedUnit}
+                disabled={busy}
                 onClick={inviteCoordinator}
                 className="w-full rounded-pill bg-accent-blue px-5 py-3 text-base font-semibold text-white disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
               >
-                {busy ? 'Gerando…' : 'Gerar convite'}
+                {busy ? 'Gerando…' : 'Gerar convite de coordenador'}
               </button>
             )}
             {invite && <InviteCard invite={invite} onReset={() => setInvite(null)} />}
+          </div>
+        </Section>
+
+        <Section
+          title="Coordenadores pendentes"
+          subtitle="Escolha a UPA e toque ✓ pra aprovar · Segure ✗ pra rejeitar"
+        >
+          <div className="space-y-3">
+            {pending.length === 0 && (
+              <p className="rounded-card border border-border bg-card p-4 text-center text-sm text-text-secondary">
+                Nenhum coordenador aguardando aprovação.
+              </p>
+            )}
+            {pending.map((p) => (
+              <PendingCard
+                key={p.id}
+                user={p}
+                units={units}
+                onApprove={(unitId) => approve(p.id, unitId)}
+                onReject={() => reject(p.id)}
+              />
+            ))}
+          </div>
+        </Section>
+
+        <Section
+          title="Coordenadores"
+          subtitle={`${coordinators.length} no total · troque a UPA quando precisar`}
+        >
+          <div className="space-y-2">
+            {coordinators.length === 0 && (
+              <p className="rounded-card border border-border bg-card p-4 text-center text-sm text-text-secondary">
+                Nenhum coordenador cadastrado.
+              </p>
+            )}
+            {coordinators.map((c) => (
+              <CoordinatorRow
+                key={c.id}
+                coord={c}
+                units={units}
+                onChangeUnit={(unitId) => changeUnit(c.id, unitId)}
+              />
+            ))}
           </div>
         </Section>
 
@@ -225,28 +300,6 @@ export default function AdminPage() {
                   </button>
                 </div>
               ))}
-          </div>
-        </Section>
-
-        <Section
-          title="Coordenadores pendentes"
-          subtitle="Toque ✓ pra aprovar · Segure ✗ pra rejeitar"
-        >
-          <div className="space-y-3">
-            {pending.length === 0 && (
-              <p className="rounded-card border border-border bg-card p-4 text-center text-sm text-text-secondary">
-                Nenhum coordenador aguardando aprovação.
-              </p>
-            )}
-            {pending.map((p) => (
-              <PendingCard
-                key={p.id}
-                user={p}
-                onApprove={() => approve(p.id)}
-                onReject={() => reject(p.id)}
-                onConfigureUnit={p.unit_id ? () => goToConfigure(p.unit_id as string) : undefined}
-              />
-            ))}
           </div>
         </Section>
       </main>
@@ -336,17 +389,65 @@ function InviteCard({
   );
 }
 
+const STATUS_LABEL: Record<string, string> = {
+  pending: 'pendente',
+  active: 'ativo',
+  suspended: 'suspenso',
+};
+
+function CoordinatorRow({
+  coord,
+  units,
+  onChangeUnit,
+}: {
+  coord: AdminCoordinator;
+  units: AdminUnit[];
+  onChangeUnit: (unitId: string) => void | Promise<void>;
+}) {
+  return (
+    <div className="flex items-center gap-3 rounded-card border border-border bg-card px-3 py-2.5">
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-accent-blue/10 text-accent-blue">
+        <UserRound size={18} />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <p className="truncate text-sm font-semibold text-text-primary">{coord.name}</p>
+          <span className="shrink-0 rounded-pill bg-surface px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-text-secondary">
+            {STATUS_LABEL[coord.status] ?? coord.status}
+          </span>
+        </div>
+        <select
+          value={coord.unit_id ?? ''}
+          onChange={(e) => void onChangeUnit(e.target.value)}
+          aria-label={`UPA de ${coord.name}`}
+          className="mt-1 w-full rounded-pill border border-border bg-surface px-3 py-1.5 text-xs font-medium text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+        >
+          <option value="" disabled>
+            Sem UPA — selecione
+          </option>
+          {units.map((u) => (
+            <option key={u.id} value={u.id}>
+              {u.canonical_name}
+            </option>
+          ))}
+        </select>
+      </div>
+    </div>
+  );
+}
+
 function PendingCard({
   user,
+  units,
   onApprove,
   onReject,
-  onConfigureUnit,
 }: {
   user: PendingUser;
-  onApprove: () => void | Promise<void>;
+  units: AdminUnit[];
+  onApprove: (unitId: string) => void | Promise<void>;
   onReject: () => void | Promise<void>;
-  onConfigureUnit?: () => void;
 }) {
+  const [unitId, setUnitId] = useState<string>(user.unit_id ?? '');
   const [rejectProgress, setRejectProgress] = useState(0);
   const rafRef = useRef<number | null>(null);
   const firedRef = useRef(false);
@@ -395,22 +496,14 @@ function PendingCard({
             {user.coren_crm ? ` · ${user.coren_crm}` : ''}
           </p>
           <p className="truncate text-xs text-text-tertiary">CPF {user.cpf_masked}</p>
-          {onConfigureUnit && (
-            <button
-              type="button"
-              onClick={onConfigureUnit}
-              className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-accent-blue hover:underline"
-            >
-              <Settings2 size={12} /> Ver setores da UPA
-            </button>
-          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <button
             type="button"
-            onClick={() => void onApprove()}
+            onClick={() => void onApprove(unitId)}
+            disabled={!unitId}
             aria-label={`Aprovar ${user.name}`}
-            className="flex h-10 w-10 items-center justify-center rounded-pill bg-accent-green/10 text-accent-green transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-green hover:bg-accent-green/20"
+            className="flex h-10 w-10 items-center justify-center rounded-pill bg-accent-green/10 text-accent-green transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-green hover:bg-accent-green/20 disabled:opacity-40"
           >
             <Check size={18} />
           </button>
@@ -439,6 +532,27 @@ function PendingCard({
             <X size={18} className="relative" />
           </button>
         </div>
+      </div>
+
+      <div className="mt-2.5">
+        <label className="mb-1 block text-[11px] font-medium text-text-secondary">
+          UPA que vai coordenar
+        </label>
+        <select
+          value={unitId}
+          onChange={(e) => setUnitId(e.target.value)}
+          aria-label={`UPA de ${user.name}`}
+          className="w-full rounded-pill border border-border bg-surface px-3 py-2 text-sm font-medium text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+        >
+          <option value="" disabled>
+            Selecione a UPA
+          </option>
+          {units.map((u) => (
+            <option key={u.id} value={u.id}>
+              {u.canonical_name}
+            </option>
+          ))}
+        </select>
       </div>
     </motion.div>
   );

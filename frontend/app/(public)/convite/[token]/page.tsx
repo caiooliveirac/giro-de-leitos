@@ -274,6 +274,7 @@ function Welcome({
   onStart: () => void;
 }) {
   const isCoord = preview.type === 'coordinator';
+  const hasUnit = Boolean(preview.unit_name);
   const unit = preview.unit_name ?? 'sua unidade';
   const expires = new Date(preview.expires_at).toLocaleDateString('pt-BR', {
     day: '2-digit',
@@ -283,11 +284,19 @@ function Welcome({
     <>
       <h1 className="invite-h1">
         {isCoord ? (
-          <>
-            Você foi convidado pra
-            <br />
-            coordenar a {unit}
-          </>
+          hasUnit ? (
+            <>
+              Você foi convidado pra
+              <br />
+              coordenar a {unit}
+            </>
+          ) : (
+            <>
+              Você foi convidado pra
+              <br />
+              ser coordenador de plantão
+            </>
+          )
         ) : (
           <>
             Você foi convidado pra
