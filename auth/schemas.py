@@ -180,9 +180,32 @@ class PendingUser(BaseModel):
     coren_crm: Optional[str] = None
 
 
+class ApproveRequest(BaseModel):
+    # UPA a atribuir na aprovação. Obrigatória para coordenador vindo de convite
+    # genérico (sem unidade); opcional quando o usuário já tem unidade.
+    unit_id: Optional[UUID] = None
+
+
 class ApproveResponse(BaseModel):
     id: UUID
     status: str
+
+
+class SetUnitRequest(BaseModel):
+    unit_id: UUID
+
+
+class AdminCoordinator(BaseModel):
+    id: UUID
+    name: str
+    status: str
+    cargo: Optional[str] = None
+    cpf_masked: str
+    username: Optional[str] = None
+    unit_id: Optional[UUID] = None
+    unit_name: Optional[str] = None
+    created_at: datetime
+    approved_at: Optional[datetime] = None
 
 
 class UnitMember(BaseModel):

@@ -409,9 +409,9 @@ def create_invite(
     if type == "coordinator":
         if creator_role != "admin":
             raise HTTPException(status_code=403, detail="Somente admin cria coordenador.")
-        if not target_unit_id:
-            raise HTTPException(status_code=400, detail="target_unit_id obrigatório.")
-        unit_id = str(target_unit_id)
+        # UPA opcional: convite genérico de coordenador. Um único link serve para
+        # qualquer coordenador; o admin define a UPA na hora de aprovar.
+        unit_id = str(target_unit_id) if target_unit_id else None
     elif type == "professional":
         if creator_role not in ("coordinator", "admin"):
             raise HTTPException(status_code=403, detail="Sem permissão.")
@@ -628,20 +628,86 @@ def _load_target(conn, user_id: UUID | str) -> dict[str, Any]:
     return row
 
 
-def approve_user(conn, approver: dict[str, Any], user_id: UUID | str) -> dict[str, Any]:
+def _unit_exists(conn, unit_id: UUID | str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM units WHERE id = %s", (str(unit_id),))
+        return cur.fetchone() is not None
+
+
+def approve_user(
+    conn,
+    approver: dict[str, Any],
+    user_id: UUID | str,
+    unit_id: UUID | str | None = None,
+) -> dict[str, Any]:
     target = _load_target(conn, user_id)
     _ensure_approver_can_act(approver, target)
     if target["status"] == "active":
         return target
+    # UPA final: a informada na aprovação (convite genérico) ou a que o usuário já
+    # trazia (convite vinculado / fluxo do coordenador).
+    final_unit = str(unit_id) if unit_id else (
+        str(target["unit_id"]) if target.get("unit_id") else None
+    )
+    if target["role"] == "coordinator" and not final_unit:
+        raise HTTPException(status_code=400, detail="Defina a UPA do coordenador para aprovar.")
+    if final_unit and not _unit_exists(conn, final_unit):
+        raise HTTPException(status_code=400, detail="UPA inválida.")
     with conn.cursor() as cur:
         cur.execute(
             """
             UPDATE users
-               SET status = 'active', approved_at = NOW(), approved_by = %s
+               SET status = 'active', approved_at = NOW(), approved_by = %s, unit_id = %s
              WHERE id = %s
              RETURNING id, name, role, status, unit_id, phone
             """,
-            (str(approver["id"]), str(user_id)),
+            (str(approver["id"]), final_unit, str(user_id)),
+        )
+        return cur.fetchone()
+
+
+def list_coordinators(conn) -> list[dict[str, Any]]:
+    """Visão global de todos os coordenadores e suas UPAs, para o painel admin."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT u.id, u.name, u.status, u.cargo, u.cpf_encrypted, u.username,
+                   u.unit_id, un.canonical_name AS unit_name, u.created_at, u.approved_at
+              FROM users u
+              LEFT JOIN units un ON un.id = u.unit_id
+             WHERE u.role = 'coordinator'
+             ORDER BY
+                CASE u.status
+                    WHEN 'pending' THEN 0
+                    WHEN 'active' THEN 1
+                    WHEN 'suspended' THEN 2
+                    ELSE 3
+                END,
+                un.canonical_name ASC NULLS LAST,
+                u.name ASC
+            """
+        )
+        return cur.fetchall()
+
+
+def set_user_unit(
+    conn, admin: dict[str, Any], user_id: UUID | str, unit_id: UUID | str
+) -> dict[str, Any]:
+    """Admin: (re)atribui a UPA de um coordenador/profissional."""
+    target = _load_target(conn, user_id)
+    if target["role"] not in ("coordinator", "professional"):
+        raise HTTPException(status_code=403, detail="Alvo inválido.")
+    if not _unit_exists(conn, unit_id):
+        raise HTTPException(status_code=400, detail="UPA inválida.")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE users
+               SET unit_id = %s
+             WHERE id = %s
+             RETURNING id, name, role, status, unit_id
+            """,
+            (str(unit_id), str(user_id)),
         )
         return cur.fetchone()
 
