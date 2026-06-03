@@ -27,6 +27,7 @@ from auth.deps import (
     set_session_cookie,
 )
 from auth.schemas import (
+    AddUnitRequest,
     AdminCoordinator,
     AdminLogin,
     AdminResetPasswordResponse,
@@ -34,6 +35,7 @@ from auth.schemas import (
     ApproveRequest,
     ApproveResponse,
     ChangeMyPasswordPayload,
+    CoordinatorUnit,
     DeviceGenerateCodeRequest,
     DeviceGenerateCodeResponse,
     DevicePair,
@@ -47,7 +49,6 @@ from auth.schemas import (
     InvitePreview,
     PendingUser,
     PinVerify,
-    SetUnitRequest,
     ShiftEnd,
     ShiftStart,
     ShiftStartResponse,
@@ -573,10 +574,13 @@ def list_admin_units(
             COALESCE(r.red_capacity, 0) AS red_capacity
         FROM units u
         LEFT JOIN (
-            SELECT unit_id, COUNT(*) AS coord_count
-            FROM users
-            WHERE role = 'coordinator' AND status = 'active'
-            GROUP BY unit_id
+            SELECT cu.unit_id, COUNT(DISTINCT cu.user_id) AS coord_count
+            FROM coordinator_units cu
+            JOIN users cuu
+              ON cuu.id = cu.user_id
+             AND cuu.role = 'coordinator'
+             AND cuu.status = 'active'
+            GROUP BY cu.unit_id
         ) c ON c.unit_id = u.id
         LEFT JOIN (
             SELECT unit_id, COUNT(*) AS enabled_count
@@ -652,8 +656,11 @@ def list_coordinators_endpoint(
             cargo=r.get("cargo"),
             cpf_masked=_safe_cpf_masked(r.get("cpf_encrypted")),
             username=r.get("username"),
-            unit_id=r.get("unit_id"),
-            unit_name=r.get("unit_name"),
+            phone=r.get("phone"),
+            units=[
+                CoordinatorUnit(id=u["id"], name=u["name"])
+                for u in (r.get("units") or [])
+            ],
             created_at=r["created_at"],
             approved_at=r.get("approved_at"),
         )
@@ -661,23 +668,45 @@ def list_coordinators_endpoint(
     ]
 
 
-@router.patch("/admin/users/{user_id}/unit", response_model=ApproveResponse)
-def set_user_unit_endpoint(
+@router.post("/admin/users/{user_id}/units", response_model=ApproveResponse)
+def add_user_unit_endpoint(
     user_id: UUID,
-    payload: SetUnitRequest,
+    payload: AddUnitRequest,
     request: Request,
     admin=Depends(get_current_admin),
     conn=Depends(get_db),
 ):
-    """Admin-only: (re)atribui a UPA de um coordenador/profissional."""
-    result = service.set_user_unit(conn, admin, user_id, payload.unit_id)
+    """Admin-only: adiciona uma UPA ao conjunto do coordenador (multi-UPA)."""
+    result = service.add_user_unit(conn, admin, user_id, payload.unit_id)
     record_audit(
         conn,
         actor_user_id=admin["id"],
-        action="user.unit.set",
+        action="user.unit.add",
         entity_type="user",
         entity_id=str(user_id),
         new_value={"unit_id": str(payload.unit_id)},
+        **client_meta(request),
+    )
+    return ApproveResponse(id=result["id"], status=result["status"])
+
+
+@router.delete("/admin/users/{user_id}/units/{unit_id}", response_model=ApproveResponse)
+def remove_user_unit_endpoint(
+    user_id: UUID,
+    unit_id: UUID,
+    request: Request,
+    admin=Depends(get_current_admin),
+    conn=Depends(get_db),
+):
+    """Admin-only: remove uma UPA do conjunto do coordenador."""
+    result = service.remove_user_unit(conn, admin, user_id, unit_id)
+    record_audit(
+        conn,
+        actor_user_id=admin["id"],
+        action="user.unit.remove",
+        entity_type="user",
+        entity_id=str(user_id),
+        new_value={"unit_id": str(unit_id)},
         **client_meta(request),
     )
     return ApproveResponse(id=result["id"], status=result["status"])
