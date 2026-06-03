@@ -602,7 +602,30 @@ def accept_invite(conn, token: str, payload) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Approval flow
 # ---------------------------------------------------------------------------
-def _ensure_approver_can_act(approver: dict[str, Any], target: dict[str, Any]) -> None:
+def unit_ids_for_user(
+    conn, user_id: UUID | str, primary_unit_id: UUID | str | None = None
+) -> set[str]:
+    """Conjunto de UPAs que o usuário gerencia.
+
+    Para coordenadores, é a união de ``coordinator_units`` com a unidade primária
+    (``users.unit_id``). Para profissionais (sem linhas na tabela), reduz à
+    unidade primária. Fonte única de verdade para checagens de pertencimento.
+    """
+    ids: set[str] = set()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT unit_id FROM coordinator_units WHERE user_id = %s",
+            (str(user_id),),
+        )
+        for row in cur.fetchall() or []:
+            if row.get("unit_id"):
+                ids.add(str(row["unit_id"]))
+    if primary_unit_id:
+        ids.add(str(primary_unit_id))
+    return ids
+
+
+def _ensure_approver_can_act(conn, approver: dict[str, Any], target: dict[str, Any]) -> None:
     if approver["role"] == "admin":
         if target["role"] not in ("coordinator", "professional"):
             raise HTTPException(status_code=403, detail="Alvo inválido.")
@@ -610,7 +633,8 @@ def _ensure_approver_can_act(approver: dict[str, Any], target: dict[str, Any]) -
     if approver["role"] == "coordinator":
         if target["role"] != "professional":
             raise HTTPException(status_code=403, detail="Coordenador só age sobre profissionais.")
-        if not approver.get("unit_id") or str(approver["unit_id"]) != str(target.get("unit_id")):
+        approver_units = unit_ids_for_user(conn, approver["id"], approver.get("unit_id"))
+        if not approver_units or str(target.get("unit_id")) not in approver_units:
             raise HTTPException(status_code=403, detail="Fora da sua unidade.")
         return
     raise HTTPException(status_code=403, detail="Sem permissão.")
@@ -641,7 +665,7 @@ def approve_user(
     unit_id: UUID | str | None = None,
 ) -> dict[str, Any]:
     target = _load_target(conn, user_id)
-    _ensure_approver_can_act(approver, target)
+    _ensure_approver_can_act(conn, approver, target)
     if target["status"] == "active":
         return target
     # UPA final: a informada na aprovação (convite genérico) ou a que o usuário já
@@ -663,7 +687,18 @@ def approve_user(
             """,
             (str(approver["id"]), final_unit, str(user_id)),
         )
-        return cur.fetchone()
+        result = cur.fetchone()
+        # Registra a UPA primária no conjunto de unidades do coordenador.
+        if final_unit and target["role"] == "coordinator":
+            cur.execute(
+                """
+                INSERT INTO coordinator_units (user_id, unit_id)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id, unit_id) DO NOTHING
+                """,
+                (str(user_id), final_unit),
+            )
+        return result
 
 
 def list_coordinators(conn) -> list[dict[str, Any]]:
@@ -672,10 +707,19 @@ def list_coordinators(conn) -> list[dict[str, Any]]:
         cur.execute(
             """
             SELECT u.id, u.name, u.status, u.cargo, u.cpf_encrypted, u.username,
-                   u.unit_id, un.canonical_name AS unit_name, u.created_at, u.approved_at
+                   u.phone, u.unit_id, u.created_at, u.approved_at,
+                   COALESCE(
+                       json_agg(
+                           json_build_object('id', un.id, 'name', un.canonical_name)
+                           ORDER BY un.canonical_name
+                       ) FILTER (WHERE un.id IS NOT NULL),
+                       '[]'
+                   ) AS units
               FROM users u
-              LEFT JOIN units un ON un.id = u.unit_id
+              LEFT JOIN coordinator_units cu ON cu.user_id = u.id
+              LEFT JOIN units un ON un.id = cu.unit_id
              WHERE u.role = 'coordinator'
+             GROUP BY u.id
              ORDER BY
                 CASE u.status
                     WHEN 'pending' THEN 0
@@ -683,17 +727,16 @@ def list_coordinators(conn) -> list[dict[str, Any]]:
                     WHEN 'suspended' THEN 2
                     ELSE 3
                 END,
-                un.canonical_name ASC NULLS LAST,
                 u.name ASC
             """
         )
         return cur.fetchall()
 
 
-def set_user_unit(
+def add_user_unit(
     conn, admin: dict[str, Any], user_id: UUID | str, unit_id: UUID | str
 ) -> dict[str, Any]:
-    """Admin: (re)atribui a UPA de um coordenador/profissional."""
+    """Admin: adiciona uma UPA ao conjunto de um coordenador/profissional."""
     target = _load_target(conn, user_id)
     if target["role"] not in ("coordinator", "professional"):
         raise HTTPException(status_code=403, detail="Alvo inválido.")
@@ -702,19 +745,58 @@ def set_user_unit(
     with conn.cursor() as cur:
         cur.execute(
             """
-            UPDATE users
-               SET unit_id = %s
-             WHERE id = %s
-             RETURNING id, name, role, status, unit_id
+            INSERT INTO coordinator_units (user_id, unit_id)
+            VALUES (%s, %s)
+            ON CONFLICT (user_id, unit_id) DO NOTHING
             """,
-            (str(unit_id), str(user_id)),
+            (str(user_id), str(unit_id)),
+        )
+        # Sem unidade primária ainda? Esta vira a primária (default de sessão).
+        if not target.get("unit_id"):
+            cur.execute(
+                "UPDATE users SET unit_id = %s WHERE id = %s",
+                (str(unit_id), str(user_id)),
+            )
+        cur.execute(
+            "SELECT id, name, role, status, unit_id FROM users WHERE id = %s",
+            (str(user_id),),
+        )
+        return cur.fetchone()
+
+
+def remove_user_unit(
+    conn, admin: dict[str, Any], user_id: UUID | str, unit_id: UUID | str
+) -> dict[str, Any]:
+    """Admin: remove uma UPA do conjunto. Se era a primária, promove outra (ou NULL)."""
+    target = _load_target(conn, user_id)
+    if target["role"] not in ("coordinator", "professional"):
+        raise HTTPException(status_code=403, detail="Alvo inválido.")
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM coordinator_units WHERE user_id = %s AND unit_id = %s",
+            (str(user_id), str(unit_id)),
+        )
+        if target.get("unit_id") and str(target["unit_id"]) == str(unit_id):
+            cur.execute(
+                "SELECT unit_id FROM coordinator_units WHERE user_id = %s LIMIT 1",
+                (str(user_id),),
+            )
+            row = cur.fetchone()
+            new_primary = str(row["unit_id"]) if row and row.get("unit_id") else None
+            cur.execute(
+                "UPDATE users SET unit_id = %s WHERE id = %s",
+                (new_primary, str(user_id)),
+            )
+        cur.execute(
+            "SELECT id, name, role, status, unit_id FROM users WHERE id = %s",
+            (str(user_id),),
         )
         return cur.fetchone()
 
 
 def reject_user(conn, approver: dict[str, Any], user_id: UUID | str) -> dict[str, Any]:
     target = _load_target(conn, user_id)
-    _ensure_approver_can_act(approver, target)
+    _ensure_approver_can_act(conn, approver, target)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -730,7 +812,7 @@ def reject_user(conn, approver: dict[str, Any], user_id: UUID | str) -> dict[str
 
 def suspend_user(conn, approver: dict[str, Any], user_id: UUID | str) -> dict[str, Any]:
     target = _load_target(conn, user_id)
-    _ensure_approver_can_act(approver, target)
+    _ensure_approver_can_act(conn, approver, target)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -889,16 +971,18 @@ def list_pending(conn, approver: dict[str, Any]) -> list[dict[str, Any]]:
                 """
             )
         elif approver["role"] == "coordinator":
-            if not approver.get("unit_id"):
+            units = unit_ids_for_user(conn, approver["id"], approver.get("unit_id"))
+            if not units:
                 return []
             cur.execute(
                 """
                 SELECT id, name, role, cargo, unit_id, created_at, cpf_encrypted, coren_crm
                   FROM users
-                 WHERE status = 'pending' AND role = 'professional' AND unit_id = %s
+                 WHERE status = 'pending' AND role = 'professional'
+                   AND unit_id = ANY(%s)
                  ORDER BY created_at ASC
                 """,
-                (str(approver["unit_id"]),),
+                (list(units),),
             )
         else:
             return []

@@ -34,6 +34,11 @@ interface PendingUser {
   created_at: string;
 }
 
+interface CoordUnit {
+  id: string;
+  name: string;
+}
+
 interface AdminCoordinator {
   id: string;
   name: string;
@@ -41,8 +46,8 @@ interface AdminCoordinator {
   cargo: string | null;
   cpf_masked: string;
   username: string | null;
-  unit_id: string | null;
-  unit_name: string | null;
+  phone: string | null;
+  units: CoordUnit[];
   created_at: string;
   approved_at: string | null;
 }
@@ -175,17 +180,29 @@ export default function AdminPage() {
     }
   };
 
-  const changeUnit = async (id: string, unitId: string) => {
+  const addUnit = async (id: string, unitId: string) => {
     try {
-      await apiFetch(`/api/admin/users/${id}/unit`, {
-        method: 'PATCH',
+      await apiFetch(`/api/admin/users/${id}/units`, {
+        method: 'POST',
         body: JSON.stringify({ unit_id: unitId }),
       });
-      toast.success('UPA atualizada');
+      toast.success('UPA adicionada');
       void loadUnits();
       void loadCoordinators();
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : 'Falha ao trocar UPA';
+      const msg = err instanceof ApiError ? err.message : 'Falha ao adicionar UPA';
+      toast.error(msg);
+    }
+  };
+
+  const removeUnit = async (id: string, unitId: string) => {
+    try {
+      await apiFetch(`/api/admin/users/${id}/units/${unitId}`, { method: 'DELETE' });
+      toast.success('UPA removida');
+      void loadUnits();
+      void loadCoordinators();
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : 'Falha ao remover UPA';
       toast.error(msg);
     }
   };
@@ -259,7 +276,8 @@ export default function AdminPage() {
                 key={c.id}
                 coord={c}
                 units={units}
-                onChangeUnit={(unitId) => changeUnit(c.id, unitId)}
+                onAddUnit={(unitId) => addUnit(c.id, unitId)}
+                onRemoveUnit={(unitId) => removeUnit(c.id, unitId)}
               />
             ))}
           </div>
@@ -395,42 +413,95 @@ const STATUS_LABEL: Record<string, string> = {
   suspended: 'suspenso',
 };
 
+function formatPhone(raw: string | null): string | null {
+  if (!raw) return null;
+  const d = raw.replace(/\D/g, '');
+  if (d.length === 11) return `(${d.slice(0, 2)}) ${d.slice(2, 7)}-${d.slice(7)}`;
+  if (d.length === 10) return `(${d.slice(0, 2)}) ${d.slice(2, 6)}-${d.slice(6)}`;
+  return raw;
+}
+
 function CoordinatorRow({
   coord,
   units,
-  onChangeUnit,
+  onAddUnit,
+  onRemoveUnit,
 }: {
   coord: AdminCoordinator;
   units: AdminUnit[];
-  onChangeUnit: (unitId: string) => void | Promise<void>;
+  onAddUnit: (unitId: string) => void | Promise<void>;
+  onRemoveUnit: (unitId: string) => void | Promise<void>;
 }) {
+  const assignedIds = new Set(coord.units.map((u) => u.id));
+  const available = units.filter((u) => !assignedIds.has(u.id));
+  const created = new Date(coord.created_at).toLocaleDateString('pt-BR', {
+    day: '2-digit',
+    month: '2-digit',
+    year: '2-digit',
+  });
+  const phone = formatPhone(coord.phone);
+
   return (
-    <div className="flex items-center gap-3 rounded-card border border-border bg-card px-3 py-2.5">
-      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-accent-blue/10 text-accent-blue">
-        <UserRound size={18} />
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <p className="truncate text-sm font-semibold text-text-primary">{coord.name}</p>
-          <span className="shrink-0 rounded-pill bg-surface px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-text-secondary">
-            {STATUS_LABEL[coord.status] ?? coord.status}
-          </span>
+    <div className="rounded-card border border-border bg-card px-3 py-2.5">
+      <div className="flex items-center gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-accent-blue/10 text-accent-blue">
+          <UserRound size={18} />
         </div>
-        <select
-          value={coord.unit_id ?? ''}
-          onChange={(e) => void onChangeUnit(e.target.value)}
-          aria-label={`UPA de ${coord.name}`}
-          className="mt-1 w-full rounded-pill border border-border bg-surface px-3 py-1.5 text-xs font-medium text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-        >
-          <option value="" disabled>
-            Sem UPA — selecione
-          </option>
-          {units.map((u) => (
-            <option key={u.id} value={u.id}>
-              {u.canonical_name}
-            </option>
-          ))}
-        </select>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <p className="truncate text-sm font-semibold text-text-primary">{coord.name}</p>
+            <span className="shrink-0 rounded-pill bg-surface px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-text-secondary">
+              {STATUS_LABEL[coord.status] ?? coord.status}
+            </span>
+          </div>
+          <p className="truncate text-xs text-text-secondary">
+            {coord.cargo ?? 'Coordenador'}
+            {coord.username ? ` · @${coord.username}` : ''}
+          </p>
+          <p className="truncate text-xs text-text-tertiary">
+            CPF {coord.cpf_masked}
+            {phone ? ` · ${phone}` : ''} · desde {created}
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        {coord.units.length === 0 && (
+          <span className="text-xs text-accent-red">Sem UPA</span>
+        )}
+        {coord.units.map((u) => (
+          <span
+            key={u.id}
+            className="inline-flex items-center gap-1 rounded-pill bg-accent-blue/10 px-2.5 py-1 text-xs font-medium text-accent-blue"
+          >
+            {u.name}
+            <button
+              type="button"
+              onClick={() => void onRemoveUnit(u.id)}
+              aria-label={`Remover ${u.name} de ${coord.name}`}
+              className="rounded-full p-0.5 hover:bg-accent-blue/20"
+            >
+              <X size={12} />
+            </button>
+          </span>
+        ))}
+        {available.length > 0 && (
+          <select
+            value=""
+            onChange={(e) => {
+              if (e.target.value) void onAddUnit(e.target.value);
+            }}
+            aria-label={`Adicionar UPA a ${coord.name}`}
+            className="rounded-pill border border-dashed border-border bg-surface px-2.5 py-1 text-xs font-medium text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+          >
+            <option value="">+ adicionar UPA</option>
+            {available.map((u) => (
+              <option key={u.id} value={u.id}>
+                {u.canonical_name}
+              </option>
+            ))}
+          </select>
+        )}
       </div>
     </div>
   );

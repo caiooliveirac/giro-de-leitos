@@ -191,8 +191,13 @@ class ApproveResponse(BaseModel):
     status: str
 
 
-class SetUnitRequest(BaseModel):
+class AddUnitRequest(BaseModel):
     unit_id: UUID
+
+
+class CoordinatorUnit(BaseModel):
+    id: UUID
+    name: str
 
 
 class AdminCoordinator(BaseModel):
@@ -202,8 +207,8 @@ class AdminCoordinator(BaseModel):
     cargo: Optional[str] = None
     cpf_masked: str
     username: Optional[str] = None
-    unit_id: Optional[UUID] = None
-    unit_name: Optional[str] = None
+    phone: Optional[str] = None
+    units: list[CoordinatorUnit] = []
     created_at: datetime
     approved_at: Optional[datetime] = None
 

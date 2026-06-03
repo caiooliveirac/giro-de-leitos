@@ -28,6 +28,7 @@ from auth.deps import (
     require_pin_confirm,
 )
 
+from auth.service import unit_ids_for_user
 from beds import service
 from beds.schemas import (
     BedTransfer,
@@ -74,9 +75,10 @@ def get_unit_read_access(
     if device is not None:
         try:
             ctx = get_current_session(request=request, conn=conn, device=device)  # type: ignore[arg-type]
-            if str(ctx["user"].get("unit_id") or device["unit_id"]) != str(unit_id):
-                if ctx["user"]["role"] != "admin":
-                    raise HTTPException(status_code=403, detail="Unidade não corresponde.")
+            member_units = unit_ids_for_user(conn, ctx["user"]["id"], ctx["user"].get("unit_id"))
+            allowed = str(unit_id) in member_units or str(device["unit_id"]) == str(unit_id)
+            if not allowed and ctx["user"]["role"] != "admin":
+                raise HTTPException(status_code=403, detail="Unidade não corresponde.")
             return {
                 "actor": ctx["user"],
                 "unit_id": str(unit_id),
@@ -106,8 +108,8 @@ def get_unit_mutation_access(
     device = get_device_context(request=request, conn=conn)  # type: ignore[arg-type]
     ctx = get_current_session(request=request, conn=conn, device=device)  # type: ignore[arg-type]
     user = ctx["user"]
-    user_unit = str(user.get("unit_id")) if user.get("unit_id") else None
-    if user["role"] != "admin" and user_unit and user_unit != str(unit_id):
+    member_units = unit_ids_for_user(conn, user["id"], user.get("unit_id"))
+    if user["role"] != "admin" and member_units and str(unit_id) not in member_units:
         raise HTTPException(status_code=403, detail="Usuário não pertence à unidade.")
     if device["unit_id"] != str(unit_id) and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Dispositivo não pertence à unidade.")
@@ -289,8 +291,8 @@ async def post_bed_death(
 ):
     # ``require_pin_confirm`` already validated session + PIN. Verify unit match.
     user = ctx["user"]
-    user_unit = str(user.get("unit_id")) if user.get("unit_id") else None
-    if user["role"] != "admin" and user_unit and user_unit != str(unit_id):
+    member_units = unit_ids_for_user(conn, user["id"], user.get("unit_id"))
+    if user["role"] != "admin" and member_units and str(unit_id) not in member_units:
         raise HTTPException(status_code=403, detail="Usuário não pertence à unidade.")
 
     expected = _parse_if_match(if_match)
