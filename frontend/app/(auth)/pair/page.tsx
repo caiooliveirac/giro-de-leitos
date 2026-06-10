@@ -465,6 +465,12 @@ function SelfPairMode() {
       >
         {loading ? 'Pareando…' : 'Parear e iniciar plantão'}
       </button>
+
+      <p className="text-center text-[13px]">
+        <Link href="/esqueci-senha" className="text-accent-blue hover:underline">
+          Esqueci minha senha
+        </Link>
+      </p>
     </motion.div>
   );
 }

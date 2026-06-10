@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { motion } from 'framer-motion';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -123,6 +124,11 @@ export default function AdminLoginPage() {
         >
           {loading ? 'Entrando…' : 'Entrar'}
         </button>
+        <p className="text-center text-xs">
+          <Link href="/esqueci-senha" className="text-accent-blue hover:underline">
+            Esqueci minha senha
+          </Link>
+        </p>
       </form>
       <ToastViewport />
     </main>

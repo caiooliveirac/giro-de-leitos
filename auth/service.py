@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -880,6 +881,143 @@ def change_my_password(conn, user_id: UUID | str, new_password: str) -> None:
              WHERE id = %s
             """,
             (new_hash, str(user_id)),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Password reset (self-service via e-mail)
+# ---------------------------------------------------------------------------
+PASSWORD_RESET_TTL = timedelta(hours=1)
+FORGOT_WINDOW = timedelta(minutes=15)
+FORGOT_MAX_REQUESTS = 5
+
+
+def _hash_reset_token(token: str) -> str:
+    """Deterministic sha256 hash for token lookup (tokens are high-entropy, so a
+    plain sha256 is sufficient — no need for a slow KDF)."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _count_recent_forgot_requests(conn, *, client_ip: Optional[str]) -> int:
+    """Counts recent password.forgot.request audit rows by IP."""
+    if not client_ip:
+        return 0
+    sql = (
+        "SELECT COUNT(*)::int AS n FROM audit_log "
+        "WHERE action = 'password.forgot.request' "
+        "AND created_at > NOW() - INTERVAL '15 minutes' "
+        "AND client_ip = %s"
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (client_ip,))
+            row = cur.fetchone()
+        return int(row["n"]) if row else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def check_forgot_rate_limit(conn, *, client_ip: Optional[str]) -> None:
+    n = _count_recent_forgot_requests(conn, client_ip=client_ip)
+    if n >= FORGOT_MAX_REQUESTS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Muitas tentativas. Tente novamente em alguns minutos.",
+            headers={"Retry-After": "900"},
+        )
+
+
+def create_password_reset(conn, *, login_or_email: str) -> Optional[dict[str, Any]]:
+    """Create a password-reset token for the user resolved from a single login.
+
+    Returns ``{"email", "token", "name", "user_id"}`` for the caller to deliver
+    the link by e-mail. Returns ``None`` (silently) when there is no active user
+    with an e-mail — the caller still responds 200 to avoid account enumeration.
+    """
+    user = find_user_by_login(conn, login_or_email)
+    if not user:
+        return None
+    if user.get("status") != "active":
+        return None
+
+    # The login-resolution SELECTs don't include the e-mail; fetch it now.
+    with conn.cursor() as cur:
+        cur.execute("SELECT email FROM users WHERE id = %s", (str(user["id"]),))
+        row = cur.fetchone()
+    email = (row.get("email") if row else None) or None
+    if not email:
+        return None
+
+    token = secrets.token_urlsafe(32)
+    token_hash = _hash_reset_token(token)
+    expires_at = datetime.now(timezone.utc) + PASSWORD_RESET_TTL
+    with conn.cursor() as cur:
+        # Invalidate prior unused tokens for this user (best-effort).
+        cur.execute(
+            """
+            UPDATE password_reset_tokens
+               SET used_at = NOW()
+             WHERE user_id = %s AND used_at IS NULL
+            """,
+            (str(user["id"]),),
+        )
+        cur.execute(
+            """
+            INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+            VALUES (%s, %s, %s)
+            """,
+            (str(user["id"]), token_hash, expires_at),
+        )
+    return {
+        "email": email,
+        "token": token,
+        "name": user.get("name"),
+        "user_id": str(user["id"]),
+    }
+
+
+def reset_password_with_token(conn, *, token: str, new_password: str) -> None:
+    """Apply a new password using a valid (unexpired, unused) reset token.
+
+    Friendly 400s on bad token / weak password. Marks the token used and clears
+    ``must_change_password``.
+    """
+    if not new_password or len(new_password) < _PASSWORD_MIN_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Senha precisa ter pelo menos {_PASSWORD_MIN_LEN} caracteres.",
+        )
+    token_hash = _hash_reset_token(token or "")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, user_id, expires_at, used_at
+              FROM password_reset_tokens
+             WHERE token_hash = %s
+             FOR UPDATE
+            """,
+            (token_hash,),
+        )
+        row = cur.fetchone()
+    if not row or row.get("used_at") is not None:
+        raise HTTPException(status_code=400, detail="Link inválido ou expirado.")
+    if row["expires_at"] < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Link inválido ou expirado.")
+
+    new_hash = crypto.hash_password(new_password)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE users
+               SET password_hash = %s,
+                   must_change_password = FALSE
+             WHERE id = %s
+            """,
+            (new_hash, str(row["user_id"])),
+        )
+        cur.execute(
+            "UPDATE password_reset_tokens SET used_at = NOW() WHERE id = %s",
+            (str(row["id"]),),
         )
 
 
