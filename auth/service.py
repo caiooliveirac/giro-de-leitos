@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -9,10 +10,13 @@ from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import HTTPException, status
+from psycopg.errors import UniqueViolation
 
 from auth import crypto
 from auth.cpf import validate_cpf
 from auth.deps import DEVICE_TOKEN_TTL, PAIRING_CODE_TTL, SHIFT_TOKEN_TTL
+
+logger = logging.getLogger(__name__)
 
 INVITE_TTL = timedelta(days=7)
 # Per-creator cap on invites/hour. Default raised for unit onboarding (an admin
@@ -83,6 +87,11 @@ def create_pairing_code(conn, unit_id: UUID | str, created_by: UUID | str) -> di
                 if row:
                     return {"pairing_code": code, "expires_at": expires_at}
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "create_pairing_code: INSERT em trusted_devices falhou (unit_id=%s)",
+                unit_id,
+                exc_info=True,
+            )
             conn.rollback()
             continue
     raise HTTPException(status_code=500, detail="Não foi possível gerar código.")
@@ -190,6 +199,42 @@ def find_user_by_cpf_digits(conn, cpf_digits: str) -> Optional[dict[str, Any]]:
         return cur.fetchone()
 
 
+def find_user_by_email(conn, email: str) -> Optional[dict[str, Any]]:
+    if not email:
+        return None
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, name, role, status, unit_id, cargo, photo_url,
+                   cpf_encrypted, coren_crm, password_hash, pin_hash,
+                   must_change_password
+              FROM users
+             WHERE LOWER(email) = LOWER(%s)
+            """,
+            (email.strip(),),
+        )
+        return cur.fetchone()
+
+
+def find_user_by_login(conn, login: str) -> Optional[dict[str, Any]]:
+    """Resolve a user from a single login field: e-mail, CPF, or username.
+
+    The self-pair screen sends one ``login`` field; every user always has a CPF
+    and (going forward) an e-mail, and may also have a username.
+    """
+    if not login:
+        return None
+    login = login.strip()
+    if "@" in login:
+        return find_user_by_email(conn, login)
+    digits = "".join(ch for ch in login if ch.isdigit())
+    if len(login) == 11 and len(digits) == 11:
+        user = find_user_by_cpf_digits(conn, digits)
+        if user:
+            return user
+    return find_user_by_username(conn, login)
+
+
 def _count_recent_self_pair_fails(conn, *, client_ip: Optional[str], cpf_hash: Optional[str]) -> int:
     """Counts recent device.self_pair.fail audit rows by IP or cpf_hash."""
     if not client_ip and not cpf_hash:
@@ -233,10 +278,14 @@ def self_pair_device(
     device_fingerprint: str,
     label: Optional[str],
     username: Optional[str] = None,
+    login: Optional[str] = None,
 ) -> dict[str, Any]:
     """Pair a device using an existing active user's own credentials.
 
-    Failure modes 1-3 (unknown CPF, wrong password, wrong PIN) all collapse to a
+    The user is resolved from ``login`` (e-mail, CPF, or username) when present;
+    ``username``/``cpf_digits`` remain for backwards compatibility.
+
+    Failure modes 1-3 (unknown user, wrong password, wrong PIN) all collapse to a
     single generic 401 to avoid enumeration. Statuses 4-5 are explicit because
     they aren't credential-enumerable.
     """
@@ -246,7 +295,9 @@ def self_pair_device(
     except Exception:  # noqa: BLE001
         cpf_hash = None
 
-    if username:
+    if login:
+        user = find_user_by_login(conn, login)
+    elif username:
         user = find_user_by_username(conn, username)
     else:
         user = find_user_by_cpf_digits(conn, cpf_digits)
@@ -559,43 +610,68 @@ def accept_invite(conn, token: str, payload) -> dict[str, Any]:
             raise HTTPException(status_code=409, detail="CPF já cadastrado nesta unidade.")
         raise HTTPException(status_code=409, detail="CPF já cadastrado no sistema.")
 
+    # Login identifiers: e-mail (required) and username (optional). Both are
+    # unique in the DB; pre-check for friendly 409s before the INSERT.
+    email = (payload.email or "").strip().lower()
+    username = (payload.username or "").strip().lower() or None
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM users WHERE LOWER(email) = %s", (email,))
+        if cur.fetchone():
+            raise HTTPException(status_code=409, detail="E-mail já cadastrado.")
+        if username:
+            cur.execute("SELECT 1 FROM users WHERE LOWER(username) = %s", (username,))
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail="Nome de usuário já em uso.")
+
     cpf_enc = crypto.encrypt_cpf(payload.cpf)
     pwd_hash = crypto.hash_password(payload.password)
     pin_hash = crypto.hash_pin(payload.pin)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO users (
-                name, cpf_encrypted, cpf_hash, phone, photo_url, role, cargo,
-                coren_crm, unit_id, status, password_hash, pin_hash, lgpd_accepted_at
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, NOW()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (
+                    name, cpf_encrypted, cpf_hash, phone, photo_url, role, cargo,
+                    coren_crm, unit_id, status, email, username,
+                    password_hash, pin_hash, lgpd_accepted_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s, NOW()
+                )
+                RETURNING id, name, role, status, unit_id, cargo, photo_url, coren_crm
+                """,
+                (
+                    payload.name.strip(),
+                    cpf_enc,
+                    cpf_hash,
+                    payload.phone,
+                    payload.photo_url,
+                    role,
+                    payload.cargo,
+                    payload.coren_crm,
+                    str(target_unit_id) if target_unit_id else None,
+                    email,
+                    username,
+                    pwd_hash,
+                    pin_hash,
+                ),
             )
-            RETURNING id, name, role, status, unit_id, cargo, photo_url, coren_crm
-            """,
-            (
-                payload.name.strip(),
-                cpf_enc,
-                cpf_hash,
-                payload.phone,
-                payload.photo_url,
-                role,
-                payload.cargo,
-                payload.coren_crm,
-                str(target_unit_id) if target_unit_id else None,
-                pwd_hash,
-                pin_hash,
-            ),
-        )
-        user = cur.fetchone()
-        cur.execute(
-            """
-            UPDATE invites
-               SET status = 'used', used_by = %s, used_at = NOW()
-             WHERE id = %s
-            """,
-            (str(user["id"]), str(invite["id"])),
-        )
+            user = cur.fetchone()
+            cur.execute(
+                """
+                UPDATE invites
+                   SET status = 'used', used_by = %s, used_at = NOW()
+                 WHERE id = %s
+                """,
+                (str(user["id"]), str(invite["id"])),
+            )
+    except UniqueViolation as exc:  # race with a concurrent accept
+        conn.rollback()
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", "") or ""
+        if "username" in constraint:
+            raise HTTPException(status_code=409, detail="Nome de usuário já em uso.") from exc
+        if "email" in constraint:
+            raise HTTPException(status_code=409, detail="E-mail já cadastrado.") from exc
+        raise HTTPException(status_code=409, detail="Cadastro já existente.") from exc
     return user
 
 

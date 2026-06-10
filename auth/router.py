@@ -212,7 +212,11 @@ def device_self_pair(
     response: Response,
     conn=Depends(get_db),
 ):
-    cpf_digits = re.sub(r"\D", "", payload.cpf or "")
+    # CPF may arrive in the dedicated field or inside the unified ``login`` field.
+    raw_cpf = payload.cpf or (payload.login if payload.login and "@" not in payload.login else "")
+    cpf_digits = re.sub(r"\D", "", raw_cpf or "")
+    if len(cpf_digits) != 11:
+        cpf_digits = ""
     meta = client_meta(request)
     try:
         cpf_hash_val = hash_cpf(cpf_digits) if len(cpf_digits) == 11 else None
@@ -231,6 +235,7 @@ def device_self_pair(
             device_fingerprint=payload.device_fingerprint,
             label=payload.label,
             username=payload.username,
+            login=payload.login,
         )
     except HTTPException as exc:
         # Audit failure for credential-class errors (401) and gate-class (403)

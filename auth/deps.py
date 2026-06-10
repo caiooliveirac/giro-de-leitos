@@ -2,7 +2,9 @@
 
 Cookies:
 - ``admin_token``: JWT scope=admin, validade curta (8h).
-- ``device_token``: JWT scope=device, 30 dias, carrega ``unit_id`` e ``device_id``.
+- ``device_token``: JWT scope=device, carrega ``unit_id`` e ``device_id``.
+  Janela deslizante: renovado a cada uso, então o tablet em uso nunca expira;
+  só perde o pareamento se ficar ~90 dias parado.
 - ``session_token``: JWT scope=shift, 12h, carrega ``session_id``/``user_id``.
 
 JWT secret: env ``JWT_SECRET``. Em dev gera um fallback determinístico-por-processo
@@ -19,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Iterator, Optional
 from uuid import UUID
 
-from fastapi import Cookie, Depends, Header, HTTPException, Request, status
+from fastapi import Cookie, Depends, Header, HTTPException, Request, Response, status
 from jose import JWTError, jwt
 from psycopg.rows import dict_row
 
@@ -30,7 +32,12 @@ logger = logging.getLogger(__name__)
 
 JWT_ALGORITHM = "HS256"
 ADMIN_TOKEN_TTL = timedelta(hours=8)
-DEVICE_TOKEN_TTL = timedelta(days=30)
+DEVICE_TOKEN_TTL = timedelta(days=90)
+# Janela deslizante: a cada requisição válida, se faltar menos que isto pra
+# expirar, empurramos ``expires_at`` pra frente e reemitimos o cookie. Assim um
+# tablet em uso nunca expira; só cai se ficar ~90 dias sem uso. O limiar evita
+# escrever no banco em toda requisição (no máx. uma renovação a cada ~45 dias).
+DEVICE_TOKEN_RENEW_WINDOW = DEVICE_TOKEN_TTL / 2
 SHIFT_TOKEN_TTL = timedelta(hours=12)
 PAIRING_CODE_TTL = timedelta(minutes=10)
 
@@ -201,7 +208,9 @@ def get_current_admin(
 # ---------------------------------------------------------------------------
 # Device context (any operator endpoint)
 # ---------------------------------------------------------------------------
-def get_device_context(request: Request, conn=Depends(get_db)) -> dict[str, Any]:
+def get_device_context(
+    request: Request, conn=Depends(get_db), response: Response = None
+) -> dict[str, Any]:
     raw = _read_cookie(request, COOKIE_DEVICE)
     if not raw:
         raise HTTPException(status_code=401, detail="Dispositivo não pareado.")
@@ -228,8 +237,31 @@ def get_device_context(request: Request, conn=Depends(get_db)) -> dict[str, Any]
         dev = cur.fetchone()
     if not dev or dev["revoked_at"] is not None:
         raise HTTPException(status_code=401, detail="Dispositivo revogado.")
-    if dev["expires_at"] and dev["expires_at"] < datetime.now(timezone.utc):
+    now = datetime.now(timezone.utc)
+    if dev["expires_at"] and dev["expires_at"] < now:
         raise HTTPException(status_code=401, detail="Pareamento expirado.")
+    # Janela deslizante: renova por uso para o tablet ativo nunca expirar.
+    # Só escreve no banco/reemite o cookie quando passa do meio da janela, e
+    # somente quando há um ``response`` pra reemitir o cookie junto — caso
+    # contrário banco e cookie ficariam dessincronizados (chamadas diretas que
+    # não repassam ``response`` apenas leem, sem renovar).
+    needs_renew = dev["expires_at"] is None or (dev["expires_at"] - now) < DEVICE_TOKEN_RENEW_WINDOW
+    if response is not None and needs_renew:
+        new_expires = now + DEVICE_TOKEN_TTL
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE trusted_devices SET expires_at = %s WHERE id = %s",
+                (new_expires, str(dev["id"])),
+            )
+        token = encode_token(
+            {
+                "scope": "device",
+                "unit_id": str(dev["unit_id"]),
+                "device_id": str(dev["id"]),
+            },
+            DEVICE_TOKEN_TTL,
+        )
+        set_device_cookie(response, token)
     return {"unit_id": str(dev["unit_id"]), "device_id": str(dev["id"])}
 
 
@@ -315,6 +347,7 @@ def require_pin_confirm(
 __all__ = [
     "ADMIN_TOKEN_TTL",
     "DEVICE_TOKEN_TTL",
+    "DEVICE_TOKEN_RENEW_WINDOW",
     "SHIFT_TOKEN_TTL",
     "PAIRING_CODE_TTL",
     "COOKIE_ADMIN",

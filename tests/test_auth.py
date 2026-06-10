@@ -220,6 +220,51 @@ def test_self_pair_requires_username_or_cpf(client):
     assert resp.status_code == 422
 
 
+def test_self_pair_accepts_login_email(client, monkeypatch):
+    # Campo unificado ``login`` com um e-mail — passa do 422 e segue pro lookup.
+    monkeypatch.setattr(auth_service, "find_user_by_login", lambda *a, **kw: None)
+    monkeypatch.setattr(auth_service, "check_self_pair_rate_limit", lambda *a, **kw: None)
+    resp = client.post(
+        "/api/auth/device/self-pair",
+        json={
+            "login": "ivan@example.com",
+            "password": "abc123",
+            "pin": "1234",
+            "device_fingerprint": "fp-test-abc",
+        },
+    )
+    assert resp.status_code == 401
+    assert resp.json().get("detail") == "Credenciais inválidas."
+
+
+def test_self_pair_accepts_login_cpf(client, monkeypatch):
+    # ``login`` com um CPF de 11 dígitos também é aceito pelo schema.
+    monkeypatch.setattr(auth_service, "find_user_by_login", lambda *a, **kw: None)
+    monkeypatch.setattr(auth_service, "check_self_pair_rate_limit", lambda *a, **kw: None)
+    resp = client.post(
+        "/api/auth/device/self-pair",
+        json={
+            "login": "52998224725",
+            "password": "abc123",
+            "pin": "1234",
+            "device_fingerprint": "fp-test-abc",
+        },
+    )
+    assert resp.status_code == 401
+    assert resp.json().get("detail") == "Credenciais inválidas."
+
+
+def test_find_user_by_login_dispatch(monkeypatch):
+    # Despacha por e-mail (tem @), CPF (11 dígitos) ou username (resto).
+    monkeypatch.setattr(auth_service, "find_user_by_email", lambda conn, v: ("email", v))
+    monkeypatch.setattr(auth_service, "find_user_by_cpf_digits", lambda conn, v: ("cpf", v))
+    monkeypatch.setattr(auth_service, "find_user_by_username", lambda conn, v: ("user", v))
+
+    assert auth_service.find_user_by_login(None, "a@b.com")[0] == "email"
+    assert auth_service.find_user_by_login(None, "52998224725")[0] == "cpf"
+    assert auth_service.find_user_by_login(None, "ivan.paiva")[0] == "user"
+
+
 def test_self_pair_invalid_credentials(client, monkeypatch):
     # Force user lookup to fail → 401 generic message.
     monkeypatch.setattr(auth_service, "find_user_by_cpf_digits", lambda *a, **kw: None)
@@ -276,3 +321,99 @@ def test_pairing_code_format(monkeypatch):
     # Indirectly exercise _gen_pairing_code via attribute import.
     code = auth_service._gen_pairing_code()  # noqa: SLF001
     assert len(code) == 6 and code.isdigit()
+
+
+# ---------------------------------------------------------------------------
+# Device sliding window (renova pareamento por uso)
+# ---------------------------------------------------------------------------
+class _DeviceCursor:
+    def __init__(self, dev_row, calls):
+        self.dev_row = dev_row
+        self.calls = calls
+        self._last = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql: str, params: tuple = ()):
+        verb = sql.strip().split()[0].lower()
+        self.calls.append((verb, params))
+        self._last = self.dev_row if verb == "select" else None
+
+    def fetchone(self):
+        return self._last
+
+
+class _DeviceConn:
+    def __init__(self, dev_row, calls):
+        self.dev_row = dev_row
+        self.calls = calls
+
+    def cursor(self):
+        return _DeviceCursor(self.dev_row, self.calls)
+
+
+class _Req:
+    def __init__(self, cookies):
+        self.cookies = cookies
+
+
+def _device_token(unit_id: str, dev_id: str) -> str:
+    return auth_deps.encode_token(
+        {"scope": "device", "unit_id": unit_id, "device_id": dev_id},
+        auth_deps.DEVICE_TOKEN_TTL,
+    )
+
+
+def _make_device_call(expires_in, *, with_response: bool):
+    from datetime import datetime, timezone
+    from fastapi import Response
+
+    dev_id = str(uuid.uuid4())
+    unit_id = str(uuid.uuid4())
+    dev_row = {
+        "id": dev_id,
+        "unit_id": unit_id,
+        "label": "tablet",
+        "expires_at": datetime.now(timezone.utc) + expires_in,
+        "revoked_at": None,
+    }
+    calls: list[Any] = []
+    conn = _DeviceConn(dev_row, calls)
+    req = _Req({auth_deps.COOKIE_DEVICE: _device_token(unit_id, dev_id)})
+    resp = Response() if with_response else None
+    ctx = auth_deps.get_device_context(request=req, conn=conn, response=resp)
+    assert ctx["device_id"] == dev_id
+    renewed = any(v == "update" for v, _ in calls)
+    cookie_set = bool(resp and auth_deps.COOKIE_DEVICE in (resp.headers.get("set-cookie") or ""))
+    return renewed, cookie_set
+
+
+def test_device_renews_when_near_expiry():
+    from datetime import timedelta
+
+    # 1 dia restante < janela de renovação (45 dias) → renova e reemite cookie.
+    renewed, cookie_set = _make_device_call(timedelta(days=1), with_response=True)
+    assert renewed
+    assert cookie_set
+
+
+def test_device_skips_renew_when_fresh():
+    from datetime import timedelta
+
+    # 80 dias restantes > janela de renovação → só lê, sem escrever nem cookie.
+    renewed, cookie_set = _make_device_call(timedelta(days=80), with_response=True)
+    assert not renewed
+    assert not cookie_set
+
+
+def test_device_direct_call_without_response_does_not_renew():
+    from datetime import timedelta
+
+    # Sem ``response`` (chamada direta), nunca renova mesmo perto de expirar,
+    # pra não dessincronizar banco e cookie.
+    renewed, _ = _make_device_call(timedelta(days=1), with_response=False)
+    assert not renewed
