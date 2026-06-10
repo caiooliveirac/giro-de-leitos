@@ -58,6 +58,7 @@ def _try_admin(request: Request, conn) -> Optional[dict[str, Any]]:
 def get_unit_read_access(
     unit_id: UUID,
     request: Request,
+    response: Response,
     conn=Depends(get_db),
 ) -> dict[str, Any]:
     """Read access for a unit: admin, active session, or paired device."""
@@ -67,7 +68,7 @@ def get_unit_read_access(
 
     # Try shift session (preferred — gives actor identity).
     try:
-        device = get_device_context(request=request, conn=conn)  # type: ignore[arg-type]
+        device = get_device_context(request=request, conn=conn, response=response)  # type: ignore[arg-type]
     except HTTPException:
         device = None
 
@@ -96,6 +97,7 @@ def get_unit_read_access(
 def get_unit_mutation_access(
     unit_id: UUID,
     request: Request,
+    response: Response,
     conn=Depends(get_db),
 ) -> dict[str, Any]:
     """Mutation requires an active shift session on the unit (admin overrides)."""
@@ -103,7 +105,7 @@ def get_unit_mutation_access(
     if admin is not None:
         return {"actor": admin, "unit_id": str(unit_id), "session": None, "device": None}
 
-    device = get_device_context(request=request, conn=conn)  # type: ignore[arg-type]
+    device = get_device_context(request=request, conn=conn, response=response)  # type: ignore[arg-type]
     ctx = get_current_session(request=request, conn=conn, device=device)  # type: ignore[arg-type]
     user = ctx["user"]
     user_unit = str(user.get("unit_id")) if user.get("unit_id") else None

@@ -73,7 +73,7 @@ export default function PairPage() {
 
       <p className="mt-5 text-center text-[12px] text-ink-3">
         {mode === 'code'
-          ? 'Já tem cadastro? Use a aba ao lado pra parear com seu login/senha/PIN.'
+          ? 'Já tem cadastro nesta UPA? Use a aba ao lado e pareie com seu login/senha/PIN — sem depender de coordenador.'
           : 'Precisa do código? Peça pra um coordenador.'}
       </p>
 
@@ -201,7 +201,8 @@ function CodeMode() {
         <strong className="text-ink">10 minutos</strong>.
       </p>
       <p className="mt-1 text-[13px] text-ink-3">
-        Esse aparelho fica vinculado à unidade dele por 30 dias.
+        Enquanto este aparelho estiver em uso, segue pareado — o código só é
+        pedido de novo se ele ficar cerca de 90 dias parado.
       </p>
 
       <motion.div
@@ -251,7 +252,7 @@ function CodeMode() {
 function SelfPairMode() {
   const router = useRouter();
   const toast = useToast();
-  const [username, setUsername] = useState('');
+  const [login, setLogin] = useState('');
   const [password, setPassword] = useState('');
   const [pin, setPin] = useState<string[]>(() => Array(PIN_LENGTH).fill(''));
   const [loading, setLoading] = useState(false);
@@ -259,12 +260,12 @@ function SelfPairMode() {
   const [shaking, setShaking] = useState(false);
   const pinRefs = useRef<Array<HTMLInputElement | null>>([]);
 
-  const usernameTrim = username.trim();
-  const usernameOk = usernameTrim.length >= 3;
+  const loginTrim = login.trim();
+  const loginOk = loginTrim.length >= 3;
   const pinStr = pin.join('');
   const pinOk = pinStr.length === PIN_LENGTH && pin.every((d) => /\d/.test(d));
   const passwordOk = password.length >= 6;
-  const canSubmit = usernameOk && pinOk && passwordOk && !loading;
+  const canSubmit = loginOk && pinOk && passwordOk && !loading;
 
   const setPinAt = (i: number, value: string) => {
     setPin((d) => {
@@ -323,7 +324,7 @@ function SelfPairMode() {
         {
           method: 'POST',
           body: JSON.stringify({
-            username: usernameTrim,
+            login: loginTrim,
             password,
             pin: pinStr,
             device_fingerprint: fingerprint,
@@ -376,13 +377,14 @@ function SelfPairMode() {
       transition={{ duration: 0.38 }}
     >
       <p className="text-[14px] leading-relaxed text-ink-2">
-        Use seu login, senha e PIN. O aparelho fica vinculado à sua UPA por 30
-        dias e seu plantão já começa.
+        Use seu login, senha e PIN — sem precisar de coordenador. O aparelho
+        fica pareado enquanto estiver em uso (só cai depois de ~90 dias parado)
+        e seu plantão já começa.
       </p>
 
       <div className="field">
         <label className="field-label" htmlFor="sp-user">
-          Login
+          CPF, e-mail ou usuário
         </label>
         <input
           id="sp-user"
@@ -393,11 +395,14 @@ function SelfPairMode() {
           spellCheck={false}
           autoComplete="username"
           className="input-shell"
-          value={username}
-          placeholder="ex.: ivan.bairrodapaz"
-          onChange={(e) => setUsername(e.target.value)}
+          value={login}
+          placeholder="seu CPF, e-mail ou nome de usuário"
+          onChange={(e) => setLogin(e.target.value)}
           disabled={loading}
         />
+        <p className="mt-1 text-[12px] text-ink-3">
+          Pode entrar com qualquer um: o CPF do cadastro, o e-mail ou o nome de usuário.
+        </p>
       </div>
 
       <div className="field">

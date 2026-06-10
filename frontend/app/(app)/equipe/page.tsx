@@ -844,7 +844,7 @@ function ResetPasswordModal({
                   Login
                 </p>
                 <p className="mt-0.5 font-mono text-sm font-semibold text-text-primary">
-                  {result.username ?? '(usar CPF)'}
+                  {result.username ?? '(usar CPF ou e-mail)'}
                 </p>
               </div>
               <div className="rounded-card border border-accent-blue/30 bg-accent-blue/5 px-3 py-3">

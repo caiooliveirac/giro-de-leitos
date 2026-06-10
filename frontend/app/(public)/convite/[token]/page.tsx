@@ -25,6 +25,8 @@ interface FormState {
   coren_crm: string;
   phone: string;
   cpf: string;
+  email: string;
+  username: string;
   lgpd: boolean;
   password: string;
   password_confirm: string;
@@ -39,11 +41,16 @@ const EMPTY: FormState = {
   coren_crm: '',
   phone: '',
   cpf: '',
+  email: '',
+  username: '',
   lgpd: false,
   password: '',
   password_confirm: '',
   pin: '',
 };
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const USERNAME_RE = /^[a-z0-9._-]{3,32}$/;
 
 function calcStrength(pw: string): 0 | 1 | 2 | 3 | 4 {
   if (!pw) return 0;
@@ -136,6 +143,8 @@ export default function InvitePage({ params }: { params: { token: string } }) {
       const payload: InviteAcceptPayload = {
         name: data.name,
         cpf: cpfDigits(data.cpf),
+        email: data.email.trim().toLowerCase(),
+        username: data.username.trim().toLowerCase() || null,
         phone: phoneDigits(data.phone),
         cargo: data.cargo,
         coren_crm: data.coren_crm.trim() || null,
@@ -315,7 +324,7 @@ function Welcome({
       <p className="text-[14px] leading-[1.5] text-ink-2">Você vai precisar de:</p>
       <ul className="mt-1 list-disc pl-5 text-[13px] leading-[1.7] text-ink-2">
         <li>Uma foto pra colegas te reconhecerem no plantão</li>
-        <li>Seu CPF e telefone</li>
+        <li>Seu CPF, e-mail e telefone</li>
         <li>Cerca de 2 minutos</li>
       </ul>
 
@@ -495,10 +504,13 @@ function Step2({
   onBack: () => void;
 }) {
   const [cpfTouched, setCpfTouched] = useState(false);
+  const [emailTouched, setEmailTouched] = useState(false);
   const phoneOk = isValidPhoneBR(data.phone);
   const cpfOk = validateCpf(data.cpf);
   const cpfShowErr = cpfTouched && cpfDigits(data.cpf).length === 11 && !cpfOk;
-  const canNext = phoneOk && cpfOk && data.lgpd;
+  const emailOk = EMAIL_RE.test(data.email.trim());
+  const emailShowErr = emailTouched && data.email.trim().length > 0 && !emailOk;
+  const canNext = phoneOk && cpfOk && emailOk && data.lgpd;
 
   return (
     <>
@@ -527,6 +539,35 @@ function Step2({
           <div className="help">
             Vamos usar pra te avisar quando seu cadastro for aprovado.
           </div>
+        </div>
+
+        <div className="field">
+          <label className="field-label" htmlFor="iv-email">
+            E-mail
+          </label>
+          <input
+            id="iv-email"
+            type="email"
+            className="input-shell"
+            value={data.email}
+            placeholder="voce@exemplo.com"
+            inputMode="email"
+            autoComplete="email"
+            autoCapitalize="off"
+            spellCheck={false}
+            data-err={emailShowErr}
+            onBlur={() => setEmailTouched(true)}
+            onChange={(e) => onChange({ email: e.target.value })}
+          />
+          {emailShowErr ? (
+            <div className="help text-critical-ink">
+              E-mail inválido — verifique o endereço.
+            </div>
+          ) : (
+            <div className="help">
+              Serve para entrar no app e recuperar sua senha se você esquecer.
+            </div>
+          )}
         </div>
 
         <div className="field">
@@ -606,7 +647,9 @@ function Step3({
     /[a-zA-Z]/.test(data.password) &&
     /\d/.test(data.password);
   const pinOk = /^\d{4}$/.test(data.pin);
-  const canNext = minOk && match && pinOk && !submitting;
+  const usernameTrim = data.username.trim().toLowerCase();
+  const usernameOk = usernameTrim.length === 0 || USERNAME_RE.test(usernameTrim);
+  const canNext = minOk && match && pinOk && usernameOk && !submitting;
 
   return (
     <>
@@ -619,6 +662,36 @@ function Step3({
       </p>
 
       <div className="field-stack">
+        <div className="field">
+          <label className="field-label" htmlFor="iv-username">
+            Nome de usuário{' '}
+            <span className="font-medium normal-case tracking-normal text-ink-3">
+              · opcional
+            </span>
+          </label>
+          <input
+            id="iv-username"
+            className="input-shell"
+            value={data.username}
+            placeholder="ex.: mariana.soares"
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+            autoComplete="username"
+            data-err={data.username.trim().length > 0 && !usernameOk}
+            onChange={(e) => onChange({ username: e.target.value })}
+          />
+          {data.username.trim().length > 0 && !usernameOk ? (
+            <div className="help text-critical-ink">
+              3-32 caracteres: letras, números, ponto, hífen ou _.
+            </div>
+          ) : (
+            <div className="help">
+              Um apelido para entrar mais rápido. Você também pode usar CPF ou e-mail.
+            </div>
+          )}
+        </div>
+
         <div className="field">
           <label className="field-label" htmlFor="iv-pw">
             Senha

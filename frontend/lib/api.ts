@@ -260,6 +260,8 @@ export interface InvitePreview {
 export interface InviteAcceptPayload {
   name: string;
   cpf: string;
+  email: string;
+  username: string | null;
   phone: string;
   cargo: string;
   coren_crm: string | null;
@@ -270,6 +272,7 @@ export interface InviteAcceptPayload {
 }
 
 export interface DeviceSelfPairPayload {
+  login?: string;
   username?: string;
   cpf?: string;
   password: string;

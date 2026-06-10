@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Literal, Optional
 from uuid import UUID
@@ -54,6 +55,12 @@ class DevicePairResponse(BaseModel):
 
 
 class DeviceSelfPair(BaseModel):
+    login: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=160,
+        description="Identificador único: CPF, e-mail ou username.",
+    )
     username: Optional[str] = Field(default=None, min_length=1, max_length=64)
     cpf: Optional[str] = Field(default=None, min_length=11, max_length=14)
     password: str = Field(min_length=1, max_length=128)
@@ -63,8 +70,8 @@ class DeviceSelfPair(BaseModel):
 
     @model_validator(mode="after")
     def _one_login(self):
-        if not (self.username or self.cpf):
-            raise ValueError("Informe username ou cpf.")
+        if not (self.login or self.username or self.cpf):
+            raise ValueError("Informe login, username ou cpf.")
         return self
 
 
@@ -125,6 +132,8 @@ class InvitePreview(BaseModel):
 class InviteAccept(BaseModel):
     name: str = Field(min_length=2, max_length=160)
     cpf: str = Field(min_length=11, max_length=14)
+    email: EmailStr = Field(description="E-mail de login e recuperação de senha.")
+    username: Optional[str] = Field(default=None, min_length=3, max_length=32)
     phone: Optional[str] = Field(default=None, max_length=32)
     cargo: str = Field(min_length=2, max_length=80)
     coren_crm: Optional[str] = Field(default=None, max_length=40)
@@ -141,6 +150,20 @@ class InviteAccept(BaseModel):
         if not value:
             raise ValueError("LGPD precisa ser aceita.")
         return value
+
+    @field_validator("username")
+    @classmethod
+    def _username_format(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        v = value.strip().lower()
+        if not v:
+            return None
+        if not re.fullmatch(r"[a-z0-9._-]{3,32}", v):
+            raise ValueError(
+                "Usuário deve ter 3-32 caracteres: letras, números, ponto, hífen ou _."
+            )
+        return v
 
 
 class InviteListItem(BaseModel):
