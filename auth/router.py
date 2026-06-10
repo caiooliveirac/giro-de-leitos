@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import re
 from typing import Any, Optional
 from uuid import UUID
@@ -42,6 +44,7 @@ from auth.schemas import (
     DevicePairResponse,
     DeviceSelfPair,
     DeviceSelfPairResponse,
+    ForgotPasswordPayload,
     InviteAccept,
     InviteCreate,
     InviteCreateResponse,
@@ -49,15 +52,48 @@ from auth.schemas import (
     InvitePreview,
     PendingUser,
     PinVerify,
+    ResetPasswordPayload,
     ShiftEnd,
     ShiftStart,
     ShiftStartResponse,
     UnitMember,
     UserPublic,
 )
+from services import email as email_service
 from services import notifications
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api", tags=["auth"])
+
+
+def _password_reset_email(name: str | None, link: str) -> tuple[str, str, str]:
+    """Build (subject, text, html) for the password-reset e-mail."""
+    greeting = f"Olá, {name}," if name else "Olá,"
+    subject = "Redefinição de senha · Giro de Leitos"
+    text = (
+        f"{greeting}\n\n"
+        "Recebemos um pedido para redefinir a senha da sua conta no Giro de Leitos.\n"
+        "Abra o link abaixo para escolher uma nova senha (válido por 1 hora):\n\n"
+        f"{link}\n\n"
+        "Se você não solicitou, ignore este e-mail — sua senha permanece a mesma.\n"
+    )
+    html = (
+        f"<p>{greeting}</p>"
+        "<p>Recebemos um pedido para redefinir a senha da sua conta no "
+        "<strong>Giro de Leitos</strong>.</p>"
+        "<p>Clique no botão abaixo para escolher uma nova senha "
+        "(válido por 1 hora):</p>"
+        f'<p><a href="{link}" '
+        'style="display:inline-block;padding:12px 20px;background:#2563eb;'
+        'color:#fff;border-radius:8px;text-decoration:none;font-weight:600">'
+        "Redefinir senha</a></p>"
+        f'<p>Ou copie e cole este endereço no navegador:<br>'
+        f'<a href="{link}">{link}</a></p>'
+        "<p style=\"color:#6b7280;font-size:13px\">Se você não solicitou, "
+        "ignore este e-mail — sua senha permanece a mesma.</p>"
+    )
+    return subject, text, html
 
 
 def _safe_cpf_masked(cpf_encrypted: str | None) -> str:
@@ -776,6 +812,61 @@ def change_my_password_endpoint(
         action="user.password.change",
         entity_type="user",
         entity_id=str(user_id),
+        **client_meta(request),
+    )
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Password reset (self-service via e-mail)
+# ---------------------------------------------------------------------------
+@router.post("/auth/password/forgot")
+def forgot_password_endpoint(
+    payload: ForgotPasswordPayload,
+    request: Request,
+    conn=Depends(get_db),
+):
+    """Start a self-service password reset. Always returns 200 (anti-enumeration)."""
+    meta = client_meta(request)
+    service.check_forgot_rate_limit(conn, client_ip=meta.get("client_ip"))
+
+    reset = service.create_password_reset(conn, login_or_email=payload.login)
+    record_audit(
+        conn,
+        action="password.forgot.request",
+        entity_type="user",
+        entity_id=reset["user_id"] if reset else None,
+        new_value={"delivered": bool(reset)},
+        **meta,
+    )
+    if reset:
+        base = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+        link = f"{base}/redefinir-senha?token={reset['token']}"
+        subject, text, html = _password_reset_email(reset.get("name"), link)
+        try:
+            email_service.send_email(reset["email"], subject, text, html)
+        except Exception:  # noqa: BLE001
+            # Never leak delivery failures to the caller (anti-enumeration);
+            # the error is already logged by services.email.
+            logger.warning("forgot_password: envio de e-mail falhou", exc_info=True)
+    return {"ok": True}
+
+
+@router.post("/auth/password/reset")
+def reset_password_endpoint(
+    payload: ResetPasswordPayload,
+    request: Request,
+    conn=Depends(get_db),
+):
+    """Complete a password reset using the e-mailed token."""
+    service.reset_password_with_token(
+        conn, token=payload.token, new_password=payload.new_password
+    )
+    record_audit(
+        conn,
+        action="password.reset",
+        entity_type="user",
+        entity_id=None,
         **client_meta(request),
     )
     return {"ok": True}

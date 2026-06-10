@@ -270,6 +270,30 @@ class ChangeMyPasswordPayload(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Password reset (self-service via e-mail)
+# ---------------------------------------------------------------------------
+class ForgotPasswordPayload(BaseModel):
+    login: str = Field(
+        min_length=1,
+        max_length=160,
+        description="Identificador: CPF, e-mail ou nome de usuário.",
+    )
+
+    @field_validator("login")
+    @classmethod
+    def _strip(cls, value: str) -> str:
+        v = (value or "").strip()
+        if not v:
+            raise ValueError("Informe um identificador.")
+        return v
+
+
+class ResetPasswordPayload(BaseModel):
+    token: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=6, max_length=128)
+
+
+# ---------------------------------------------------------------------------
 # Admin — units overview
 # ---------------------------------------------------------------------------
 class AdminUnit(BaseModel):
