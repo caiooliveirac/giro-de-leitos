@@ -229,6 +229,8 @@ class AdminCoordinator(BaseModel):
     status: str
     cargo: Optional[str] = None
     cpf_masked: str
+    cpf: Optional[str] = None  # full CPF — admin-only management screen
+    email: Optional[str] = None
     username: Optional[str] = None
     phone: Optional[str] = None
     units: list[CoordinatorUnit] = []
@@ -246,6 +248,8 @@ class UnitMember(BaseModel):
     phone: Optional[str] = None
     photo_url: Optional[str] = None
     cpf_masked: str
+    cpf: Optional[str] = None  # full CPF — admin-only management screen
+    email: Optional[str] = None
     username: Optional[str] = None
     must_change_password: bool = False
     created_at: datetime
@@ -256,7 +260,9 @@ class AdminResetPasswordResponse(BaseModel):
     user_id: UUID
     name: str
     username: Optional[str] = None
+    email: Optional[str] = None
     temp_password: str
+    temp_pin: str
 
 
 class ChangeMyPasswordPayload(BaseModel):

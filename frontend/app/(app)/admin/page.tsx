@@ -45,6 +45,8 @@ interface AdminCoordinator {
   status: string;
   cargo: string | null;
   cpf_masked: string;
+  cpf: string | null;
+  email: string | null;
   username: string | null;
   phone: string | null;
   units: CoordUnit[];
@@ -458,8 +460,11 @@ function CoordinatorRow({
             {coord.cargo ?? 'Coordenador'}
             {coord.username ? ` · @${coord.username}` : ''}
           </p>
+          <p className="truncate text-xs text-text-secondary">
+            {coord.email ?? 'sem e-mail'}
+          </p>
           <p className="truncate text-xs text-text-tertiary">
-            CPF {coord.cpf_masked}
+            CPF {coord.cpf ?? coord.cpf_masked}
             {phone ? ` · ${phone}` : ''} · desde {created}
           </p>
         </div>

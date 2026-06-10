@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
@@ -67,6 +67,19 @@ def _safe_cpf_masked(cpf_encrypted: str | None) -> str:
         return mask_cpf(decrypt_cpf(cpf_encrypted))
     except Exception:  # noqa: BLE001
         return "***.***.***-**"
+
+
+def _safe_cpf_full(cpf_encrypted: str | None) -> Optional[str]:
+    """Full, formatted CPF for the admin-only management screen (admin auth required)."""
+    if not cpf_encrypted:
+        return None
+    try:
+        d = decrypt_cpf(cpf_encrypted)
+        if d and len(d) == 11:
+            return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}"
+        return d or None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _user_public(row: dict[str, Any]) -> UserPublic:
@@ -637,6 +650,8 @@ def list_unit_members_endpoint(
             phone=r.get("phone"),
             photo_url=r.get("photo_url"),
             cpf_masked=_safe_cpf_masked(r.get("cpf_encrypted")),
+            cpf=_safe_cpf_full(r.get("cpf_encrypted")),
+            email=r.get("email"),
             username=r.get("username"),
             must_change_password=bool(r.get("must_change_password")),
             created_at=r["created_at"],
@@ -660,6 +675,8 @@ def list_coordinators_endpoint(
             status=r["status"],
             cargo=r.get("cargo"),
             cpf_masked=_safe_cpf_masked(r.get("cpf_encrypted")),
+            cpf=_safe_cpf_full(r.get("cpf_encrypted")),
+            email=r.get("email"),
             username=r.get("username"),
             phone=r.get("phone"),
             units=[

@@ -783,7 +783,7 @@ def list_coordinators(conn) -> list[dict[str, Any]]:
         cur.execute(
             """
             SELECT u.id, u.name, u.status, u.cargo, u.cpf_encrypted, u.username,
-                   u.phone, u.unit_id, u.created_at, u.approved_at,
+                   u.email, u.phone, u.unit_id, u.created_at, u.approved_at,
                    COALESCE(
                        json_agg(
                            json_build_object('id', un.id, 'name', un.canonical_name)
@@ -922,7 +922,7 @@ def list_unit_members(conn, unit_id: UUID | str) -> list[dict[str, Any]]:
         cur.execute(
             """
             SELECT id, name, role, cargo, coren_crm, phone, photo_url, status,
-                   unit_id, cpf_encrypted, username, must_change_password,
+                   unit_id, cpf_encrypted, username, email, must_change_password,
                    created_at, approved_at
               FROM users
              WHERE unit_id = %s AND role IN ('coordinator', 'professional')
@@ -947,19 +947,26 @@ def _generate_temp_numeric_password() -> str:
     return f"{secrets.randbelow(1_000_000):06d}"
 
 
+def _generate_temp_pin() -> str:
+    """4-digit zero-padded numeric PIN for a temporary plantão credential."""
+    return f"{secrets.randbelow(10_000):04d}"
+
+
 def admin_reset_user_password(
     conn, admin: dict[str, Any], user_id: UUID | str
 ) -> dict[str, Any]:
-    """Generate a temporary numeric password for a user. Sets must_change_password.
+    """Reset a user's password AND PIN to temporary values. Sets must_change_password.
 
-    Returns ``{user_id, name, username, temp_password}``. Plaintext password is
-    only returned this one time — caller must surface it to the admin and never
-    persist it.
+    Both credentials are reset because self-pair (the operator login) requires
+    password + PIN: resetting only the password leaves a coordinator who forgot
+    the PIN still locked out. Returns ``{user_id, name, username, email,
+    temp_password, temp_pin}``. Plaintext values are only returned this one time —
+    caller must surface them to the admin and never persist them.
     """
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id, name, role, status, username
+            SELECT id, name, role, status, username, email
               FROM users
              WHERE id = %s
             """,
@@ -977,22 +984,27 @@ def admin_reset_user_password(
         )
 
     temp_password = _generate_temp_numeric_password()
+    temp_pin = _generate_temp_pin()
     new_hash = crypto.hash_password(temp_password)
+    new_pin_hash = crypto.hash_pin(temp_pin)
     with conn.cursor() as cur:
         cur.execute(
             """
             UPDATE users
                SET password_hash = %s,
+                   pin_hash = %s,
                    must_change_password = TRUE
              WHERE id = %s
             """,
-            (new_hash, str(user_id)),
+            (new_hash, new_pin_hash, str(user_id)),
         )
     return {
         "user_id": str(user["id"]),
         "name": user["name"],
         "username": user.get("username"),
+        "email": user.get("email"),
         "temp_password": temp_password,
+        "temp_pin": temp_pin,
     }
 
 

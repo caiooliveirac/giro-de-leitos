@@ -46,6 +46,8 @@ interface UnitMember {
   phone: string | null;
   photo_url: string | null;
   cpf_masked: string;
+  cpf: string | null;
+  email: string | null;
   username: string | null;
   must_change_password: boolean;
   created_at: string;
@@ -56,7 +58,9 @@ interface ResetPasswordResponse {
   user_id: string;
   name: string;
   username: string | null;
+  email: string | null;
   temp_password: string;
+  temp_pin: string;
 }
 
 interface CoordPendingUser {
@@ -611,18 +615,35 @@ function MemberList({
                 {m.cargo ?? '—'}
                 {m.coren_crm ? ` · ${m.coren_crm}` : ''}
               </p>
-              {showLogin && (
-                <p className="truncate text-[11px] font-medium text-text-secondary">
-                  Login:{' '}
-                  <span className="font-mono tabular-nums text-text-primary">
-                    {m.username ?? m.cpf_masked}
-                  </span>
+              {showLogin ? (
+                <div className="mt-0.5 space-y-0.5 text-[11px] text-text-secondary">
+                  <p className="truncate">
+                    E-mail:{' '}
+                    <span className="font-mono text-text-primary">{m.email ?? '—'}</span>
+                  </p>
+                  <p className="truncate">
+                    Usuário:{' '}
+                    <span className="font-mono text-text-primary">{m.username ?? '—'}</span>
+                  </p>
+                  <p className="truncate">
+                    CPF:{' '}
+                    <span className="font-mono tabular-nums text-text-primary">
+                      {m.cpf ?? m.cpf_masked}
+                    </span>
+                  </p>
+                  {m.phone && (
+                    <p className="truncate">
+                      Tel:{' '}
+                      <span className="font-mono tabular-nums text-text-primary">{m.phone}</span>
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <p className="truncate text-[11px] text-text-tertiary">
+                  CPF {m.cpf_masked}
+                  {m.phone ? ` · ${m.phone}` : ''}
                 </p>
               )}
-              <p className="truncate text-[11px] text-text-tertiary">
-                CPF {m.cpf_masked}
-                {m.phone ? ` · ${m.phone}` : ''}
-              </p>
             </div>
             <div className="flex shrink-0 items-center gap-2">{actions(m)}</div>
           </div>
@@ -778,23 +799,30 @@ function ResetPasswordModal({
 }) {
   const toast = useToast();
 
+  const loginLabel = result ? result.email ?? result.username ?? 'seu CPF' : '';
+
   const copyPair = async () => {
     if (!result) return;
-    const text = result.username
-      ? `Login: ${result.username}\nSenha temporária: ${result.temp_password}`
-      : `Senha temporária: ${result.temp_password}`;
+    const text =
+      `Acesso Giro de Leitos\n` +
+      `Login: ${loginLabel}\n` +
+      `Senha temporária: ${result.temp_password}\n` +
+      `PIN temporário: ${result.temp_pin}\n\n` +
+      `Você precisará trocar a senha no primeiro login.`;
     try {
       await navigator.clipboard.writeText(text);
-      toast.success('Login e senha copiados');
+      toast.success('Login, senha e PIN copiados');
     } catch {
       toast.error('Não foi possível copiar');
     }
   };
 
   const waText = result
-    ? result.username
-      ? `Acesso Giro:%0ALogin: ${result.username}%0ASenha temporária: ${result.temp_password}%0A%0AVocê precisará trocar a senha no primeiro login.`
-      : `Senha temporária Giro: ${result.temp_password}%0A%0AVocê precisará trocar a senha no primeiro login.`
+    ? `Acesso Giro de Leitos%0A` +
+      `Login: ${loginLabel}%0A` +
+      `Senha temporária: ${result.temp_password}%0A` +
+      `PIN temporário: ${result.temp_pin}%0A%0A` +
+      `Você precisará trocar a senha no primeiro login.`
     : '';
   const waUrl = result ? `https://wa.me/?text=${waText}` : '#';
 
@@ -821,11 +849,11 @@ function ResetPasswordModal({
             <div className="flex items-start justify-between gap-3">
               <div>
                 <h3 className="text-lg font-semibold text-text-primary">
-                  Senha temporária gerada
+                  Senha e PIN temporários
                 </h3>
                 <p className="mt-1 text-xs text-text-secondary">
                   Para <strong>{result.name}</strong>. Anote ou envie agora — não vamos
-                  mostrar essa senha de novo.
+                  mostrar de novo.
                 </p>
               </div>
               <button
@@ -844,20 +872,34 @@ function ResetPasswordModal({
                   Login
                 </p>
                 <p className="mt-0.5 font-mono text-sm font-semibold text-text-primary">
-                  {result.username ?? '(usar CPF ou e-mail)'}
+                  {result.email ?? result.username ?? '(usar CPF)'}
+                </p>
+                <p className="mt-0.5 text-[11px] text-text-tertiary">
+                  Também serve CPF{result.username ? ' ou usuário' : ''}.
                 </p>
               </div>
-              <div className="rounded-card border border-accent-blue/30 bg-accent-blue/5 px-3 py-3">
-                <p className="text-[11px] uppercase tracking-wide text-accent-blue">
-                  Senha temporária
-                </p>
-                <p className="mt-0.5 font-mono text-2xl font-semibold tabular-nums tracking-[0.2em] text-text-primary">
-                  {result.temp_password}
-                </p>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="rounded-card border border-accent-blue/30 bg-accent-blue/5 px-3 py-3">
+                  <p className="text-[11px] uppercase tracking-wide text-accent-blue">
+                    Senha temporária
+                  </p>
+                  <p className="mt-0.5 font-mono text-2xl font-semibold tabular-nums tracking-[0.15em] text-text-primary">
+                    {result.temp_password}
+                  </p>
+                </div>
+                <div className="rounded-card border border-accent-blue/30 bg-accent-blue/5 px-3 py-3">
+                  <p className="text-[11px] uppercase tracking-wide text-accent-blue">
+                    PIN temporário
+                  </p>
+                  <p className="mt-0.5 font-mono text-2xl font-semibold tabular-nums tracking-[0.15em] text-text-primary">
+                    {result.temp_pin}
+                  </p>
+                </div>
               </div>
               <p className="flex items-start gap-1.5 text-[11px] text-warning-ink">
                 <AlertTriangle size={12} className="mt-0.5 shrink-0" aria-hidden />
-                No próximo login, vai ser obrigatório escolher uma nova senha.
+                Senha + PIN são usados para entrar; no próximo login, vai ser obrigatório
+                escolher uma nova senha.
               </p>
             </div>
 
