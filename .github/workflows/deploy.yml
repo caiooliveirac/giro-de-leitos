@@ -107,11 +107,14 @@ jobs:
               echo "WARN: .deploy-env ausente, pulando backup"
               exit 0
             fi
-            # shellcheck disable=SC1091
-            set -a
-            source /home/ubuntu/giro-de-leitos/.deploy-env
-            set +a
-            DUMP_URL=$(echo "$DATABASE_URL" | sed 's|host.docker.internal|127.0.0.1|g')
+            # Extrai só o DATABASE_URL sem dar `source` no arquivo: .deploy-env
+            # é formato docker --env-file (KEY=VALUE literal, valores podem ter
+            # espaços p.ex. SMTP_PASS/SMTP_FROM) e NÃO é um script shell válido.
+            DUMP_URL=$(grep -E '^DATABASE_URL=' /home/ubuntu/giro-de-leitos/.deploy-env | head -1 | cut -d= -f2- | tr -d '\r' | sed 's|host.docker.internal|127.0.0.1|g')
+            if [ -z "$DUMP_URL" ]; then
+              echo "WARN: DATABASE_URL ausente no .deploy-env, pulando backup"
+              exit 0
+            fi
             pg_dump "$DUMP_URL" | gzip > /home/ubuntu/giro-backups/db-$ts.sql.gz
             ls -t /home/ubuntu/giro-backups/db-*.sql.gz | tail -n +8 | xargs -r rm
             echo "backup: db-$ts.sql.gz ($(du -h /home/ubuntu/giro-backups/db-$ts.sql.gz | cut -f1))"
