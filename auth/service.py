@@ -468,7 +468,16 @@ def create_invite(
         if creator_role not in ("coordinator", "admin"):
             raise HTTPException(status_code=403, detail="Sem permissão.")
         if creator_role == "coordinator":
-            unit_id = str(created_by["unit_id"]) if created_by.get("unit_id") else None
+            # Coordenador multi-UPA: pode convidar para qualquer UPA do seu
+            # conjunto autorizado (coordinator_units + primária). Sem alvo
+            # explícito, cai na primária — comportamento anterior.
+            allowed = unit_ids_for_user(conn, creator_id, created_by.get("unit_id"))
+            if target_unit_id:
+                unit_id = str(target_unit_id)
+                if unit_id not in allowed:
+                    raise HTTPException(status_code=403, detail="UPA fora do seu conjunto.")
+            else:
+                unit_id = str(created_by["unit_id"]) if created_by.get("unit_id") else None
             if not unit_id:
                 raise HTTPException(status_code=400, detail="Coordenador sem unidade vinculada.")
         else:
@@ -700,6 +709,30 @@ def unit_ids_for_user(
     if primary_unit_id:
         ids.add(str(primary_unit_id))
     return ids
+
+
+def list_my_units(conn, user: dict[str, Any]) -> list[dict[str, Any]]:
+    """UPAs que o operador logado pode visualizar/gerenciar, com nome e flag de
+    primária. Base do seletor de UPA do coordenador multi-UPA no frontend."""
+    primary = str(user["unit_id"]) if user.get("unit_id") else None
+    ids = unit_ids_for_user(conn, user["id"], primary)
+    if not ids:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, canonical_name
+              FROM units
+             WHERE id::text = ANY(%s)
+             ORDER BY canonical_name ASC
+            """,
+            (list(ids),),
+        )
+        rows = cur.fetchall() or []
+    return [
+        {"id": r["id"], "name": r["canonical_name"], "is_primary": str(r["id"]) == primary}
+        for r in rows
+    ]
 
 
 def _ensure_approver_can_act(conn, approver: dict[str, Any], target: dict[str, Any]) -> None:

@@ -223,6 +223,18 @@ class CoordinatorUnit(BaseModel):
     name: str
 
 
+class MyUnit(BaseModel):
+    """UPA que o operador logado pode visualizar/gerenciar.
+
+    Para coordenadores é a união de ``coordinator_units`` com a unidade primária;
+    ``is_primary`` marca a unidade default da sessão.
+    """
+
+    id: UUID
+    name: str
+    is_primary: bool = False
+
+
 class AdminCoordinator(BaseModel):
     id: UUID
     name: str

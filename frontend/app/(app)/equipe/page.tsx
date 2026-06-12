@@ -17,10 +17,12 @@ import {
 import { apiFetch, ApiError, type PairingCodeResponse } from '@/lib/api';
 import { useToast } from '@/lib/toast';
 import { useCurrentUser } from '@/hooks/useCurrentUser';
+import { useMyUnits } from '@/hooks/useMyUnits';
 import { TopBar } from '@/components/shared/TopBar';
 import { OfflineBanner } from '@/components/shared/OfflineBanner';
 import { ToastViewport } from '@/components/shared/ToastViewport';
 import { UnitPicker } from '@/components/admin/UnitPicker';
+import { UnitSwitcher } from '@/components/shared/UnitSwitcher';
 import { qrImageUrl } from '@/lib/qr';
 
 const ADMIN_VIEW_KEY = 'gl_admin_viewing_unit';
@@ -413,30 +415,45 @@ function CoordinatorEquipe({
   const [staff, setStaff] = useState<CoordStaffUser[]>([]);
   const [invite, setInvite] = useState<InviteCreateResponse | null>(null);
   const [busy, setBusy] = useState(false);
+  const { units, selected, setSelected } = useMyUnits(unitId);
+
+  // UPA ativa: a selecionada (coordenador multi-UPA) ou a primária.
+  const activeUnit = selected ?? unitId;
 
   const load = useCallback(async () => {
     try {
+      const staffPath = activeUnit
+        ? `/api/auth/me/unit/staff?unit_id=${encodeURIComponent(activeUnit)}`
+        : '/api/auth/me/unit/staff';
       const [p, s] = await Promise.all([
         apiFetch<CoordPendingUser[]>('/api/users/pending'),
-        apiFetch<CoordStaffUser[]>('/api/auth/me/unit/staff'),
+        apiFetch<CoordStaffUser[]>(staffPath),
       ]);
       setPending(p);
       setStaff(s);
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : 'Falha ao carregar equipe');
     }
-  }, [toast]);
+  }, [toast, activeUnit]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Trocar de UPA descarta o convite/QR da UPA anterior.
+  useEffect(() => {
+    setInvite(null);
+  }, [activeUnit]);
 
   const generateInvite = async () => {
     setBusy(true);
     try {
       const res = await apiFetch<InviteCreateResponse>('/api/invites', {
         method: 'POST',
-        body: JSON.stringify({ type: 'professional' }),
+        body: JSON.stringify({
+          type: 'professional',
+          ...(activeUnit ? { target_unit_id: activeUnit } : {}),
+        }),
       });
       setInvite(res);
       toast.success('Convite gerado');
@@ -468,11 +485,14 @@ function CoordinatorEquipe({
     }
   };
 
+  const activeName = units.find((u) => u.id === activeUnit)?.name ?? 'Equipe da UPA';
+
   return (
     <>
       <OfflineBanner />
-      <TopBar unitName="Equipe da UPA" shiftLabel={userName} />
+      <TopBar unitName={activeName} shiftLabel={userName} />
       <main className="mx-auto w-full max-w-[520px] px-4 pb-24 pt-4">
+        <UnitSwitcher units={units} value={activeUnit} onChange={setSelected} />
         <Section title="Convidar profissional" subtitle="Link com QR válido por 7 dias">
           <div className="rounded-card border border-border bg-card p-4">
             {!invite && (
@@ -493,7 +513,7 @@ function CoordinatorEquipe({
           title="Adicionar aparelho"
           subtitle="Gera código de 6 dígitos para parear um tablet"
         >
-          <PairingCodeBlock unitId={unitId} />
+          <PairingCodeBlock unitId={activeUnit} />
         </Section>
 
         <Section title="Pendentes" subtitle="Toque ✓ pra aprovar. Segure ✗ pra rejeitar.">

@@ -16,11 +16,13 @@ import {
 import { SECTORS, type SectorKey } from '@/lib/sectors';
 import { useToast } from '@/lib/toast';
 import { useCurrentUser } from '@/hooks/useCurrentUser';
+import { useMyUnits } from '@/hooks/useMyUnits';
 import { useUnitState } from '@/hooks/useUnitState';
 import { TopBar } from '@/components/shared/TopBar';
 import { OfflineBanner } from '@/components/shared/OfflineBanner';
 import { ToastViewport } from '@/components/shared/ToastViewport';
 import { UnitPicker } from '@/components/admin/UnitPicker';
+import { UnitSwitcher } from '@/components/shared/UnitSwitcher';
 import { RedRoomBed } from '@/components/beds/RedRoomBed';
 import { CounterSector } from '@/components/beds/CounterSector';
 import { SpecialistCard } from '@/components/beds/SpecialistCard';
@@ -151,6 +153,7 @@ function AdminHome() {
 function ShiftHome({ unitId, userName }: { unitId: string | null; userName: string }) {
   const router = useRouter();
   const [cachedName, setCachedName] = useState<string | null>(null);
+  const { units, selected, setSelected } = useMyUnits(unitId);
 
   useEffect(() => {
     try {
@@ -166,12 +169,18 @@ function ShiftHome({ unitId, userName }: { unitId: string | null; userName: stri
 
   if (!unitId) return null;
 
+  // Coordenador multi-UPA pode trocar a UPA em exibição; cai na primária.
+  const activeUnit = selected ?? unitId;
+  const activeName =
+    units.find((u) => u.id === activeUnit)?.name ?? cachedName ?? 'Plantão';
+
   return (
     <>
       <OfflineBanner />
-      <TopBar unitName={cachedName ?? 'Plantão'} shiftLabel={userName} />
+      <TopBar unitName={activeName} shiftLabel={userName} />
       <main className="mx-auto w-full max-w-[520px] px-4 pb-24 pt-4">
-        <UnitGiro unitId={unitId} />
+        <UnitSwitcher units={units} value={activeUnit} onChange={setSelected} />
+        <UnitGiro unitId={activeUnit} />
       </main>
       <ToastViewport />
     </>

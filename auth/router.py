@@ -8,7 +8,7 @@ import re
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response, status
 
 from auth import service
 from auth.audit import record_audit
@@ -50,6 +50,7 @@ from auth.schemas import (
     InviteCreateResponse,
     InviteListItem,
     InvitePreview,
+    MyUnit,
     PendingUser,
     PinVerify,
     ResetPasswordPayload,
@@ -208,7 +209,8 @@ def device_generate_code(
         except HTTPException as exc:
             raise HTTPException(status_code=401, detail="Não autorizado.") from exc
         user = ctx["user"]
-        if user["role"] != "coordinator" or str(user.get("unit_id")) != str(payload.unit_id):
+        allowed = service.unit_ids_for_user(conn, user["id"], user.get("unit_id"))
+        if user["role"] != "coordinator" or str(payload.unit_id) not in allowed:
             raise HTTPException(status_code=403, detail="Sem permissão.")
         actor = user
 
@@ -341,12 +343,53 @@ def device_self_pair(
 # ---------------------------------------------------------------------------
 # Staff visible on a device
 # ---------------------------------------------------------------------------
+@router.get("/auth/me/units", response_model=list[MyUnit])
+def list_my_units_endpoint(request: Request, conn=Depends(get_db)):
+    """UPAs que o operador logado (admin ou coordenador) pode visualizar.
+
+    Para coordenador multi-UPA, retorna a união de ``coordinator_units`` com a
+    primária — base do seletor de UPA no frontend. Admin (sem UPA própria)
+    recebe lista vazia; profissional recebe só a primária.
+    """
+    try:
+        user = get_current_admin(request=request, conn=conn)  # type: ignore[arg-type]
+    except HTTPException:
+        ctx = get_current_session(  # type: ignore[arg-type]
+            request=request,
+            conn=conn,
+            device=get_device_context(request=request, conn=conn),
+        )
+        user = ctx["user"]
+    return [MyUnit(**u) for u in service.list_my_units(conn, user)]
+
+
 @router.get("/auth/me/unit/staff")
 def list_my_unit_staff(
+    request: Request,
+    unit_id: UUID | None = Query(default=None),
     device=Depends(get_device_context),
     conn=Depends(get_db),
 ):
-    rows = service.list_unit_staff(conn, device["unit_id"])
+    # Default: UPA pareada do aparelho (comportamento original). Um coordenador
+    # multi-UPA (ou admin) pode pedir outra UPA via ?unit_id=, desde que ela
+    # esteja no seu conjunto autorizado.
+    target = str(unit_id) if unit_id else device["unit_id"]
+    if target != device["unit_id"]:
+        authorized = False
+        try:
+            get_current_admin(request=request, conn=conn)  # type: ignore[arg-type]
+            authorized = True
+        except HTTPException:
+            ctx = get_current_session(  # type: ignore[arg-type]
+                request=request, conn=conn, device=device
+            )
+            allowed = service.unit_ids_for_user(
+                conn, ctx["user"]["id"], ctx["user"].get("unit_id")
+            )
+            authorized = target in allowed
+        if not authorized:
+            raise HTTPException(status_code=403, detail="UPA fora do seu conjunto.")
+    rows = service.list_unit_staff(conn, target)
     return [_user_public(r).model_dump(mode="json") for r in rows]
 
 
