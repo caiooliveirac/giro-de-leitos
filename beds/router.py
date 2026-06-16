@@ -111,9 +111,15 @@ def get_unit_mutation_access(
     ctx = get_current_session(request=request, conn=conn, device=device)  # type: ignore[arg-type]
     user = ctx["user"]
     member_units = unit_ids_for_user(conn, user["id"], user.get("unit_id"))
-    if user["role"] != "admin" and member_units and str(unit_id) not in member_units:
+    is_admin = user["role"] == "admin"
+    # Coordenador multi-UPA autorizado na UPA-alvo (via coordinator_units/primária)
+    # pode gerir a partir de um único aparelho pareado.
+    authorized_member = bool(member_units) and str(unit_id) in member_units
+    if not is_admin and member_units and str(unit_id) not in member_units:
         raise HTTPException(status_code=403, detail="Usuário não pertence à unidade.")
-    if device["unit_id"] != str(unit_id) and user["role"] != "admin":
+    # Só exigimos device==unit quando não há autorização explícita por unidade
+    # (ex.: profissional preso ao aparelho da própria UPA).
+    if device["unit_id"] != str(unit_id) and not is_admin and not authorized_member:
         raise HTTPException(status_code=403, detail="Dispositivo não pertence à unidade.")
     return {
         "actor": user,

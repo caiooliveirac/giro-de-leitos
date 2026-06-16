@@ -951,7 +951,12 @@ def list_unit_staff(conn, unit_id: UUID | str) -> list[dict[str, Any]]:
 
 
 def list_unit_members(conn, unit_id: UUID | str) -> list[dict[str, Any]]:
-    """All users (any status) tied to a unit. For admin team management."""
+    """All users (any status) tied to a unit. For admin team management.
+
+    Inclui quem tem a UPA como primária (``users.unit_id``) **e** os
+    coordenadores multi-UPA vinculados via ``coordinator_units`` — sem isso, um
+    coordenador cuja primária é outra UPA não aparecia na equipe desta.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -959,7 +964,13 @@ def list_unit_members(conn, unit_id: UUID | str) -> list[dict[str, Any]]:
                    unit_id, cpf_encrypted, username, email, must_change_password,
                    created_at, approved_at
               FROM users
-             WHERE unit_id = %s AND role IN ('coordinator', 'professional')
+             WHERE role IN ('coordinator', 'professional')
+               AND (
+                   unit_id = %s
+                   OR id IN (
+                       SELECT user_id FROM coordinator_units WHERE unit_id = %s
+                   )
+               )
              ORDER BY
                 CASE status
                     WHEN 'pending' THEN 0
@@ -969,7 +980,7 @@ def list_unit_members(conn, unit_id: UUID | str) -> list[dict[str, Any]]:
                 END,
                 name ASC
             """,
-            (str(unit_id),),
+            (str(unit_id), str(unit_id)),
         )
         return cur.fetchall()
 
