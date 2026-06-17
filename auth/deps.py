@@ -38,7 +38,13 @@ DEVICE_TOKEN_TTL = timedelta(days=90)
 # tablet em uso nunca expira; só cai se ficar ~90 dias sem uso. O limiar evita
 # escrever no banco em toda requisição (no máx. uma renovação a cada ~45 dias).
 DEVICE_TOKEN_RENEW_WINDOW = DEVICE_TOKEN_TTL / 2
-SHIFT_TOKEN_TTL = timedelta(hours=12)
+# Sessão não expira por tempo: "logou, está logado". A sessão persiste como o
+# pareamento do dispositivo — validade longa com janela deslizante, renovada por
+# uso (ver get_current_session). Não há conceito de "plantão" que caduca; o que
+# protege escritas sensíveis é o PIN de 4 dígitos (require_pin_confirm), não a
+# expiração da sessão.
+SHIFT_TOKEN_TTL = DEVICE_TOKEN_TTL
+SHIFT_TOKEN_RENEW_WINDOW = SHIFT_TOKEN_TTL / 2
 PAIRING_CODE_TTL = timedelta(minutes=10)
 
 COOKIE_ADMIN = "admin_token"
@@ -272,6 +278,7 @@ def get_current_session(
     request: Request,
     conn=Depends(get_db),
     device=Depends(get_device_context),
+    response: Response = None,
 ) -> dict[str, Any]:
     raw = _read_cookie(request, COOKIE_SESSION)
     if not raw:
@@ -306,6 +313,26 @@ def get_current_session(
         raise HTTPException(status_code=401, detail="Usuário inativo.")
     if user["unit_id"] and str(user["unit_id"]) != device["unit_id"]:
         raise HTTPException(status_code=403, detail="Usuário não pertence à unidade do dispositivo.")
+    # Janela deslizante: enquanto a sessão estiver em uso, empurramos a expiração
+    # pra frente e reemitimos o cookie. Assim "logou, está logado" — a sessão só
+    # cai após ~90 dias de inatividade. Só renova quando há ``response`` pra
+    # reemitir o cookie (senão banco e cookie ficam dessincronizados) e quando
+    # passou do meio da janela, evitando escrever no banco a cada requisição.
+    now = datetime.now(timezone.utc)
+    needs_renew = sess["expires_at"] is None or (sess["expires_at"] - now) < SHIFT_TOKEN_RENEW_WINDOW
+    if response is not None and needs_renew:
+        new_expires = now + SHIFT_TOKEN_TTL
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE auth_sessions SET expires_at = %s WHERE id = %s",
+                (new_expires, str(sess["id"])),
+            )
+        token = encode_token(
+            {"scope": "shift", "session_id": str(sess["id"]), "sub": str(sess["user_id"])},
+            SHIFT_TOKEN_TTL,
+        )
+        set_session_cookie(response, token)
+        sess["expires_at"] = new_expires
     return {"session": sess, "user": user, "device": device}
 
 

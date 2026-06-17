@@ -188,6 +188,7 @@ def admin_logout(response: Response):
 def device_generate_code(
     payload: DeviceGenerateCodeRequest,
     request: Request,
+    response: Response,
     conn=Depends(get_db),
 ):
     # Authorization: admin OR coordinator of the target unit.
@@ -205,6 +206,7 @@ def device_generate_code(
                 request=request,
                 conn=conn,
                 device=get_device_context(request=request, conn=conn),
+                response=response,
             )
         except HTTPException as exc:
             raise HTTPException(status_code=401, detail="Não autorizado.") from exc
@@ -344,7 +346,7 @@ def device_self_pair(
 # Staff visible on a device
 # ---------------------------------------------------------------------------
 @router.get("/auth/me/units", response_model=list[MyUnit])
-def list_my_units_endpoint(request: Request, conn=Depends(get_db)):
+def list_my_units_endpoint(request: Request, response: Response, conn=Depends(get_db)):
     """UPAs que o operador logado (admin ou coordenador) pode visualizar.
 
     Para coordenador multi-UPA, retorna a união de ``coordinator_units`` com a
@@ -358,6 +360,7 @@ def list_my_units_endpoint(request: Request, conn=Depends(get_db)):
             request=request,
             conn=conn,
             device=get_device_context(request=request, conn=conn),
+            response=response,
         )
         user = ctx["user"]
     return [MyUnit(**u) for u in service.list_my_units(conn, user)]
@@ -366,6 +369,7 @@ def list_my_units_endpoint(request: Request, conn=Depends(get_db)):
 @router.get("/auth/me/unit/staff")
 def list_my_unit_staff(
     request: Request,
+    response: Response,
     unit_id: UUID | None = Query(default=None),
     device=Depends(get_device_context),
     conn=Depends(get_db),
@@ -381,7 +385,7 @@ def list_my_unit_staff(
             authorized = True
         except HTTPException:
             ctx = get_current_session(  # type: ignore[arg-type]
-                request=request, conn=conn, device=device
+                request=request, conn=conn, device=device, response=response
             )
             allowed = service.unit_ids_for_user(
                 conn, ctx["user"]["id"], ctx["user"].get("unit_id")
@@ -476,8 +480,13 @@ def pin_verify(
 def _current_inviter(
     request: Request,
     conn,
+    response: Response = None,
 ) -> dict[str, Any]:
-    """Admin OR active coordinator session — both can create invites."""
+    """Admin OR coordinator session — both can create invites.
+
+    ``response`` é repassado pra que a sessão de plantão seja renovada por uso
+    (janela deslizante): enquanto o coordenador usa o painel, ela nunca expira.
+    """
     try:
         admin = get_current_admin(request=request, conn=conn)  # type: ignore[arg-type]
         return admin
@@ -487,6 +496,7 @@ def _current_inviter(
         request=request,
         conn=conn,
         device=get_device_context(request=request, conn=conn),
+        response=response,
     )
     if ctx["user"]["role"] not in ("coordinator", "admin"):
         raise HTTPException(status_code=403, detail="Sem permissão.")
@@ -497,9 +507,10 @@ def _current_inviter(
 def create_invite_endpoint(
     payload: InviteCreate,
     request: Request,
+    response: Response,
     conn=Depends(get_db),
 ):
-    inviter = _current_inviter(request, conn)
+    inviter = _current_inviter(request, conn, response)
     row = service.create_invite(
         conn,
         created_by=inviter,
@@ -532,8 +543,8 @@ def create_invite_endpoint(
 
 
 @router.get("/invites", response_model=list[InviteListItem])
-def list_invites_endpoint(request: Request, conn=Depends(get_db)):
-    user = _current_inviter(request, conn)
+def list_invites_endpoint(request: Request, response: Response, conn=Depends(get_db)):
+    user = _current_inviter(request, conn, response)
     rows = service.list_invites(conn, user=user)
     return [InviteListItem(**r) for r in rows]
 
@@ -571,8 +582,8 @@ def accept_invite_endpoint(
 
 
 @router.post("/invites/{invite_id}/revoke")
-def revoke_invite_endpoint(invite_id: UUID, request: Request, conn=Depends(get_db)):
-    user = _current_inviter(request, conn)
+def revoke_invite_endpoint(invite_id: UUID, request: Request, response: Response, conn=Depends(get_db)):
+    user = _current_inviter(request, conn, response)
     service.revoke_invite(conn, user=user, invite_id=invite_id)
     record_audit(
         conn,
@@ -589,8 +600,8 @@ def revoke_invite_endpoint(invite_id: UUID, request: Request, conn=Depends(get_d
 # Approval
 # ---------------------------------------------------------------------------
 @router.get("/users/pending", response_model=list[PendingUser])
-def list_pending_endpoint(request: Request, conn=Depends(get_db)):
-    user = _current_inviter(request, conn)
+def list_pending_endpoint(request: Request, response: Response, conn=Depends(get_db)):
+    user = _current_inviter(request, conn, response)
     rows = service.list_pending(conn, user)
     return [_pending_user(r) for r in rows]
 
@@ -599,10 +610,11 @@ def list_pending_endpoint(request: Request, conn=Depends(get_db)):
 def approve_user_endpoint(
     user_id: UUID,
     request: Request,
+    response: Response,
     payload: ApproveRequest | None = Body(default=None),
     conn=Depends(get_db),
 ):
-    approver = _current_inviter(request, conn)
+    approver = _current_inviter(request, conn, response)
     unit_id = payload.unit_id if payload else None
     result = service.approve_user(conn, approver, user_id, unit_id=unit_id)
     record_audit(
@@ -628,8 +640,8 @@ def approve_user_endpoint(
 
 
 @router.post("/users/{user_id}/reject", response_model=ApproveResponse)
-def reject_user_endpoint(user_id: UUID, request: Request, conn=Depends(get_db)):
-    approver = _current_inviter(request, conn)
+def reject_user_endpoint(user_id: UUID, request: Request, response: Response, conn=Depends(get_db)):
+    approver = _current_inviter(request, conn, response)
     result = service.reject_user(conn, approver, user_id)
     record_audit(
         conn,
@@ -916,8 +928,8 @@ def reset_password_endpoint(
 
 
 @router.post("/users/{user_id}/suspend", response_model=ApproveResponse)
-def suspend_user_endpoint(user_id: UUID, request: Request, conn=Depends(get_db)):
-    approver = _current_inviter(request, conn)
+def suspend_user_endpoint(user_id: UUID, request: Request, response: Response, conn=Depends(get_db)):
+    approver = _current_inviter(request, conn, response)
     result = service.suspend_user(conn, approver, user_id)
     record_audit(
         conn,
