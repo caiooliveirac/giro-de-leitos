@@ -140,6 +140,9 @@ manager = ConnectionManager()
 app.state.last_dashboard_event = None
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "").strip()
+# Alertas de admin podem sair por um bot diferente do bot interativo/webhook
+# (o usuário acompanha o bot "Giro de Leitos"; o Age fica só para o webhook)
+TELEGRAM_ALERT_BOT_TOKEN = os.getenv("TELEGRAM_ALERT_BOT_TOKEN", "").strip() or TELEGRAM_BOT_TOKEN
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://mnrs.com.br").rstrip("/")
 PUBLIC_WEBHOOK_PATH = os.getenv("PUBLIC_WEBHOOK_PATH", "/giro/api/webhook/telegram").strip() or "/giro/api/webhook/telegram"
@@ -342,7 +345,7 @@ async def _stale_units_watcher() -> None:
 
 def _notify_admin_telegram(message: str) -> None:
     """Envia alerta para o chat do admin no Telegram."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_CHAT_ID:
+    if not TELEGRAM_ALERT_BOT_TOKEN or not TELEGRAM_ADMIN_CHAT_ID:
         return
     try:
         payload = json.dumps({
@@ -351,7 +354,7 @@ def _notify_admin_telegram(message: str) -> None:
             "parse_mode": "HTML",
         }).encode("utf-8")
         req = request.Request(
-            url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            url=f"https://api.telegram.org/bot{TELEGRAM_ALERT_BOT_TOKEN}/sendMessage",
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
