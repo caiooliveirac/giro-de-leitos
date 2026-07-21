@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import os
+from html import escape as html_escape
 from urllib import error, request
 from datetime import datetime, timezone
 from typing import Any
@@ -17,7 +19,7 @@ from pydantic import BaseModel, Field
 from db import get_dashboard_metrics, get_latest_events, get_latest_status_by_unit, get_parsed_event, get_pending_unit_confirmations, get_recent_alerts, get_registered_units, init_db, is_database_configured, resolve_pending_unit_confirmation, save_event, update_unit_reported_at, delete_event, admin_update_event, get_event_detail
 from auth.deps import get_current_admin
 from parser_service import parse_whatsapp_message
-from units import resolve_unit_from_text, resolve_unit_name
+from units import normalize_unit_text, resolve_unit_from_text, resolve_unit_name
 
 
 FIXED_NO_YELLOW_UNIT_CODES = {
@@ -147,6 +149,7 @@ PUBLIC_WEBHOOK_PATH = os.getenv("PUBLIC_WEBHOOK_PATH", "/giro/api/webhook/telegr
 async def startup_event() -> None:
     if is_database_configured():
         await run_in_threadpool(init_db)
+    asyncio.create_task(_stale_units_watcher())
 
 
 def build_dashboard_event(
@@ -250,45 +253,91 @@ async def publish_event(event: dict[str, Any]) -> dict[str, Any]:
         save_result = await run_in_threadpool(save_event, event)
     await manager.broadcast_json(event)
 
-    # Notificar admin via Telegram sobre anomalias de horário
-    data = event.get("data", {})
-    unit_name = data.get("upa_name") or data.get("unit_code") or "?"
-    time_anomaly = data.get("_time_anomaly")
-
-    if time_anomaly and time_anomaly["type"] == "absurd_time":
-        _notify_admin_telegram(
-            f"⚠️ <b>Horário delirante substituído</b>\n"
-            f"🏥 {unit_name}\n"
-            f"✏️ Digitado: {time_anomaly['typed_time']}\n"
-            f"🕐 Usado: {time_anomaly['system_time']}\n"
-            f"📏 Drift: {time_anomaly['drift_hours']}h\n\n"
-            f"O horário digitado no giro estava {time_anomaly['drift_hours']}h "
-            f"fora do horário real. Foi publicado com o horário de recebimento."
-        )
-    elif time_anomaly and time_anomaly["type"] == "suspect_time":
-        _notify_admin_telegram(
-            f"🔶 <b>Horário suspeito mantido</b>\n"
-            f"🏥 {unit_name}\n"
-            f"✏️ Digitado: {time_anomaly['typed_time']}\n"
-            f"🕐 Sistema: {time_anomaly['system_time']}\n"
-            f"📏 Drift: {time_anomaly['drift_hours']}h\n\n"
-            f"O horário digitado está {time_anomaly['drift_hours']}h fora do real. "
-            f"Mantido como digitado — verifique se precisa corrigir no admin."
-        )
-
-    if save_result and save_result.get("time_regression"):
-        _notify_admin_telegram(
-            f"🔙 <b>Regressão temporal detectada</b>\n"
-            f"🏥 {save_result.get('unit_name', '?')}\n"
-            f"⏮️ Anterior: {save_result['previous_received_at']}\n"
-            f"⏭️ Novo: {save_result['new_received_at']}\n"
-            f"📝 Evento #{save_result.get('new_event_id', '?')} "
-            f"(substituiu #{save_result.get('previous_event_id', '?')})\n\n"
-            f"O giro mais recente tem horário anterior ao que estava publicado. "
-            f"O conteúdo foi atualizado normalmente — verifique no admin se o horário está correto."
-        )
-
+    # Anomalias de horário seguem registradas no evento/warnings, mas sem
+    # alerta Telegram — o canal do admin é reservado para giros não
+    # reconhecidos e unidades muito tempo sem giro (ver _stale_units_watcher).
     return event
+
+
+_GIRO_KEYWORDS = ("vermelha", "amarela", "isolamento", "atendimento", "giro", "obituario")
+
+def _looks_like_giro(text: str, data: dict[str, Any]) -> bool:
+    """Distingue um giro real de conversa comum do grupo — o adapter repassa
+    tudo, então só vale alertar quando o texto tem cara de giro."""
+    rooms = data.get("rooms") or {}
+    for value in rooms.values():
+        candidates = value if isinstance(value, list) else [value]
+        for room in candidates:
+            if isinstance(room, dict) and room.get("capacity") is not None:
+                return True
+    normalized = normalize_unit_text(text)
+    hits = sum(1 for kw in _GIRO_KEYWORDS if kw in normalized)
+    return hits >= 2
+
+
+def _notify_unparsed_giro(text: str, issues: list[dict[str, str]]) -> None:
+    first_line = next((l.strip() for l in text.splitlines() if l.strip()), "")[:80]
+    reasons = "\n".join(f"❓ {i['message']}" for i in issues if i["severity"] == "blocking") or "❓ Motivo desconhecido"
+    _notify_admin_telegram(
+        "🚫 <b>Giro não reconhecido — não publicado</b>\n"
+        f"📄 {html_escape(first_line)}\n"
+        f"{html_escape(reasons)}\n\n"
+        f"<pre>{html_escape(text[:500])}</pre>"
+    )
+
+
+STALE_ALERT_HOURS = float(os.getenv("STALE_ALERT_HOURS", "10"))
+STALE_CHECK_INTERVAL_MINUTES = float(os.getenv("STALE_CHECK_INTERVAL_MINUTES", "30"))
+_stale_alerted: dict[str, str] = {}
+
+
+def _as_utc_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+async def _stale_units_watcher() -> None:
+    """Avisa o admin quando uma unidade passa de STALE_ALERT_HOURS sem giro.
+    Um aviso por episódio: só re-alerta se chegar giro novo e ela envelhecer
+    de novo (dedupe por unit_key+updated_at, em memória)."""
+    while True:
+        await asyncio.sleep(STALE_CHECK_INTERVAL_MINUTES * 60)
+        try:
+            if not is_database_configured():
+                continue
+            rows = await run_in_threadpool(get_latest_status_by_unit)
+            now = datetime.now(timezone.utc)
+            newly_stale: list[tuple[str, float]] = []
+            for row in rows:
+                key = row.get("unit_key")
+                ts = _as_utc_datetime(row.get("updated_at") or row.get("received_at"))
+                if not key or ts is None:
+                    continue
+                age_hours = (now - ts).total_seconds() / 3600
+                if age_hours >= STALE_ALERT_HOURS:
+                    if _stale_alerted.get(key) != ts.isoformat():
+                        _stale_alerted[key] = ts.isoformat()
+                        name = row.get("displayed_name") or row.get("canonical_name") or key
+                        newly_stale.append((str(name), age_hours))
+                else:
+                    _stale_alerted.pop(key, None)
+            if newly_stale:
+                lines = "\n".join(
+                    f"• {html_escape(name)} — há {age:.0f}h sem giro" for name, age in newly_stale
+                )
+                await run_in_threadpool(
+                    _notify_admin_telegram,
+                    f"⏰ <b>UPA há mais de {STALE_ALERT_HOURS:.0f}h sem giro</b>\n{lines}",
+                )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Watcher de unidades sem giro falhou: %s", exc)
 
 
 def _notify_admin_telegram(message: str) -> None:
@@ -978,6 +1027,11 @@ async def whatsapp_bridge_ingest(payload: WhatsAppBridgeIngestPayload) -> dict[s
             await run_in_threadpool(save_event, event)
         # Broadcast de refresh para mostrar pendência
         await manager.broadcast_json(event)
+
+        # Avisar o admin no Telegram — só quando o texto parece um giro de
+        # verdade (o adapter repassa toda mensagem do grupo, inclusive conversa)
+        if _looks_like_giro(payload.text, data):
+            await run_in_threadpool(_notify_unparsed_giro, payload.text, issues)
 
         return {
             "status": "pending",
