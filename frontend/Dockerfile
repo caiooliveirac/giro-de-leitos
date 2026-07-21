@@ -41,6 +41,8 @@ COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1 \
     NODE_ENV=production
 
+ARG APP_BASE_PATH=""
+ENV APP_BASE_PATH=${APP_BASE_PATH}
 RUN pnpm build
 
 # ---------- Stage 3: runner ----------

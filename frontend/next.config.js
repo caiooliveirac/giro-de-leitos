@@ -10,9 +10,17 @@ const withPWA = require('next-pwa')({
   disable: true,
 });
 
+// Suporte a basePath via env (padrao do repo maternidades-salvador):
+// APP_BASE_PATH=/tabela/upas monta o dashboard sob o prefixo da tabela.
+const configuredBasePath = (process.env.APP_BASE_PATH || "").trim();
+const normalizedBasePath = configuredBasePath
+  ? "/" + configuredBasePath.replace(/^\/+|\/+$/g, "")
+  : "";
+
 const nextConfig = {
   reactStrictMode: true,
   output: 'standalone',
+  basePath: normalizedBasePath || undefined,
   experimental: {
     optimizePackageImports: ['lucide-react', 'framer-motion'],
   },

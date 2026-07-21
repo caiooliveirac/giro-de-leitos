@@ -7,8 +7,8 @@
 #   - parser-api (giro-de-leitos-api) e frontend sao gerenciados via raw
 #     `docker run` pelo workflow .github/workflows/deploy.yml (canary + swap).
 #     NAO usar `docker compose up` para subir a API/frontend em prod.
-#   - whatsapp-bridge continua sendo gerenciada via `docker compose up -d
-#     whatsapp-bridge` (sobrevive aos swaps para nao perder a sessao Baileys).
+#   - A ingestao WhatsApp e feita pelo whatsmeow-gw (container avulso) +
+#     giro-wa-adapter (systemd); a antiga whatsapp-bridge (Baileys) foi removida.
 #   - A rede `giro-de-leitos_default` e criada pelo compose e reaproveitada
 #     pelos `docker run` da API (com --network-alias parser-api).
 #
@@ -44,7 +44,7 @@ services:
       TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://mnrs.com.br}
       PUBLIC_WEBHOOK_PATH: ${PUBLIC_WEBHOOK_PATH:-/giro/api/webhook/telegram}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://giro:giro_seguro_2026@postgres:5432/giro_de_leitos}
+      DATABASE_URL: postgresql://giro:${POSTGRES_PASSWORD}@postgres:5432/giro_de_leitos
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       # --- Comunicação com a bridge (sai da API para a bridge) ---
@@ -62,37 +62,12 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
 
-  whatsapp-bridge:
-    build: ./whatsapp-bridge
-    container_name: giro-whatsapp-bridge
-    restart: unless-stopped
-    depends_on:
-      - parser-api
-    environment:
-      WHATSAPP_GROUP_IDS: ${WHATSAPP_GROUP_IDS:-}
-      API_BASE_URL: http://parser-api:8000
-      API_INGEST_PATH: /api/ingest/whatsapp-bridge
-      LOG_LEVEL: ${WA_LOG_LEVEL:-warn}
-      DRY_RUN: ${WA_DRY_RUN:-false}
-      LIST_GROUPS: ${WA_LIST_GROUPS:-false}
-      STALE_ALERTS_ENABLED: ${WA_STALE_ALERTS_ENABLED:-true}
-      STALE_CHECK_INTERVAL_MIN: ${WA_STALE_CHECK_INTERVAL_MIN:-120}
-      STALE_THRESHOLD_HOURS: ${WA_STALE_THRESHOLD_HOURS:-6}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_ADMIN_CHAT_ID: ${TELEGRAM_ADMIN_CHAT_ID:-1438288563}
-      TELEGRAM_ALERT_BOT_TOKEN: ${TELEGRAM_ALERT_BOT_TOKEN:-}
-      WHATSAPP_PHONE_NUMBER: ${WHATSAPP_PHONE_NUMBER:-557181619480}
-    volumes:
-      - wa_auth_info:/app/auth_info
-    # Para ver o QR code na primeira execução:
-    #   docker compose logs -f whatsapp-bridge
-    tty: true
-    stdin_open: true
-
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        APP_BASE_PATH: ${APP_BASE_PATH:-}
     image: giro-frontend:latest
     container_name: giro-de-leitos-frontend
     restart: unless-stopped
@@ -106,7 +81,6 @@ services:
 
 volumes:
   giro_db_data_local:
-  wa_auth_info:
 
 networks:
   repo_default:

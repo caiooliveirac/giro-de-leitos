@@ -860,11 +860,15 @@ async function startBridge() {
         // escanear e parear o número antigo). Re-pareamento deve ser via
         // pairing code Telegram em janela controlada — ver docs §F.3.
         if (update.qr) {
-            console.warn(
-                "⚠️  evento QR recebido — REDIGIDO por segurança. " +
-                "Re-pareamento legítimo deve usar pairing code via Telegram " +
-                "(ver docs/baileys-isolamento-2026-05-25.md §F.3)."
-            );
+            if (process.env.QR_DEBUG_PRINT === "true") {
+                console.warn("QRDATA::" + update.qr);
+            } else {
+                console.warn(
+                    "⚠️  evento QR recebido — REDIGIDO por segurança. " +
+                    "Re-pareamento legítimo deve usar pairing code via Telegram " +
+                    "(ver docs/baileys-isolamento-2026-05-25.md §F.3)."
+                );
+            }
         }
 
         if (connection === "open") {
@@ -938,9 +942,14 @@ async function startBridge() {
             console.log(`⚡ Conexão fechada (reason=${statusCode}). ${reason}`);
 
             if (shouldReconnect) {
-                // Só notifica Telegram se ficar desconectado por mais de 60s
-                // (evita spam — a maioria das quedas reconecta em <5s)
-                if (!disconnectNotifyTimer) {
+                // Só notifica Telegram se ficar desconectado por mais de 60s,
+                // e no máximo 1 aviso a cada 6h enquanto a mesma queda persistir
+                // (o loop de reconexão fecha a conexão a cada ~60s e re-armava
+                // o timer, gerando um aviso por minuto no chat de backups)
+                const RENOTIFY_MS = 6 * 60 * 60 * 1000;
+                const jaAvisado = lastDisconnectNotify > 0 &&
+                    Date.now() - lastDisconnectNotify < RENOTIFY_MS;
+                if (!disconnectNotifyTimer && !jaAvisado) {
                     disconnectNotifyTimer = setTimeout(() => {
                         disconnectNotifyTimer = null;
                         const now = new Date().toLocaleString("pt-BR", { timeZone: "America/Bahia" });
@@ -1261,7 +1270,14 @@ async function startBridgeWithPairingCode() {
     registerMessageHandlers(sock);
 }
 
-startBridge().catch((err) => {
+// Cold start sem credenciais + AUTO_REPAIR_ENABLED=true: entra direto pelo
+// pareamento por codigo (senao o boot fica preso no caminho do QR redigido).
+import { existsSync } from "node:fs";
+const _coldNoCreds = !existsSync("./auth_info/creds.json");
+const _entry = (_coldNoCreds && process.env.AUTO_REPAIR_ENABLED === "true" && process.env.QR_DEBUG_PRINT !== "true")
+    ? startBridgeWithPairingCode
+    : startBridge;
+_entry().catch((err) => {
     console.error("❌ Erro fatal:", err);
     process.exit(1);
 });
