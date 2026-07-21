@@ -17,6 +17,9 @@ UNIT_REGISTRY: list[dict[str, Any]] = [
             "DR ORLANDO IMBASSAHY",
             "ORLANDO IMBASSAHY",
             "ORLANDO IMBASSAHY UPA",
+            # Grafia usada nos giros reais do plantão (typo recorrente)
+            "PA ORLANDO IMBASSHAY",
+            "ORLANDO IMBASSHAY",
         ],
     },
     {
