@@ -6,7 +6,7 @@ import hmac
 import json
 import os
 from html import escape as html_escape
-from urllib import error, request
+from urllib import request
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,7 +16,30 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from db import get_capacity_timeline, get_dashboard_metrics, get_giro_activity, get_latest_events, get_latest_status_by_unit, get_parsed_event, get_pending_unit_confirmations, get_recent_alerts, get_registered_units, get_unit_responsibles, get_unparsed_summary, init_db, is_database_configured, record_unparsed_message, resolve_pending_unit_confirmation, save_event, update_unit_reported_at, delete_event, admin_update_event, get_event_detail
+from db import (
+    admin_update_event,
+    delete_event,
+    get_capacity_timeline,
+    get_dashboard_metrics,
+    get_event_detail,
+    get_giro_activity,
+    get_latest_events,
+    get_latest_status_by_unit,
+    get_parsed_event,
+    get_pending_unit_confirmations,
+    get_recent_alerts,
+    get_registered_units,
+    get_telegram_alert_chats,
+    get_unit_responsibles,
+    get_unparsed_summary,
+    init_db,
+    is_database_configured,
+    record_unparsed_message,
+    register_telegram_alert_chat,
+    resolve_pending_unit_confirmation,
+    save_event,
+    update_unit_reported_at,
+)
 from auth.deps import get_current_admin
 from parser_service import parse_whatsapp_message
 from reports import (
@@ -108,6 +131,7 @@ class TelegramUpdatePayload(BaseModel):
     update_id: int | None = None
     message: dict[str, Any] | None = None
     edited_message: dict[str, Any] | None = None
+    my_chat_member: dict[str, Any] | None = None
 
 
 class ConnectionManager:
@@ -152,6 +176,7 @@ manager = ConnectionManager()
 app.state.last_dashboard_event = None
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "").strip()
+TELEGRAM_ADMIN_CHAT_IDS = os.getenv("TELEGRAM_ADMIN_CHAT_IDS", "").strip()
 # Alertas de admin podem sair por um bot diferente do bot interativo/webhook
 # (o usuário acompanha o bot "Giro de Leitos"; o Age fica só para o webhook)
 TELEGRAM_ALERT_BOT_TOKEN = os.getenv("TELEGRAM_ALERT_BOT_TOKEN", "").strip() or TELEGRAM_BOT_TOKEN
@@ -272,10 +297,9 @@ async def publish_event(event: dict[str, Any]) -> dict[str, Any]:
     if is_database_configured():
         save_result = await run_in_threadpool(save_event, event)
     await manager.broadcast_json(event)
-
-    # Anomalias de horário seguem registradas no evento/warnings, mas sem
-    # alerta Telegram — o canal do admin é reservado para giros não
-    # reconhecidos e unidades muito tempo sem giro (ver _stale_units_watcher).
+    transition_alerts = (save_result or {}).get("transition_alerts") or []
+    if transition_alerts:
+        await run_in_threadpool(_notify_transition_alerts, transition_alerts)
     return event
 
 
@@ -371,27 +395,80 @@ async def _stale_units_watcher() -> None:
             logging.getLogger(__name__).warning("Watcher de unidades sem giro falhou: %s", exc)
 
 
-def _notify_admin_telegram(message: str) -> None:
-    """Envia alerta para o chat do admin no Telegram."""
-    if not TELEGRAM_ALERT_BOT_TOKEN or not TELEGRAM_ADMIN_CHAT_ID:
+def _configured_admin_chat_ids() -> list[str]:
+    raw_values = [TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_ADMIN_CHAT_IDS]
+    return list(dict.fromkeys(
+        chat_id.strip()
+        for raw in raw_values
+        for chat_id in raw.split(",")
+        if chat_id.strip()
+    ))
+
+
+def _configured_group_chat_ids() -> list[str]:
+    return list(dict.fromkeys(
+        chat_id.strip()
+        for chat_id in TELEGRAM_REPORT_CHAT_IDS.split(",")
+        if chat_id.strip()
+    ))
+
+
+def _send_telegram_with_token(token: str, chat_id: int | str, message: str, *, html: bool = False) -> None:
+    if not token:
         return
-    try:
-        payload = json.dumps({
-            "chat_id": TELEGRAM_ADMIN_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML",
-        }).encode("utf-8")
-        req = request.Request(
-            url=f"https://api.telegram.org/bot{TELEGRAM_ALERT_BOT_TOKEN}/sendMessage",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+    body: dict[str, Any] = {"chat_id": chat_id, "text": message}
+    if html:
+        body["parse_mode"] = "HTML"
+    payload = json.dumps(body).encode("utf-8")
+    req = request.Request(
+        url=f"https://api.telegram.org/bot{token}/sendMessage",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with request.urlopen(req, timeout=15) as response:
+        response.read()
+
+
+def _notify_admin_telegram(message: str) -> None:
+    """Envia alerta para todos os chats privados de admin configurados."""
+    if not TELEGRAM_ALERT_BOT_TOKEN:
+        return
+    for chat_id in _configured_admin_chat_ids():
+        try:
+            _send_telegram_with_token(TELEGRAM_ALERT_BOT_TOKEN, chat_id, message, html=True)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Falha ao notificar admin Telegram %s: %s", chat_id, exc)
+
+
+def _notify_transition_alerts(alerts: list[dict[str, Any]]) -> None:
+    """Dispara transições para admins e grupos que já interagiram com o bot."""
+    if not alerts:
+        return
+    message = build_alerts_text(alerts)
+    destinations: list[tuple[str, int | str]] = [
+        (TELEGRAM_ALERT_BOT_TOKEN, chat_id) for chat_id in _configured_admin_chat_ids()
+    ]
+    destinations.extend((TELEGRAM_BOT_TOKEN, chat_id) for chat_id in _configured_group_chat_ids())
+    if TELEGRAM_BOT_TOKEN and is_database_configured():
+        destinations.extend(
+            (TELEGRAM_BOT_TOKEN, row["chat_id"])
+            for row in get_telegram_alert_chats()
+            if row.get("chat_id") is not None
         )
-        with request.urlopen(req, timeout=15) as response:
-            response.read()
-    except Exception as exc:
-        import logging
-        logging.getLogger(__name__).warning("Falha ao notificar admin Telegram: %s", exc)
+
+    sent: set[tuple[str, str]] = set()
+    for token, chat_id in destinations:
+        destination = (token, str(chat_id))
+        if not token or destination in sent:
+            continue
+        sent.add(destination)
+        try:
+            _send_telegram_with_token(token, chat_id, message)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Falha ao enviar transição Telegram para %s: %s", chat_id, exc)
 
 
 def _format_room_line(label: str, room: dict[str, Any] | None) -> str:
@@ -483,9 +560,9 @@ def build_telegram_help_reply() -> str:
             "- Unidade: UPA ADROALDO ALBERGARIA",
             "",
             "Comandos disponíveis:",
-            "- /resumo",
-            "- /alertas",
-            "- /status",
+            "- /resumo — visão rápida para decisão",
+            "- /alertas — mudanças recentes e há quanto tempo",
+            "- /status — detalhes de todas as UPAs",
             "",
             *build_reports_help_lines(),
         ]
@@ -636,6 +713,39 @@ def build_priority_buckets(status_rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build_system_summary_text(status_rows: list[dict[str, Any]]) -> str:
+    """Resumo curto para decisão rápida, sem repetir o status de cada UPA."""
+    if not status_rows:
+        return "📭 Ainda não há giros persistidos no banco."
+
+    buckets = build_priority_buckets(status_rows)
+
+    def names(items: list[Any], *, include_vacancies: bool = False) -> str:
+        values: list[str] = []
+        for item in items:
+            if isinstance(item, dict):
+                value = str(item.get("unit_name") or "")
+                if include_vacancies:
+                    value += f" ({item.get('vacancies', 0)})"
+            else:
+                value = str(item)
+            if value and value not in values:
+                values.append(value)
+        return ", ".join(values) or "—"
+
+    isolation_and_other = [*buckets["isolation_priority"], *buckets["other_beds"]]
+    return "\n".join(
+        [
+            "📍 RESUMO AGORA",
+            f"🔴 Vermelha: {names(buckets['red_priority'])}",
+            f"🟡 Amarela ♂: {names(buckets['yellow_male_priority'], include_vacancies=True)}",
+            f"🟡 Amarela ♀: {names(buckets['yellow_female_priority'], include_vacancies=True)}",
+            f"🛏️ Isol./intern.: {names(isolation_and_other, include_vacancies=True)}",
+            f"🦴 Ortopedista: {names(buckets['with_orthopedist'])}",
+        ]
+    )
+
+
+def build_system_status_text(status_rows: list[dict[str, Any]]) -> str:
     if not status_rows:
         return "📭 Ainda não há giros persistidos no banco."
 
@@ -723,43 +833,61 @@ def build_system_summary_text(status_rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_alerts_text(alert_rows: list[dict[str, Any]]) -> str:
+def _alert_age(created_at: Any, now: datetime | None = None) -> tuple[str, str]:
+    timestamp = _as_utc_datetime(created_at)
+    if timestamp is None:
+        return "🕐 agora", "🟢"
+    age_seconds = max(0, int(((now or datetime.now(timezone.utc)) - timestamp).total_seconds()))
+    if age_seconds < 60:
+        age_text = "agora"
+    elif age_seconds < 3600:
+        age_text = f"{age_seconds // 60}min"
+    elif age_seconds < 86400:
+        age_text = f"{age_seconds // 3600}h"
+    else:
+        age_text = f"{age_seconds // 86400}d"
+
+    if age_seconds <= 15 * 60:
+        recency = "🟢"
+    elif age_seconds <= 2 * 3600:
+        recency = "🟡"
+    elif age_seconds <= 6 * 3600:
+        recency = "🟠"
+    else:
+        recency = "🔴"
+    return f"🕐 {age_text}", recency
+
+
+def _alert_subject_emoji(alert_type: str) -> str:
+    if alert_type.startswith("red_"):
+        return "🔴"
+    if alert_type.startswith("yellow_"):
+        return "🟡"
+    if alert_type.endswith("_changed"):
+        return "🩺"
+    if alert_type.startswith("isolation_"):
+        return "🚪"
+    return "🛏️"
+
+
+def build_alerts_text(alert_rows: list[dict[str, Any]], now: datetime | None = None) -> str:
     if not alert_rows:
         return "🔕 Nenhum alerta recente registrado."
 
     lines = ["🚨 Alertas recentes:"]
     for row in alert_rows[:10]:
-        severity = row.get("severity", "info").upper()
-        lines.extend(
-            [
-                "",
-                f"[{severity}] {row.get('unit_name')}",
-                f"- {row.get('title')}",
-                f"- {row.get('message')}",
-            ]
+        clock, recency = _alert_age(row.get("created_at"), now)
+        subject = _alert_subject_emoji(str(row.get("alert_type") or ""))
+        lines.append(
+            f"\n{clock} {recency} {subject} {row.get('unit_name')}\n{row.get('message') or row.get('title')}"
         )
     return "\n".join(lines)
 
 
 def _send_telegram_chunk(chat_id: int | str, text: str) -> None:
-    payload = json.dumps(
-        {
-            "chat_id": chat_id,
-            "text": text,
-        }
-    ).encode("utf-8")
-
-    req = request.Request(
-        url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
     try:
-        with request.urlopen(req, timeout=15) as response:
-            response.read()
-    except error.URLError as exc:
+        _send_telegram_with_token(TELEGRAM_BOT_TOKEN, chat_id, text)
+    except Exception as exc:
         raise RuntimeError(f"Falha ao responder no Telegram: {exc}") from exc
 
 
@@ -1197,7 +1325,8 @@ async def patch_pending_unit_resolution(event_id: int, payload: ResolvePendingUn
 # ---------------------------------------------------------------------------
 
 _HELP_COMMANDS = {"start", "ajuda", "help"}
-_SUMMARY_COMMANDS = {"resumo", "status", "giro"}
+_SUMMARY_COMMANDS = {"resumo"}
+_STATUS_COMMANDS = {"status", "giro"}
 _ALERT_COMMANDS = {"alertas", "alerta"}
 _VACANCY_COMMANDS = {"vagas", "vaga", "ondetemvaga", "leitos"}
 _COMPLIANCE_COMMANDS = {"cobranca", "cobrança", "ranking", "semgiro", "atraso"}
@@ -1270,6 +1399,11 @@ async def _run_bot_command(
         status_rows = await run_in_threadpool(get_latest_status_by_unit) if db_ready else []
         summary_text = build_system_summary_text(status_rows)
         return summary_text, "Comando de resumo processado.", {"summary": summary_text}
+
+    if command in _STATUS_COMMANDS:
+        status_rows = await run_in_threadpool(get_latest_status_by_unit) if db_ready else []
+        status_text = build_system_status_text(status_rows)
+        return status_text, "Comando de status processado.", {"summary": status_text}
 
     if command in _ALERT_COMMANDS:
         alert_rows = await run_in_threadpool(get_recent_alerts, 10) if db_ready else []
@@ -1344,14 +1478,32 @@ async def telegram_webhook(
     if TELEGRAM_WEBHOOK_SECRET and x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Secret do webhook do Telegram inválido.")
 
-    incoming_message = payload.message or payload.edited_message or {}
+    membership_update = payload.my_chat_member or {}
+    incoming_message = payload.message or payload.edited_message or membership_update
     text = incoming_message.get("text")
-
-    if not text:
-        raise HTTPException(status_code=400, detail="Update do Telegram sem campo de texto utilizável.")
 
     chat = incoming_message.get("chat") or {}
     chat_id = chat.get("id")
+    chat_type = str(chat.get("type") or "")
+    membership_status = str((membership_update.get("new_chat_member") or {}).get("status") or "")
+    group_is_active = not membership_update or membership_status in {"member", "administrator"}
+    if (
+        chat_id is not None
+        and chat_type in {"group", "supergroup"}
+        and is_database_configured()
+    ):
+        await run_in_threadpool(
+            register_telegram_alert_chat,
+            chat_id,
+            chat_type,
+            chat.get("title") or chat.get("username"),
+            group_is_active,
+        )
+
+    if not text:
+        if membership_update:
+            return {"status": "accepted", "message": "Atualização de participação do bot processada."}
+        raise HTTPException(status_code=400, detail="Update do Telegram sem campo de texto utilizável.")
 
     command = parse_bot_command(text)
     if command is not None:

@@ -12,7 +12,7 @@ os.environ.setdefault("CPF_HASH_PEPPER", "test-pepper")
 from fastapi.testclient import TestClient  # noqa: E402
 
 import main  # noqa: E402
-from main import build_priority_buckets, build_system_summary_text, build_telegram_help_reply, is_report_chat_authorized
+from main import build_priority_buckets, build_system_status_text, build_telegram_help_reply, is_report_chat_authorized
 from reports import (
     GIRO_SLA,
     MAX_COBRANCA_SNIPPETS,
@@ -133,11 +133,11 @@ class MessageSplittingTests(unittest.TestCase):
         self.assertEqual(len(parts), 4)
         self.assertIn("mensagem cortada", parts[-1])
 
-    def test_current_resumo_fits_after_chunking(self) -> None:
-        """Regressão do bug de produção: /resumo com 16 unidades passa de 4.096."""
-        summary = build_system_summary_text(_full_network_rows())
-        self.assertGreater(len(summary), 3000)
-        parts = split_message(summary)
+    def test_current_status_fits_after_chunking(self) -> None:
+        """O /status detalhado com 16 unidades deve ser dividido em balões válidos."""
+        status = build_system_status_text(_full_network_rows())
+        self.assertGreater(len(status), 3000)
+        parts = split_message(status)
         for part in parts:
             self.assertLess(len(part), 4096)
 

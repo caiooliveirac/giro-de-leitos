@@ -121,6 +121,15 @@ CREATE INDEX IF NOT EXISTS idx_alert_events_created_at
 
 CREATE INDEX IF NOT EXISTS idx_alert_events_unit_key_created_at
     ON alert_events (unit_key, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS telegram_alert_chats (
+    chat_id BIGINT PRIMARY KEY,
+    chat_type TEXT NOT NULL,
+    title TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
 
@@ -361,7 +370,7 @@ def _insert_alert(
     title: str,
     message: str,
     payload: dict[str, Any],
-) -> None:
+) -> dict[str, Any]:
     cur.execute(
         """
         INSERT INTO alert_events (
@@ -375,9 +384,24 @@ def _insert_alert(
             message,
             payload
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+        RETURNING id, created_at
         """,
         (unit_key, unit_code, unit_name, event_id, alert_type, severity, title, message, _json_dumps(payload)),
     )
+    inserted = cur.fetchone() or {}
+    return {
+        "id": inserted.get("id"),
+        "unit_key": unit_key,
+        "unit_code": unit_code,
+        "unit_name": unit_name,
+        "event_id": event_id,
+        "alert_type": alert_type,
+        "severity": severity,
+        "title": title,
+        "message": message,
+        "payload": payload,
+        "created_at": inserted.get("created_at"),
+    }
 
 
 def _emit_transition_alerts(
@@ -399,136 +423,130 @@ def _emit_transition_alerts(
     isolation_male_occupied: int | None,
     isolation_male_capacity: int | None,
     has_orthopedist: bool,
+    has_surgeon: bool,
     has_psychiatrist: bool,
     current_rooms: dict[str, Any] | None = None,
-) -> None:
+) -> list[dict[str, Any]]:
     if not previous_status:
-        return
+        return []
 
-    previous_red = _has_vacancy_from_values(previous_status.get("red_occupied"), previous_status.get("red_capacity"))
-    current_red = _has_vacancy_from_values(red_occupied, red_capacity)
-    if not previous_red and current_red:
-        _insert_alert(
-            cur,
-            unit_key=unit_key,
-            unit_code=unit_code,
-            unit_name=unit_name,
-            event_id=event_id,
-            alert_type="red_vacancy_opened",
-            severity="critical",
-            title="Vaga aberta na vermelha",
-            message=f"{unit_name} passou a ter vaga na Sala Vermelha ({red_occupied:02d}/{red_capacity:02d}).",
-            payload={"previous": {"occupied": previous_status.get("red_occupied"), "capacity": previous_status.get("red_capacity")}, "current": {"occupied": red_occupied, "capacity": red_capacity}},
+    alerts: list[dict[str, Any]] = []
+    room_config = (
+        ("red_room", "Sala Vermelha", "red", "critical"),
+        ("yellow_room", "Amarela/Observação", "yellow", "high"),
+        ("yellow_male", "Amarela/Observação masculina", "yellow_male", "high"),
+        ("yellow_female", "Amarela/Observação feminina", "yellow_female", "high"),
+        ("isolation_total", "Isolamento", "isolation", "medium"),
+        ("isolation_female", "Isolamento feminino", "isolation_female", "medium"),
+        ("isolation_male", "Isolamento masculino", "isolation_male", "medium"),
+        ("isolation_pediatric", "Isolamento pediátrico", "isolation_pediatric", "medium"),
+    )
+
+    current_room_map = dict(current_rooms or {}) if isinstance(current_rooms, dict) else {}
+    current_room_map["red_room"] = {"occupied": red_occupied, "capacity": red_capacity}
+    current_room_map["yellow_room"] = {"occupied": yellow_occupied, "capacity": yellow_capacity}
+    if isolation_total_capacity is not None:
+        current_room_map["isolation_total"] = {"occupied": isolation_total_occupied, "capacity": isolation_total_capacity}
+    if isolation_female_capacity is not None:
+        current_room_map["isolation_female"] = {"occupied": isolation_female_occupied, "capacity": isolation_female_capacity}
+    if isolation_male_capacity is not None:
+        current_room_map["isolation_male"] = {"occupied": isolation_male_occupied, "capacity": isolation_male_capacity}
+
+    def vacancy_state(room: Any) -> bool | None:
+        if not isinstance(room, dict):
+            return None
+        occupied = room.get("occupied")
+        capacity = room.get("capacity")
+        if not isinstance(occupied, int) or not isinstance(capacity, int):
+            return None
+        return capacity > occupied
+
+    def ratio(room: dict[str, Any]) -> str:
+        return str(room.get("ratio") or f"{room.get('occupied', 0):02d}/{room.get('capacity', 0):02d}")
+
+    for room_key, room_label, type_prefix, severity in room_config:
+        if room_key == "yellow_room" and (current_room_map.get("yellow_male") or current_room_map.get("yellow_female")):
+            continue
+        if room_key == "isolation_total" and current_room_map.get("isolation_mode") == "split":
+            continue
+        previous_room = _room_from_payload(previous_status, room_key)
+        current_room = current_room_map.get(room_key)
+        previous_vacancy = vacancy_state(previous_room)
+        current_vacancy = vacancy_state(current_room)
+        if previous_vacancy is None or current_vacancy is None or previous_vacancy == current_vacancy:
+            continue
+        opened = current_vacancy
+        alerts.append(
+            _insert_alert(
+                cur,
+                unit_key=unit_key,
+                unit_code=unit_code,
+                unit_name=unit_name,
+                event_id=event_id,
+                alert_type=f"{type_prefix}_vacancy_{'opened' if opened else 'closed'}",
+                severity=severity if opened else ("critical" if type_prefix == "red" else "medium"),
+                title=f"Vaga {'aberta' if opened else 'encerrada'} — {room_label}",
+                message=f"{unit_name} passou a ficar {'COM' if opened else 'SEM'} vaga em {room_label} ({ratio(current_room)}).",
+                payload={"previous": previous_room, "current": current_room},
+            )
         )
 
-    previous_yellow_male = _room_from_payload(previous_status, "yellow_male")
-    current_yellow_male = (current_rooms or {}).get("yellow_male") if isinstance(current_rooms, dict) else None
-    if not _has_vacancy_from_values(
-        previous_yellow_male.get("occupied") if previous_yellow_male else None,
-        previous_yellow_male.get("capacity") if previous_yellow_male else None,
-    ) and _has_vacancy_from_values(
-        current_yellow_male.get("occupied") if isinstance(current_yellow_male, dict) else None,
-        current_yellow_male.get("capacity") if isinstance(current_yellow_male, dict) else None,
-    ):
-        _insert_alert(
-            cur,
-            unit_key=unit_key,
-            unit_code=unit_code,
-            unit_name=unit_name,
-            event_id=event_id,
-            alert_type="yellow_male_vacancy_opened",
-            severity="high",
-            title="Vaga masculina na amarela/observação",
-            message=f"{unit_name} passou a ter vaga masculina na Amarela/Observação ({current_yellow_male['ratio']}).",
-            payload={"previous": previous_yellow_male, "current": current_yellow_male},
+    previous_other_by_label = {
+        normalize_unit_text(str(room.get("label") or "leito")): room
+        for room in _other_beds_from_payload(previous_status)
+    }
+    current_other_beds = [
+        room for room in (current_room_map.get("other_beds") or []) if isinstance(room, dict)
+    ]
+    for current_room in current_other_beds:
+        label = str(current_room.get("label") or "Leito de internamento/apoio")
+        key = normalize_unit_text(label)
+        previous_room = previous_other_by_label.get(key)
+        previous_vacancy = vacancy_state(previous_room)
+        current_vacancy = vacancy_state(current_room)
+        if previous_vacancy is None or current_vacancy is None or previous_vacancy == current_vacancy:
+            continue
+        opened = current_vacancy
+        alerts.append(
+            _insert_alert(
+                cur,
+                unit_key=unit_key,
+                unit_code=unit_code,
+                unit_name=unit_name,
+                event_id=event_id,
+                alert_type=f"other_vacancy_{'opened' if opened else 'closed'}",
+                severity="medium",
+                title=f"Vaga {'aberta' if opened else 'encerrada'} — {label}",
+                message=f"{unit_name} passou a ficar {'COM' if opened else 'SEM'} vaga em {label} ({ratio(current_room)}).",
+                payload={"previous": previous_room, "current": current_room},
+            )
         )
 
-    previous_yellow_female = _room_from_payload(previous_status, "yellow_female")
-    current_yellow_female = (current_rooms or {}).get("yellow_female") if isinstance(current_rooms, dict) else None
-    if not _has_vacancy_from_values(
-        previous_yellow_female.get("occupied") if previous_yellow_female else None,
-        previous_yellow_female.get("capacity") if previous_yellow_female else None,
-    ) and _has_vacancy_from_values(
-        current_yellow_female.get("occupied") if isinstance(current_yellow_female, dict) else None,
-        current_yellow_female.get("capacity") if isinstance(current_yellow_female, dict) else None,
-    ):
-        _insert_alert(
-            cur,
-            unit_key=unit_key,
-            unit_code=unit_code,
-            unit_name=unit_name,
-            event_id=event_id,
-            alert_type="yellow_female_vacancy_opened",
-            severity="high",
-            title="Vaga feminina na amarela/observação",
-            message=f"{unit_name} passou a ter vaga feminina na Amarela/Observação ({current_yellow_female['ratio']}).",
-            payload={"previous": previous_yellow_female, "current": current_yellow_female},
+    specialist_config = (
+        ("has_orthopedist", has_orthopedist, "ortopedista", "orthopedist"),
+        ("has_surgeon", has_surgeon, "cirurgião", "surgeon"),
+        ("has_psychiatrist", has_psychiatrist, "psiquiatra", "psychiatrist"),
+    )
+    for field, current_value, label, type_prefix in specialist_config:
+        previous_value = bool(previous_status.get(field))
+        if previous_value == current_value:
+            continue
+        alerts.append(
+            _insert_alert(
+                cur,
+                unit_key=unit_key,
+                unit_code=unit_code,
+                unit_name=unit_name,
+                event_id=event_id,
+                alert_type=f"{type_prefix}_changed",
+                severity="high" if current_value else "critical",
+                title=f"Mudança — {label.capitalize()}",
+                message=f"{unit_name} agora está {'COM' if current_value else 'SEM'} {label}.",
+                payload={"previous": previous_value, "current": current_value},
+            )
         )
 
-    previous_yellow = _has_vacancy_from_values(previous_status.get("yellow_occupied"), previous_status.get("yellow_capacity"))
-    current_yellow = _has_vacancy_from_values(yellow_occupied, yellow_capacity)
-    if not previous_yellow and current_yellow and not (current_yellow_male or current_yellow_female):
-        _insert_alert(
-            cur,
-            unit_key=unit_key,
-            unit_code=unit_code,
-            unit_name=unit_name,
-            event_id=event_id,
-            alert_type="yellow_vacancy_opened",
-            severity="high",
-            title="Vaga aberta na amarela/observação",
-            message=f"{unit_name} passou a ter vaga na Amarela/Observação ({yellow_occupied:02d}/{yellow_capacity:02d}).",
-            payload={"previous": {"occupied": previous_status.get("yellow_occupied"), "capacity": previous_status.get("yellow_capacity")}, "current": {"occupied": yellow_occupied, "capacity": yellow_capacity}},
-        )
-
-    previous_other = any(_has_vacancy_from_values(room.get("occupied"), room.get("capacity")) for room in _other_beds_from_payload(previous_status))
-    current_other_beds = [room for room in ((current_rooms or {}).get("other_beds") or []) if isinstance(room, dict)] if isinstance(current_rooms, dict) else []
-    current_other = any(_has_vacancy_from_values(room.get("occupied"), room.get("capacity")) for room in current_other_beds)
-    if not previous_other and current_other:
-        available_rooms = [room for room in current_other_beds if _has_vacancy_from_values(room.get("occupied"), room.get("capacity"))]
-        room_descriptions = ", ".join(f"{room.get('label', 'leito')} {room.get('ratio', 'n/i')}" for room in available_rooms) or "outros leitos"
-        _insert_alert(
-            cur,
-            unit_key=unit_key,
-            unit_code=unit_code,
-            unit_name=unit_name,
-            event_id=event_id,
-            alert_type="other_vacancy_opened",
-            severity="medium",
-            title="Outro leito disponível",
-            message=f"{unit_name} passou a ter vaga em leitos de internamento/apoio: {room_descriptions}.",
-            payload={"previous": _other_beds_from_payload(previous_status), "current": current_other_beds},
-        )
-
-    previous_orthopedist = bool(previous_status.get("has_orthopedist"))
-    if previous_orthopedist != has_orthopedist:
-        _insert_alert(
-            cur,
-            unit_key=unit_key,
-            unit_code=unit_code,
-            unit_name=unit_name,
-            event_id=event_id,
-            alert_type="orthopedist_changed",
-            severity="critical" if not has_orthopedist else "high",
-            title="Mudança em ortopedia",
-            message=f"{unit_name} agora está {'COM' if has_orthopedist else 'SEM'} ortopedista.",
-            payload={"previous": previous_orthopedist, "current": has_orthopedist},
-        )
-
-    previous_psychiatrist = bool(previous_status.get("has_psychiatrist"))
-    if previous_psychiatrist != has_psychiatrist:
-        _insert_alert(
-            cur,
-            unit_key=unit_key,
-            unit_code=unit_code,
-            unit_name=unit_name,
-            event_id=event_id,
-            alert_type="psychiatrist_changed",
-            severity="medium" if has_psychiatrist else "low",
-            title="Mudança em psiquiatria",
-            message=f"{unit_name} agora está {'COM' if has_psychiatrist else 'SEM'} psiquiatria.",
-            payload={"previous": previous_psychiatrist, "current": has_psychiatrist},
-        )
+    return alerts
 
 
 def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -556,6 +574,7 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
     with _connect() as conn:
         with conn.cursor() as cur:
             previous_status: dict[str, Any] | None = None
+            transition_alerts: list[dict[str, Any]] = []
             if unit_code and displayed_name:
                 cur.execute("SELECT * FROM current_unit_status WHERE unit_key = %s", (unit_key,))
                 previous_status = cur.fetchone()
@@ -771,7 +790,7 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
                     },
                 )
 
-                _emit_transition_alerts(
+                transition_alerts = _emit_transition_alerts(
                     cur,
                     previous_status=previous_status,
                     unit_key=unit_key,
@@ -789,12 +808,13 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
                     isolation_male_occupied=isolation_male_occupied,
                     isolation_male_capacity=isolation_male_capacity,
                     has_orthopedist=bool(specialists.get("has_orthopedist")),
+                    has_surgeon=bool(specialists.get("has_surgeon")),
                     has_psychiatrist=bool(specialists.get("has_psychiatrist")),
                     current_rooms=rooms,
                 )
 
             # Detectar regressão temporal
-            save_result: dict[str, Any] | None = None
+            save_result: dict[str, Any] | None = {"transition_alerts": transition_alerts} if transition_alerts else None
             if previous_status and unit_code:
                 prev_received = previous_status.get("received_at")
                 new_received = event.get("received_at")
@@ -803,6 +823,7 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
                     new_str = str(new_received)
                     if new_str < prev_str:
                         save_result = {
+                            **(save_result or {}),
                             "time_regression": True,
                             "unit_code": unit_code,
                             "unit_name": displayed_name,
@@ -1132,6 +1153,48 @@ def get_recent_alerts(limit: int = 50) -> list[dict[str, Any]]:
     return rows
 
 
+def register_telegram_alert_chat(
+    chat_id: int | str,
+    chat_type: str,
+    title: str | None = None,
+    is_active: bool = True,
+) -> None:
+    """Registra grupos que interagiram com o bot para receber alertas operacionais."""
+    if not DATABASE_URL or chat_type not in {"group", "supergroup"}:
+        return
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO telegram_alert_chats (chat_id, chat_type, title, is_active, last_seen_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (chat_id) DO UPDATE SET
+                    chat_type = EXCLUDED.chat_type,
+                    title = EXCLUDED.title,
+                    is_active = EXCLUDED.is_active,
+                    last_seen_at = NOW()
+                """,
+                (int(chat_id), chat_type, title, is_active),
+            )
+        conn.commit()
+
+
+def get_telegram_alert_chats() -> list[dict[str, Any]]:
+    if not DATABASE_URL:
+        return []
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT chat_id, chat_type, title, last_seen_at
+                FROM telegram_alert_chats
+                WHERE is_active = TRUE
+                ORDER BY last_seen_at DESC
+                """
+            )
+            return list(cur.fetchall())
+
+
 def get_parsed_event(event_id: int) -> dict[str, Any] | None:
     if not DATABASE_URL:
         return None
@@ -1381,6 +1444,7 @@ def resolve_pending_unit_confirmation(event_id: int, event: dict[str, Any]) -> d
                 isolation_male_occupied=isolation_male_occupied,
                 isolation_male_capacity=isolation_male_capacity,
                 has_orthopedist=bool(specialists.get("has_orthopedist")),
+                has_surgeon=bool(specialists.get("has_surgeon")),
                 has_psychiatrist=bool(specialists.get("has_psychiatrist")),
                 current_rooms=rooms,
             )
