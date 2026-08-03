@@ -210,15 +210,42 @@ O webhook do Telegram já está preparado para:
 
 ### Comandos prontos
 
-- `/resumo`
-- `/status`
-- `/giro`
-- `/alertas`
+Operacionais (abertos, mesmo nível de sempre):
+
+- `/resumo`, `/status`, `/giro` — situação por unidade
+- `/alertas` — últimos alertas
+
+Relatórios de gestão (**restritos** aos chats de admin — ver
+`TELEGRAM_REPORT_CHAT_IDS`):
+
+| Comando | Argumento | O que responde |
+|---|---|---|
+| `/vagas` | `vermelha`, `amarela`, `iso`, `outros` | Onde tem vaga **agora**, com destaque de quem está acima da capacidade e carimbo de dado velho |
+| `/cobranca` | dias (padrão `7`) | Tempo sem postar giro por unidade — gap atual e piores gaps do período — nomeando o coordenador cadastrado |
+| `/lotacao` | dias (padrão `7`) | Tempo acumulado **acima da capacidade** por unidade no período |
+| `/naoparseados` | dias (padrão `7`) | Mensagens que pareciam giro e não puderam ser publicadas: quantas, de qual origem e exemplos |
+
+Notas de implementação:
+
+- Todo comando aceita o sufixo de grupo (`/vagas@girodeleitos_bot`) e argumento.
+- Toda resposta passa por `send_telegram_message`, que corta a mensagem em
+  partes de até 3.500 caracteres — o limite do `sendMessage` é 4.096 e o
+  `/resumo` já o excedia, devolvendo 400 e deixando o usuário sem resposta.
+- Horários saem em `REPORT_TIMEZONE` (default `America/Sao_Paulo`).
+- Nenhum dado de paciente e nenhum telefone aparece nas respostas — só
+  contagens e nomes de coordenador.
+- `/cobranca` usa `parsed_events.created_at` (chegada real), não o horário
+  digitado no texto, que tem drift documentado.
+- `/lotacao` integra `is_over_capacity` entre giros consecutivos, com teto de
+  6h por giro: passado esse tempo o dado está velho e para de contar.
 
 ### Variáveis de ambiente
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_WEBHOOK_SECRET`
+- `TELEGRAM_ADMIN_CHAT_ID` — também é a allowlist base dos relatórios
+- `TELEGRAM_REPORT_CHAT_IDS` — chats extras autorizados (lista por vírgula)
+- `REPORT_TIMEZONE` — default `America/Sao_Paulo`
 - `PUBLIC_BASE_URL`
 - `PUBLIC_WEBHOOK_PATH`
 
