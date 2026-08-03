@@ -115,7 +115,15 @@ jobs:
               echo "WARN: DATABASE_URL ausente no .deploy-env, pulando backup"
               exit 0
             fi
-            pg_dump "$DUMP_URL" | gzip > /home/ubuntu/giro-backups/db-$ts.sql.gz
+            # magalu: o Postgres do giro roda em container (giro-de-leitos-db-local)
+            # com hostname interno "postgres" e porta nao publicada no host.
+            # Nesse caso o dump roda DENTRO do container; senao, no host como antes.
+            if echo "$DUMP_URL" | grep -q "@postgres:"; then
+              IN_URL=$(echo "$DUMP_URL" | sed "s|@postgres:|@127.0.0.1:|")
+              docker exec giro-de-leitos-db-local pg_dump "$IN_URL" | gzip > /home/ubuntu/giro-backups/db-$ts.sql.gz
+            else
+              pg_dump "$DUMP_URL" | gzip > /home/ubuntu/giro-backups/db-$ts.sql.gz
+            fi
             ls -t /home/ubuntu/giro-backups/db-*.sql.gz | tail -n +8 | xargs -r rm
             echo "backup: db-$ts.sql.gz ($(du -h /home/ubuntu/giro-backups/db-$ts.sql.gz | cut -f1))"
           EOF
