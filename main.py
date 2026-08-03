@@ -30,6 +30,7 @@ from db import (
     get_recent_alerts,
     get_registered_units,
     get_telegram_alert_chats,
+    get_unit_contacts,
     get_unit_responsibles,
     get_unparsed_summary,
     get_whatsapp_alert_state,
@@ -51,6 +52,7 @@ from reports import (
     build_unparsed_report_text,
     build_vacancy_report_text,
     build_whatsapp_stale_alert_text,
+    collect_alert_mentions,
     compute_gap_ranking,
     compute_over_capacity_ranking,
     parse_bot_command,
@@ -58,8 +60,9 @@ from reports import (
     split_message,
 )
 from services.whatsapp_alerts import (
-    WHATSAPP_ALERT_HOURS,
+    WHATSAPP_ALERT_HOURS_OVERRIDE,
     dispatch_stale_alert,
+    normalize_phone,
     select_stale_offenders,
 )
 from units import normalize_unit_text, resolve_unit_from_text, resolve_unit_name
@@ -92,7 +95,8 @@ class WhatsAppBridgeIngestPayload(BaseModel):
     text: str = Field(..., min_length=1, description="Texto bruto do giro recebido via WhatsApp bridge")
     source: str = Field(default="whatsapp-bridge", description="Origem lógica da ingestão")
     unit_hint: str | None = Field(default=None, description="Nome da UPA identificada pelo telefone do remetente")
-    sender_phone: str | None = Field(default=None, description="Telefone do remetente (formato 55XXXXXXXXXXX)")
+    sender_phone: str | None = Field(default=None, description="Telefone do remetente (formato 55XXXXXXXXXXX ou JID completo)")
+    sender_name: str | None = Field(default=None, description="Nome exibido do remetente no WhatsApp (push name), quando o webhook trouxer")
     dry_run: bool = Field(default=False, description="Se True, parseia e retorna o resultado mas NÃO salva no banco nem publica no dashboard")
 
 
@@ -211,6 +215,8 @@ def build_dashboard_event(
     received_at: datetime | None = None,
     unit_hint: str | None = None,
     official_at: datetime | None = None,
+    sender_phone: str | None = None,
+    sender_name: str | None = None,
 ) -> dict[str, Any]:
     ingested_at = received_at or datetime.now(timezone.utc)
     parsed = parse_whatsapp_message(text)
@@ -256,6 +262,15 @@ def build_dashboard_event(
 
     parsed["reported_at"] = effective_reported_at
     parsed["ingested_at"] = ingested_at.isoformat()
+    # Autoria (quando o adapter conseguiu extrair): quem posta o giro é o
+    # contato da unidade — é daqui que sai a menção do alerta e da cobrança.
+    # O número é normalizado já na entrada para nunca gravar duas grafias do
+    # mesmo telefone (JID, com máscara, com sufixo de device).
+    normalized_sender = normalize_phone(sender_phone)
+    if normalized_sender:
+        parsed["sender_phone"] = normalized_sender
+    if (sender_name or "").strip():
+        parsed["sender_name"] = sender_name.strip()
     if _time_anomaly:
         parsed["_time_anomaly"] = _time_anomaly
 
@@ -411,10 +426,14 @@ async def _stale_units_watcher() -> None:
 def _notify_stale_whatsapp(status_rows: list[dict[str, Any]], now: datetime) -> None:
     """Aviso curto de silêncio para o WhatsApp do gestor. Nunca levanta.
 
-    Uma mensagem só, com as unidades que passaram de WHATSAPP_ALERT_HOURS e
-    estão fora do cooldown. Sem violação, nada é enviado. O cooldown só é
-    gravado quando o gateway aceita — dry-run e falha de rede não consomem a
-    janela.
+    Uma mensagem só, com as unidades que estouraram o SLA do turno (diurno 6h,
+    noturno 12h — o mesmo do /cobranca) e estão fora do cooldown. Sem violação,
+    nada é enviado. O cooldown só é gravado quando o gateway aceita — dry-run e
+    falha de rede não consomem a janela.
+
+    A mensagem menciona quem POSTA o giro de cada unidade (`unit_contacts`).
+    Sem contato aprendido — e a tabela nasce vazia — o texto cai no coordenador
+    cadastrado e a lista de menções sai vazia, exatamente como antes.
     """
     try:
         last_sent = get_whatsapp_alert_state() if is_database_configured() else {}
@@ -423,10 +442,12 @@ def _notify_stale_whatsapp(status_rows: list[dict[str, Any]], now: datetime) -> 
             return
 
         responsibles = get_unit_responsibles() if is_database_configured() else {}
+        contacts = get_unit_contacts() if is_database_configured() else {}
         message = build_whatsapp_stale_alert_text(
-            offenders, responsibles, now, WHATSAPP_ALERT_HOURS
+            offenders, responsibles, now, WHATSAPP_ALERT_HOURS_OVERRIDE, contacts
         )
-        if dispatch_stale_alert(message) and is_database_configured():
+        mentions = collect_alert_mentions(offenders, contacts)
+        if dispatch_stale_alert(message, mentions) and is_database_configured():
             record_whatsapp_alert_sent([item["unit_key"] for item in offenders], now)
     except Exception as exc:
         import logging
@@ -1191,7 +1212,13 @@ async def manual_ingest(payload: ManualIngestPayload) -> dict[str, Any]:
     ),
 )
 async def whatsapp_bridge_ingest(payload: WhatsAppBridgeIngestPayload) -> dict[str, Any]:
-    event = build_dashboard_event(payload.text, payload.source, unit_hint=payload.unit_hint)
+    event = build_dashboard_event(
+        payload.text,
+        payload.source,
+        unit_hint=payload.unit_hint,
+        sender_phone=payload.sender_phone,
+        sender_name=payload.sender_name,
+    )
 
     data = event.get("data", {})
     warnings = data.get("warnings", [])
@@ -1466,10 +1493,13 @@ async def _run_bot_command(
             return "📭 Banco não configurado — sem dados para o ranking.", "Comando de cobrança sem banco.", {}
         activity = await run_in_threadpool(get_giro_activity, days)
         responsibles = await run_in_threadpool(get_unit_responsibles)
+        contacts = await run_in_threadpool(get_unit_contacts)
         unparsed = await run_in_threadpool(get_unparsed_summary, days, 1)
         ranking = compute_gap_ranking(activity["events"], activity["last_by_unit"], now, days)
         return (
-            build_compliance_messages(ranking, responsibles, now, days, unparsed.get("total", 0)),
+            build_compliance_messages(
+                ranking, responsibles, now, days, unparsed.get("total", 0), contacts
+            ),
             "Comando de cobrança processado.",
             {},
         )

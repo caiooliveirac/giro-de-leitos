@@ -18,11 +18,17 @@ os.environ.setdefault("JWT_SECRET", "test-secret-whatsapp")
 os.environ.setdefault("CPF_ENCRYPTION_KEY", "OmaP3i0nC2P9MwJv5wDhlb0aBpfNn5Y73I9c8wL2cIc=")
 os.environ.setdefault("CPF_HASH_PEPPER", "test-pepper")
 
-from reports import MAX_WHATSAPP_ALERT_UNITS, build_whatsapp_stale_alert_text  # noqa: E402
+from reports import GIRO_SLA, MAX_WHATSAPP_ALERT_UNITS, build_whatsapp_stale_alert_text  # noqa: E402
 from services import whatsapp_alerts  # noqa: E402
 
 
 NOW = datetime(2026, 8, 3, 18, 32, tzinfo=timezone.utc)  # 15:32 em America/Sao_Paulo
+_LOCAL_TZ = timezone(timedelta(hours=-3))  # America/Sao_Paulo não tem horário de verão
+
+
+def _local(day: int, hour: int, minute: int = 0) -> datetime:
+    """Instante escrito em hora LOCAL — é como o SLA por turno é definido."""
+    return datetime(2026, 8, day, hour, minute, tzinfo=_LOCAL_TZ)
 
 
 def _status_row(unit_key: str, unit_code: str, name: str, hours_ago: float | None) -> dict:
@@ -33,6 +39,109 @@ def _status_row(unit_key: str, unit_code: str, name: str, hours_ago: float | Non
         "canonical_name": name,
         "updated_at": None if hours_ago is None else NOW - timedelta(hours=hours_ago),
     }
+
+
+def _status_row_at(unit_key: str, unit_code: str, name: str, updated_at: datetime) -> dict:
+    return {
+        "unit_key": unit_key,
+        "unit_code": unit_code,
+        "displayed_name": name,
+        "canonical_name": name,
+        "updated_at": updated_at,
+    }
+
+
+class ShiftSlaTests(unittest.TestCase):
+    """O limiar padrão é o SLA por turno do /cobranca, não um número fixo.
+
+    8h de silêncio às 10h da manhã é falha; 8h de madrugada é o combinado. Um
+    limiar único errava um dos dois casos — e errar para mais cala o canal, que
+    é a falha irreversível deste módulo.
+    """
+
+    def test_daytime_gap_above_six_hours_is_an_offender(self) -> None:
+        # 08:32 → 15:32 local: 7h inteiras dentro do turno diurno.
+        rows = [_status_row("a", "upa_barris", "UPA BARRIS", 7.0)]
+
+        offenders = whatsapp_alerts.select_stale_offenders(rows, NOW)
+
+        self.assertEqual([item["unit_key"] for item in offenders], ["a"])
+        self.assertEqual(offenders[0]["shift"], "diurno")
+        self.assertEqual(offenders[0]["limit_hours"], GIRO_SLA["day_max_gap_hours"])
+
+    def test_daytime_gap_below_six_hours_is_not(self) -> None:
+        rows = [_status_row("a", "upa_barris", "UPA BARRIS", 5.0)]
+
+        self.assertEqual(whatsapp_alerts.select_stale_offenders(rows, NOW), [])
+
+    def test_eight_hours_at_night_is_within_the_combined_limit(self) -> None:
+        """O mesmo silêncio que reprova de dia passa de madrugada."""
+        now = _local(4, 5, 0)  # 05:00 local, turno noturno
+        rows = [_status_row_at("a", "upa_barris", "UPA BARRIS", _local(3, 21, 0))]
+
+        self.assertEqual(whatsapp_alerts.select_stale_offenders(rows, now), [])
+
+    def test_night_gap_above_twelve_hours_is_an_offender(self) -> None:
+        now = _local(4, 5, 0)
+        # 16:00 → 05:00: 3h de dia e 10h de noite; a maior parte é noturna.
+        rows = [_status_row_at("a", "upa_barris", "UPA BARRIS", _local(3, 16, 0))]
+
+        offenders = whatsapp_alerts.select_stale_offenders(rows, now)
+
+        self.assertEqual(len(offenders), 1)
+        self.assertEqual(offenders[0]["shift"], "noturno")
+        self.assertEqual(offenders[0]["limit_hours"], GIRO_SLA["night_max_gap_hours"])
+
+    def test_tolerance_of_the_cobranca_is_honoured(self) -> None:
+        """6h00m30s não é violação — o arredondamento não pode virar cobrança."""
+        rows = [_status_row("a", "upa_barris", "UPA BARRIS", 6.0 + 30 / 3600)]
+
+        self.assertEqual(whatsapp_alerts.select_stale_offenders(rows, NOW), [])
+
+        rows = [_status_row("a", "upa_barris", "UPA BARRIS", 6.2)]
+        self.assertEqual(len(whatsapp_alerts.select_stale_offenders(rows, NOW)), 1)
+
+    def test_env_override_replaces_the_shift_rule_with_a_fixed_number(self) -> None:
+        """WHATSAPP_ALERT_HOURS existe como escape — e desliga o turno."""
+        rows = [_status_row("a", "upa_barris", "UPA BARRIS", 7.0)]
+
+        with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_HOURS_OVERRIDE", 12.0):
+            self.assertEqual(whatsapp_alerts.select_stale_offenders(rows, NOW), [])
+
+        with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_HOURS_OVERRIDE", None):
+            self.assertEqual(len(whatsapp_alerts.select_stale_offenders(rows, NOW)), 1)
+
+    def test_cooldown_still_applies_under_the_shift_rule(self) -> None:
+        rows = [_status_row("a", "upa_barris", "UPA BARRIS", 9.0)]
+
+        offenders = whatsapp_alerts.select_stale_offenders(
+            rows, NOW, cooldown_hours=6.0, last_sent_by_unit={"a": NOW - timedelta(hours=1)}
+        )
+
+        self.assertEqual(offenders, [])
+
+    def test_alert_text_shows_the_shift_limit_that_was_broken(self) -> None:
+        rows = [
+            _status_row("a", "upa_barris", "UPA BARRIS", 7.0),
+            _status_row_at("b", "pa_sao_marcos", "PA SÃO MARCOS", _local(2, 20, 0)),
+        ]
+
+        offenders = whatsapp_alerts.select_stale_offenders(rows, NOW)
+        text = build_whatsapp_stale_alert_text(offenders, {}, NOW)
+
+        self.assertIn("🔴 *UPA sem giro além do combinado*", text)
+        self.assertIn("SLA diurno (07h–19h) até 6h · noturno (19h–07h) até 12h", text)
+        self.assertIn("• UPA BARRIS — 7h00 (limite diurno 6h)", text)
+        self.assertIn("(limite noturno 12h)", text)
+
+    def test_alert_text_stays_short_under_the_shift_rule(self) -> None:
+        offenders = whatsapp_alerts.select_stale_offenders(
+            [_status_row(f"u{i}", f"code{i}", f"UPA {i}", 13.0 + i) for i in range(3)], NOW
+        )
+
+        text = build_whatsapp_stale_alert_text(offenders, {}, NOW)
+
+        self.assertLessEqual(len(text.splitlines()), 8)
 
 
 class ThresholdTests(unittest.TestCase):
@@ -166,7 +275,7 @@ class DispatchTests(unittest.TestCase):
             sent = whatsapp_alerts.dispatch_stale_alert("🔴 alerta de teste")
 
         self.assertTrue(sent)
-        send.assert_called_once_with("5571999999999", "🔴 alerta de teste")
+        send.assert_called_once_with("5571999999999", "🔴 alerta de teste", mentions=[])
 
     def test_gateway_failure_never_raises_and_reports_not_sent(self) -> None:
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \

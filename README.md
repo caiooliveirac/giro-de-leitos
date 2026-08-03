@@ -263,13 +263,17 @@ implementado em `services/whatsapp_alerts.py` e disparado pela mesma varredura
 de `main._stale_units_watcher` (a cada `STALE_CHECK_INTERVAL_MINUTES`).
 
 Não é relatório: **uma** mensagem curta, uma linha por UPA com horas sem giro e
-coordenador. Sem unidade acima do limiar, nada é enviado.
+quem posta o giro daquela unidade. Sem unidade em violação, nada é enviado.
 
 Três travas, nesta ordem:
 
-1. **Limiar próprio e mais alto** (`WHATSAPP_ALERT_HOURS`, default 12h) — o
-   Telegram é o acompanhamento do dia a dia; aqui só entra o que já virou
-   cobrança. Compartilhar o limiar de 10h transformaria o canal em spam.
+1. **Limiar por turno** — o **mesmo** SLA do `/cobranca` (`reports.GIRO_SLA`,
+   via `classify_gap`): diurno (07h–19h) viola acima de **6h**, noturno
+   (19h–07h) acima de **12h**. Um número só errava um dos dois casos: 8h de
+   silêncio às 10h da manhã é falha, 8h de madrugada é o combinado. Alerta e
+   cobrança usando regras diferentes fariam o gestor desconfiar dos dois.
+   `WHATSAPP_ALERT_HOURS` continua existindo como **override** opcional
+   (limiar fixo, sem turno) — deixe **vazio** para usar o SLA.
 2. **Cooldown por unidade** (`WHATSAPP_ALERT_COOLDOWN_HOURS`, default 6h), com
    estado em `whatsapp_alert_state` — persistido porque deploy/restart não
    pode zerar o anti-spam.
@@ -278,9 +282,27 @@ Três travas, nesta ordem:
 
 O envio usa o gateway whatsmeow já em produção
 (`aldinokemal2104/go-whatsapp-web-multidevice`): `POST /send/message` com
-`{"phone": ..., "message": ...}` e HTTP basic auth. Falha do gateway nunca
-propaga — `dispatch_stale_alert` devolve `False`, o cooldown **não** é gravado
-e a próxima varredura tenta de novo.
+`{"phone": ..., "message": ..., "mentions": [...]}` e HTTP basic auth. Falha do
+gateway nunca propaga — `dispatch_stale_alert` devolve `False`, o cooldown
+**não** é gravado e a próxima varredura tenta de novo.
+
+### Menção de quem posta o giro
+
+As UPAs postam o próprio giro pelo WhatsApp, então **quem posta é o contato da
+unidade** — nomear o coordenador cadastrado não resolvia, porque quase nunca é
+ele quem manda a mensagem no grupo. O alerta e o `/cobranca` usam a tabela
+`unit_contacts`, alimentada pela própria ingestão:
+
+- o adapter (`deploy/giro-wa-adapter/adapter.mjs`) extrai o remetente do
+  webhook e envia `sender_phone` + `sender_name` ao ingest;
+- `parsed_events` guarda a autoria de cada giro e `unit_contacts` acumula
+  quem posta por unidade (com contagem e último envio);
+- o alerta menciona esses números pelo campo `mentions` (menção fantasma: o
+  gateway notifica mesmo sem `@` no texto).
+
+**Fallback obrigatório:** unidade sem contato aprendido — e a tabela nasce
+vazia — volta a exibir o coordenador cadastrado, com a lista de menções vazia.
+Nada nesse caminho pode falhar por falta de autoria.
 
 ### Variáveis de ambiente
 
@@ -290,7 +312,7 @@ e a próxima varredura tenta de novo.
 | `WHATSAPP_ALERT_TO` | vazio | Número com DDI (`5571999999999`) ou JID; vazio = desligado |
 | `WHATSAPP_GW_URL` | `http://127.0.0.1:3080` | Da API (em container) use `http://host.docker.internal:3080` |
 | `WHATSAPP_GW_AUTH` | vazio | `usuario:segredo` — o mesmo `APP_BASIC_AUTH` do container `whatsmeow-gw` |
-| `WHATSAPP_ALERT_HOURS` | `12` | Limiar, separado do `STALE_ALERT_HOURS` |
+| `WHATSAPP_ALERT_HOURS` | vazio | **Override**: limiar fixo em horas. Vazio = SLA por turno (6h/12h) |
 | `WHATSAPP_ALERT_COOLDOWN_HOURS` | `6` | Janela mínima entre avisos da mesma unidade |
 
 ---
@@ -301,7 +323,9 @@ O banco mantém três camadas principais:
 
 ### `parsed_events`
 
-Armazena cada giro recebido como evento histórico.
+Armazena cada giro recebido como evento histórico. Quando o adapter consegue
+extrair o remetente, guarda também a **autoria** (`sender_phone`,
+`sender_name`); ingestão manual e mensagens antigas ficam com `NULL`.
 
 ### `current_unit_status`
 
@@ -323,6 +347,12 @@ Armazena alertas gerados a partir de transições relevantes, como:
 Uma linha por unidade com o horário do último alerta de silêncio **entregue**
 no WhatsApp do gestor — é o cooldown do canal (dry-run e falha de rede não
 gravam).
+
+### `unit_contacts`
+
+Quem posta o giro de cada unidade, **derivado da ingestão** (não é cadastro):
+uma linha por `(unit_code, sender_phone)` com contagem de giros, primeiro e
+último envio. É a origem das menções do alerta e do `/cobranca`.
 
 ---
 

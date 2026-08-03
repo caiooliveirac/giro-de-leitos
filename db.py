@@ -10,6 +10,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from parser_service import parse_whatsapp_message
+from services.whatsapp_alerts import normalize_phone
 from units import normalize_unit_text, resolve_unit_from_text, resolve_unit_name, seed_units
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -63,6 +64,12 @@ ALTER TABLE parsed_events ADD COLUMN IF NOT EXISTS canonical_unit_name TEXT;
 ALTER TABLE parsed_events ADD COLUMN IF NOT EXISTS unit_match_confidence DOUBLE PRECISION;
 ALTER TABLE parsed_events ADD COLUMN IF NOT EXISTS unit_match_method TEXT;
 ALTER TABLE parsed_events ADD COLUMN IF NOT EXISTS unit_matched_alias TEXT;
+
+-- Autoria do giro: quem mandou a mensagem (ver
+-- migrations/009_parsed_events_sender.sql). Opcionais: ingestão manual e
+-- adapter antigo continuam gravando NULL.
+ALTER TABLE parsed_events ADD COLUMN IF NOT EXISTS sender_phone TEXT;
+ALTER TABLE parsed_events ADD COLUMN IF NOT EXISTS sender_name TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_parsed_events_upa_received_at
     ON parsed_events (upa_name, received_at DESC);
@@ -136,6 +143,18 @@ CREATE TABLE IF NOT EXISTS telegram_alert_chats (
 CREATE TABLE IF NOT EXISTS whatsapp_alert_state (
     unit_key TEXT PRIMARY KEY,
     last_sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Quem posta o giro de cada unidade, derivado da ingestão (ver
+-- migrations/010_unit_contacts.sql).
+CREATE TABLE IF NOT EXISTS unit_contacts (
+    unit_code TEXT NOT NULL,
+    sender_phone TEXT NOT NULL,
+    sender_name TEXT,
+    giro_count BIGINT NOT NULL DEFAULT 1,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (unit_code, sender_phone)
 );
 """
 
@@ -556,6 +575,33 @@ def _emit_transition_alerts(
     return alerts
 
 
+def _touch_unit_contact(
+    cur: psycopg.Cursor[Any],
+    unit_code: str,
+    sender_phone: str,
+    sender_name: str | None,
+) -> None:
+    """Registra/incrementa quem postou este giro nesta unidade.
+
+    Roda dentro da MESMA transação do evento: contato aprendido sem giro
+    gravado (ou o contrário) seria uma contagem que não bate com o histórico.
+
+    O nome é atualizado só quando vem preenchido — o push_name do WhatsApp
+    falta com frequência e não pode apagar o que já sabíamos.
+    """
+    cur.execute(
+        """
+        INSERT INTO unit_contacts (unit_code, sender_phone, sender_name, giro_count)
+        VALUES (%s, %s, %s, 1)
+        ON CONFLICT (unit_code, sender_phone) DO UPDATE SET
+            giro_count = unit_contacts.giro_count + 1,
+            sender_name = COALESCE(EXCLUDED.sender_name, unit_contacts.sender_name),
+            last_seen_at = NOW()
+        """,
+        (unit_code, sender_phone, sender_name),
+    )
+
+
 def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
     """Salva evento e retorna info de anomalias detectadas (ou None)."""
     if not DATABASE_URL:
@@ -570,6 +616,11 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
     reported_upa_name = data.get("reported_upa_name") or data.get("upa_name")
     unit_key = unit_code or f"raw:{normalize_unit_text(reported_upa_name or '')}"
     displayed_name = canonical_unit_name or reported_upa_name or str(event.get("source") or "unidade-desconhecida")
+    # Autoria: só existe quando o adapter conseguiu extrair o remetente do
+    # webhook. Ausente = NULL nas colunas e nenhum contato aprendido — nunca
+    # um erro (a maior parte do histórico não tem autor).
+    sender_phone = normalize_phone(data.get("sender_phone"))
+    sender_name = (data.get("sender_name") or "").strip() or None
 
     red_occupied, red_capacity = _room_values(rooms.get("red_room"))
     yellow_occupied, yellow_capacity = _room_values(rooms.get("yellow_room"))
@@ -616,6 +667,8 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
                     has_orthopedist,
                     has_surgeon,
                     has_psychiatrist,
+                    sender_phone,
+                    sender_name,
                     payload
                 ) VALUES (
                     %(source)s,
@@ -645,6 +698,8 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
                     %(has_orthopedist)s,
                     %(has_surgeon)s,
                     %(has_psychiatrist)s,
+                    %(sender_phone)s,
+                    %(sender_name)s,
                     %(payload)s::jsonb
                 )
                 RETURNING id
@@ -677,11 +732,16 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
                     "has_orthopedist": bool(specialists.get("has_orthopedist")),
                     "has_surgeon": bool(specialists.get("has_surgeon")),
                     "has_psychiatrist": bool(specialists.get("has_psychiatrist")),
+                    "sender_phone": sender_phone or None,
+                    "sender_name": sender_name,
                     "payload": _json_dumps(event),
                 },
             )
             event_id_row = cur.fetchone()
             event_id = event_id_row["id"] if event_id_row else None
+
+            if unit_code and sender_phone:
+                _touch_unit_contact(cur, unit_code, sender_phone, sender_name)
 
             if unit_code and displayed_name:
                 cur.execute(
@@ -2141,6 +2201,69 @@ def get_unit_responsibles() -> dict[str, list[str]]:
         unit_code: (bucket["primary"] or bucket["other"])
         for unit_code, bucket in grouped.items()
     }
+
+
+def group_unit_contacts(
+    rows: list[dict[str, Any]],
+    limit_per_unit: int = 3,
+) -> dict[str, list[dict[str, Any]]]:
+    """Agrupa as linhas de `unit_contacts` por unidade, mantendo a ordem do SQL.
+
+    Separada da consulta porque é a parte com regra (o corte por unidade) e a
+    única que dá para testar sem banco.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        unit_code = row.get("unit_code")
+        phone = str(row.get("sender_phone") or "").strip()
+        if not unit_code or not phone:
+            continue
+        bucket = grouped.setdefault(unit_code, [])
+        if len(bucket) >= limit_per_unit:
+            continue
+        bucket.append(
+            {
+                "phone": phone,
+                "name": row.get("sender_name"),
+                "giro_count": row.get("giro_count"),
+                "last_seen_at": row.get("last_seen_at"),
+            }
+        )
+    return grouped
+
+
+def get_unit_contacts(
+    limit_per_unit: int = 3,
+    min_giro_count: int = 1,
+) -> dict[str, list[dict[str, Any]]]:
+    """Quem posta o giro, por unidade — os que mais postam primeiro.
+
+    Derivado da ingestão (`unit_contacts`), não de cadastro: é a resposta para
+    "quem eu chamo quando a UPA X para de postar?". O telefone SAI daqui de
+    propósito — ele é a menção (campo `mentions` do gateway) que faz o aviso
+    chegar em quem posta, diferente de `get_unit_responsibles`, onde o telefone
+    do coordenador é dado pessoal que nunca vai para mensagem automática.
+
+    Devolve {} quando não há banco ou a tabela ainda está vazia; todo consumidor
+    trata isso como "cai no coordenador cadastrado".
+    """
+    if not DATABASE_URL:
+        return {}
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT unit_code, sender_phone, sender_name, giro_count, last_seen_at
+                FROM unit_contacts
+                WHERE giro_count >= %s
+                ORDER BY unit_code ASC, giro_count DESC, last_seen_at DESC
+                """,
+                (min_giro_count,),
+            )
+            rows = cur.fetchall()
+
+    return group_unit_contacts(rows, limit_per_unit)
 
 
 def record_unparsed_message(
