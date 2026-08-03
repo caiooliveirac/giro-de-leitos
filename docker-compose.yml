@@ -52,6 +52,13 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       # --- Comunicação com a bridge (sai da API para a bridge) ---
       WHATSAPP_BRIDGE_URL: ${WHATSAPP_BRIDGE_URL:-http://whatsapp-bridge:3000}
+      # --- Alerta de silêncio no WhatsApp do gestor (nasce DESLIGADO) ---
+      WHATSAPP_ALERT_ENABLED: ${WHATSAPP_ALERT_ENABLED:-false}
+      WHATSAPP_ALERT_TO: ${WHATSAPP_ALERT_TO:-}
+      WHATSAPP_GW_URL: ${WHATSAPP_GW_URL:-http://host.docker.internal:3080}
+      WHATSAPP_GW_AUTH: ${WHATSAPP_GW_AUTH:-}
+      WHATSAPP_ALERT_HOURS: ${WHATSAPP_ALERT_HOURS:-12}
+      WHATSAPP_ALERT_COOLDOWN_HOURS: ${WHATSAPP_ALERT_COOLDOWN_HOURS:-6}
       # --- Auth / Crypto (fail-fast) ---
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET obrigatorio}
       CPF_ENCRYPTION_KEY: ${CPF_ENCRYPTION_KEY:?CPF_ENCRYPTION_KEY obrigatorio}

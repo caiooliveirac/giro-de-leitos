@@ -256,6 +256,45 @@ Notas de implementação:
 
 ---
 
+## Alerta de silêncio no WhatsApp do gestor
+
+Canal **adicional** ao watcher de Telegram do admin (`STALE_ALERT_HOURS`, 10h),
+implementado em `services/whatsapp_alerts.py` e disparado pela mesma varredura
+de `main._stale_units_watcher` (a cada `STALE_CHECK_INTERVAL_MINUTES`).
+
+Não é relatório: **uma** mensagem curta, uma linha por UPA com horas sem giro e
+coordenador. Sem unidade acima do limiar, nada é enviado.
+
+Três travas, nesta ordem:
+
+1. **Limiar próprio e mais alto** (`WHATSAPP_ALERT_HOURS`, default 12h) — o
+   Telegram é o acompanhamento do dia a dia; aqui só entra o que já virou
+   cobrança. Compartilhar o limiar de 10h transformaria o canal em spam.
+2. **Cooldown por unidade** (`WHATSAPP_ALERT_COOLDOWN_HOURS`, default 6h), com
+   estado em `whatsapp_alert_state` — persistido porque deploy/restart não
+   pode zerar o anti-spam.
+3. **Nasce desligado** — sem `WHATSAPP_ALERT_ENABLED=true` **e** destino
+   preenchido, o código só loga o que enviaria (dry-run) e não chama o gateway.
+
+O envio usa o gateway whatsmeow já em produção
+(`aldinokemal2104/go-whatsapp-web-multidevice`): `POST /send/message` com
+`{"phone": ..., "message": ...}` e HTTP basic auth. Falha do gateway nunca
+propaga — `dispatch_stale_alert` devolve `False`, o cooldown **não** é gravado
+e a próxima varredura tenta de novo.
+
+### Variáveis de ambiente
+
+| Variável | Default | Observação |
+|---|---|---|
+| `WHATSAPP_ALERT_ENABLED` | `false` | Interruptor geral |
+| `WHATSAPP_ALERT_TO` | vazio | Número com DDI (`5571999999999`) ou JID; vazio = desligado |
+| `WHATSAPP_GW_URL` | `http://127.0.0.1:3080` | Da API (em container) use `http://host.docker.internal:3080` |
+| `WHATSAPP_GW_AUTH` | vazio | `usuario:segredo` — o mesmo `APP_BASIC_AUTH` do container `whatsmeow-gw` |
+| `WHATSAPP_ALERT_HOURS` | `12` | Limiar, separado do `STALE_ALERT_HOURS` |
+| `WHATSAPP_ALERT_COOLDOWN_HOURS` | `6` | Janela mínima entre avisos da mesma unidade |
+
+---
+
 ## Persistência
 
 O banco mantém três camadas principais:
@@ -278,6 +317,12 @@ Armazena alertas gerados a partir de transições relevantes, como:
 - disponibilidade de isolamento adulto
 - mudança de ortopedia
 - mudança de psiquiatria
+
+### `whatsapp_alert_state`
+
+Uma linha por unidade com o horário do último alerta de silêncio **entregue**
+no WhatsApp do gestor — é o cooldown do canal (dry-run e falha de rede não
+gravam).
 
 ---
 

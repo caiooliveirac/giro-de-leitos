@@ -32,9 +32,11 @@ from db import (
     get_telegram_alert_chats,
     get_unit_responsibles,
     get_unparsed_summary,
+    get_whatsapp_alert_state,
     init_db,
     is_database_configured,
     record_unparsed_message,
+    record_whatsapp_alert_sent,
     register_telegram_alert_chat,
     resolve_pending_unit_confirmation,
     save_event,
@@ -48,11 +50,17 @@ from reports import (
     build_reports_help_lines,
     build_unparsed_report_text,
     build_vacancy_report_text,
+    build_whatsapp_stale_alert_text,
     compute_gap_ranking,
     compute_over_capacity_ranking,
     parse_bot_command,
     parse_days_arg,
     split_message,
+)
+from services.whatsapp_alerts import (
+    WHATSAPP_ALERT_HOURS,
+    dispatch_stale_alert,
+    select_stale_offenders,
 )
 from units import normalize_unit_text, resolve_unit_from_text, resolve_unit_name
 
@@ -390,9 +398,39 @@ async def _stale_units_watcher() -> None:
                     _notify_admin_telegram,
                     f"⏰ <b>UPA há mais de {STALE_ALERT_HOURS:.0f}h sem giro</b>\n{lines}",
                 )
+            # Canal separado, limiar mais alto: o gestor só é incomodado no
+            # WhatsApp quando o silêncio já virou cobrança. Isolado num
+            # try/except próprio para que o WhatsApp fora do ar não derrube o
+            # alerta do Telegram, que é o canal principal.
+            await run_in_threadpool(_notify_stale_whatsapp, rows, now)
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Watcher de unidades sem giro falhou: %s", exc)
+
+
+def _notify_stale_whatsapp(status_rows: list[dict[str, Any]], now: datetime) -> None:
+    """Aviso curto de silêncio para o WhatsApp do gestor. Nunca levanta.
+
+    Uma mensagem só, com as unidades que passaram de WHATSAPP_ALERT_HOURS e
+    estão fora do cooldown. Sem violação, nada é enviado. O cooldown só é
+    gravado quando o gateway aceita — dry-run e falha de rede não consomem a
+    janela.
+    """
+    try:
+        last_sent = get_whatsapp_alert_state() if is_database_configured() else {}
+        offenders = select_stale_offenders(status_rows, now, last_sent_by_unit=last_sent)
+        if not offenders:
+            return
+
+        responsibles = get_unit_responsibles() if is_database_configured() else {}
+        message = build_whatsapp_stale_alert_text(
+            offenders, responsibles, now, WHATSAPP_ALERT_HOURS
+        )
+        if dispatch_stale_alert(message) and is_database_configured():
+            record_whatsapp_alert_sent([item["unit_key"] for item in offenders], now)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Alerta WhatsApp de unidades sem giro falhou: %s", exc)
 
 
 def _configured_admin_chat_ids() -> list[str]:

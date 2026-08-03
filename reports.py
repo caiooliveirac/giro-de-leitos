@@ -1079,6 +1079,63 @@ def build_over_capacity_report_text(
 
 
 # ---------------------------------------------------------------------------
+# Builder: alerta de silêncio por WhatsApp (gestor)
+# ---------------------------------------------------------------------------
+
+# Teto de unidades citadas nominalmente no aviso. O alerta é lido no celular,
+# em pé, no corredor: passar disso vira relatório e para de ser lido. O que
+# não couber é anunciado como "+N", nunca cortado em silêncio.
+MAX_WHATSAPP_ALERT_UNITS = 8
+
+
+def _coordinator_summary(unit_code: str | None, responsibles: dict[str, list[str]]) -> str:
+    """'Joilson Santos', 'Joilson · Maria +2' ou 'sem coordenador'.
+
+    Só o nome — telefone de coordenador nunca sai em mensagem automática
+    (mesma regra de db.get_unit_responsibles).
+    """
+    names = responsibles.get(unit_code or "") or []
+    if not names:
+        return "sem coordenador"
+    shown = " · ".join(names[:2])
+    return f"{shown} +{len(names) - 2}" if len(names) > 2 else shown
+
+
+def build_whatsapp_stale_alert_text(
+    offenders: list[dict[str, Any]],
+    responsibles: dict[str, list[str]],
+    now: datetime,
+    threshold_hours: float,
+) -> str:
+    """Aviso curto de UPA sem giro, em texto puro para o WhatsApp do gestor.
+
+    Não é relatório: uma linha por unidade com horas e coordenador, e nada
+    mais. Sem HTML (o WhatsApp não entende) — negrito é *asterisco*.
+
+    `offenders` já vem filtrado por limiar e cooldown
+    (services.whatsapp_alerts.select_stale_offenders); aqui só se formata.
+    """
+    ordered = sorted(offenders, key=lambda item: item.get("age_hours") or 0.0, reverse=True)
+    shown = ordered[:MAX_WHATSAPP_ALERT_UNITS]
+    lines = [
+        f"🔴 *UPA sem giro há mais de {threshold_label(threshold_hours)}*",
+        fmt_local(now),
+        "",
+    ]
+    for item in shown:
+        name = short_unit_name(item.get("unit_code"), item.get("unit_name"))
+        coordinator = _coordinator_summary(item.get("unit_code"), responsibles)
+        lines.append(f"• {name} — {fmt_duration(item.get('age_hours'))} · 👤 {coordinator}")
+
+    remaining = len(ordered) - len(shown)
+    if remaining > 0:
+        lines.append(f"• +{remaining} unidade(s) também sem giro")
+
+    lines.extend(["", "Giro de Leitos · aviso automático"])
+    return "\n".join(lines).strip()
+
+
+# ---------------------------------------------------------------------------
 # Ajuda
 # ---------------------------------------------------------------------------
 

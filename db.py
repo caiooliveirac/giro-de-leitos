@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 import psycopg
@@ -129,6 +129,13 @@ CREATE TABLE IF NOT EXISTS telegram_alert_chats (
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Cooldown por unidade do alerta de silêncio por WhatsApp (ver
+-- migrations/008_whatsapp_alert_state.sql).
+CREATE TABLE IF NOT EXISTS whatsapp_alert_state (
+    unit_key TEXT PRIMARY KEY,
+    last_sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
 
@@ -1193,6 +1200,44 @@ def get_telegram_alert_chats() -> list[dict[str, Any]]:
                 """
             )
             return list(cur.fetchall())
+
+
+def get_whatsapp_alert_state() -> dict[str, datetime]:
+    """Último aviso de silêncio enviado por WhatsApp, por unidade.
+
+    Base do cooldown: o watcher varre a cada 30min e sem isto o mesmo aviso
+    sairia em toda varredura. Persistido porque deploy/restart não pode zerar
+    o anti-spam.
+    """
+    if not DATABASE_URL:
+        return {}
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT unit_key, last_sent_at FROM whatsapp_alert_state")
+            return {row["unit_key"]: row["last_sent_at"] for row in cur.fetchall()}
+
+
+def record_whatsapp_alert_sent(unit_keys: list[str], sent_at: datetime | None = None) -> None:
+    """Marca as unidades citadas no aviso que ACABOU de ser entregue.
+
+    Só é chamada depois do gateway aceitar a mensagem — dry-run não grava, ou
+    ligar o canal depois começaria já em cooldown.
+    """
+    if not DATABASE_URL or not unit_keys:
+        return
+    moment = sent_at or datetime.now(timezone.utc)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            for unit_key in unit_keys:
+                cur.execute(
+                    """
+                    INSERT INTO whatsapp_alert_state (unit_key, last_sent_at)
+                    VALUES (%s, %s)
+                    ON CONFLICT (unit_key) DO UPDATE SET last_sent_at = EXCLUDED.last_sent_at
+                    """,
+                    (unit_key, moment),
+                )
+        conn.commit()
 
 
 def get_parsed_event(event_id: int) -> dict[str, Any] | None:
