@@ -29,7 +29,9 @@ const GROUP_JID = (process.env.GIRO_GROUP_JID || "").trim();
 const SENDER_JID_FIELDS = ["sender_jid", "sender", "participant", "from", "author"];
 // Nome exibido (push name). Só enfeite: identifica o humano no log e no texto
 // do alerta, mas quem faz a menção funcionar é o número.
-const SENDER_NAME_FIELDS = ["sender_display_name", "push_name", "pushname", "notify", "sender_name"];
+// `from_name` e o campo REAL deste gateway (go-whatsapp-web-multidevice v9),
+// confirmado no webhook de producao em 03/08/2026; os demais sao fallback.
+const SENDER_NAME_FIELDS = ["from_name", "sender_display_name", "push_name", "pushname", "notify", "sender_name"];
 
 const GROUP_SUFFIX = "@g.us";
 
