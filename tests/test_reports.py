@@ -14,19 +14,22 @@ from fastapi.testclient import TestClient  # noqa: E402
 import main  # noqa: E402
 from main import build_priority_buckets, build_system_summary_text, build_telegram_help_reply, is_report_chat_authorized
 from reports import (
+    GIRO_SLA,
+    MAX_COBRANCA_SNIPPETS,
     MESSAGE_CHUNK_LIMIT,
-    build_compliance_report_text,
+    build_compliance_messages,
     build_over_capacity_report_text,
     build_unparsed_report_text,
     build_vacancy_report_text,
+    classify_gap,
     compute_gap_ranking,
     compute_over_capacity_ranking,
     fmt_duration,
     fmt_local,
-    night_overlap_hours,
     parse_bot_command,
     parse_days_arg,
     redact_line,
+    shift_split_hours,
     short_unit_name,
     split_message,
     traffic_light,
@@ -35,6 +38,28 @@ from units import UNIT_REGISTRY
 
 
 NOW = datetime(2026, 8, 3, 18, 32, tzinfo=timezone.utc)  # 15:32 em America/Sao_Paulo
+_LOCAL_TZ = timezone(timedelta(hours=-3))  # America/Sao_Paulo não tem horário de verão
+
+
+def _local(day: int, hour: int, minute: int = 0) -> datetime:
+    """Instante escrito em hora LOCAL — é como o SLA por turno é definido."""
+    return datetime(2026, 8, day, hour, minute, tzinfo=_LOCAL_TZ)
+
+
+def _giros(unit_code: str, *moments: tuple) -> list[dict]:
+    """Giros de uma unidade a partir de horários locais (dia, hora[, minuto])."""
+    return [{"unit_code": unit_code, "created_at": _local(*moment)} for moment in moments]
+
+
+def _everyone_else_is_up_to_date(**last_by_unit: datetime) -> dict:
+    """Rede inteira com giro recente, menos as unidades passadas explicitamente.
+
+    Sem isso toda unidade do registro entraria como "nunca postou" e viraria
+    ruído em cima do caso sob teste.
+    """
+    baseline = {unit["code"]: NOW - timedelta(hours=1) for unit in UNIT_REGISTRY}
+    baseline.update(last_by_unit)
+    return baseline
 
 
 def _room(occupied: int, capacity: int) -> dict:
@@ -175,17 +200,6 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(short_unit_name(None, "UPA PARQUE SÃO CRISTOVÃO"), "UPA P. SÃO CRISTÓVÃO")
         self.assertEqual(short_unit_name(None, "PA TANCREDO NEVES - RODRIGO ARGOLO"), "PA TANCREDO NEVES")
 
-    def test_night_overlap_counts_only_midnight_to_five(self) -> None:
-        # 23:00 -> 07:00 local (02:00Z -> 10:00Z) => 5h de madrugada
-        start = datetime(2026, 8, 3, 2, 0, tzinfo=timezone.utc)
-        end = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
-        self.assertAlmostEqual(night_overlap_hours(start, end), 5.0, places=2)
-
-    def test_night_overlap_is_zero_during_the_day(self) -> None:
-        start = datetime(2026, 8, 3, 15, 0, tzinfo=timezone.utc)  # 12:00 local
-        end = datetime(2026, 8, 3, 18, 0, tzinfo=timezone.utc)  # 15:00 local
-        self.assertEqual(night_overlap_hours(start, end), 0.0)
-
     def test_redaction_masks_long_digit_runs(self) -> None:
         self.assertNotIn("071993731970", redact_line("Ligar 071993731970 agora"))
         self.assertIn("04/07", redact_line("SALA VERMELHA 04/07"))
@@ -289,6 +303,80 @@ class VacancyReportTests(unittest.TestCase):
         self.assertNotIn("AVC", text)
 
 
+class ShiftSlaTests(unittest.TestCase):
+    """Turnos e limites do SLA (diurno 07–19 > 6h · noturno 19–07 > 12h)."""
+
+    def test_sla_thresholds_live_in_one_constant(self) -> None:
+        self.assertEqual(GIRO_SLA["day_start_hour"], 7)
+        self.assertEqual(GIRO_SLA["day_end_hour"], 19)
+        self.assertEqual(GIRO_SLA["day_max_gap_hours"], 6.0)
+        self.assertEqual(GIRO_SLA["night_max_gap_hours"], 12.0)
+
+    def test_overshoot_smaller_than_a_minute_is_not_charged(self) -> None:
+        """6h00m20s sairia no texto como '6h00 acima do limite de 6h'."""
+        start = _local(3, 8, 0)
+        self.assertFalse(classify_gap(start, start + timedelta(hours=6, seconds=20))["violated"])
+        self.assertTrue(classify_gap(start, start + timedelta(hours=6, minutes=3))["violated"])
+
+    def test_split_adds_up_to_the_total_duration(self) -> None:
+        day, night = shift_split_hours(_local(2, 16, 0), _local(3, 10, 0))
+        self.assertAlmostEqual(day + night, 18.0, places=2)
+        self.assertAlmostEqual(day, 3.0 + 3.0, places=2)  # 16–19 e 07–10
+        self.assertAlmostEqual(night, 12.0, places=2)  # 19–07
+
+    def test_daytime_gap_over_six_hours_is_a_violation(self) -> None:
+        gap = classify_gap(_local(3, 8, 0), _local(3, 15, 0))  # 7h, todo diurno
+        self.assertEqual(gap["shift"], "diurno")
+        self.assertAlmostEqual(gap["hours"], 7.0, places=2)
+        self.assertEqual(gap["limit_hours"], 6.0)
+        self.assertTrue(gap["violated"])
+
+    def test_daytime_gap_within_six_hours_is_clean(self) -> None:
+        gap = classify_gap(_local(3, 8, 0), _local(3, 13, 30))  # 5h30
+        self.assertEqual(gap["shift"], "diurno")
+        self.assertFalse(gap["violated"])
+
+    def test_nighttime_gap_gets_the_twelve_hour_limit(self) -> None:
+        gap = classify_gap(_local(2, 20, 0), _local(3, 6, 0))  # 10h, todo noturno
+        self.assertEqual(gap["shift"], "noturno")
+        self.assertEqual(gap["limit_hours"], 12.0)
+        self.assertFalse(gap["violated"])
+
+    def test_a_full_night_is_exactly_the_limit_and_does_not_violate(self) -> None:
+        """O turno noturno dura 12h: gap 100% noturno nunca estoura sozinho."""
+        gap = classify_gap(_local(2, 19, 0), _local(3, 7, 0))
+        self.assertEqual(gap["shift"], "noturno")
+        self.assertAlmostEqual(gap["hours"], 12.0, places=2)
+        self.assertFalse(gap["violated"])
+
+    def test_crossing_gap_is_judged_by_the_predominant_shift(self) -> None:
+        """16:00 → 23:00: 3h diurnas, 4h noturnas. Vale o limite noturno."""
+        gap = classify_gap(_local(3, 16, 0), _local(3, 23, 0))
+        self.assertEqual(gap["shift"], "noturno")
+        self.assertAlmostEqual(gap["day_hours"], 3.0, places=2)
+        self.assertAlmostEqual(gap["night_hours"], 4.0, places=2)
+        self.assertFalse(gap["violated"])  # 7h < 12h — como diurno teria sido violação
+
+    def test_crossing_gap_mostly_diurnal_violates_at_six_hours(self) -> None:
+        """05:00 → 14:00: 2h noturnas, 7h diurnas. Vale o limite diurno."""
+        gap = classify_gap(_local(3, 5, 0), _local(3, 14, 0))
+        self.assertEqual(gap["shift"], "diurno")
+        self.assertTrue(gap["violated"])
+
+    def test_crossing_gap_over_the_night_limit_violates_once(self) -> None:
+        """19:00 → 08:00 = 13h (12 noturnas + 1 diurna): uma violação noturna."""
+        gap = classify_gap(_local(2, 19, 0), _local(3, 8, 0))
+        self.assertEqual(gap["shift"], "noturno")
+        self.assertAlmostEqual(gap["hours"], 13.0, places=2)
+        self.assertTrue(gap["violated"])
+
+    def test_exact_tie_between_shifts_favours_the_night_limit(self) -> None:
+        """13:00 → 01:00: 6h em cada turno. Empate vai para o mais tolerante."""
+        gap = classify_gap(_local(3, 13, 0), _local(4, 1, 0))
+        self.assertEqual(gap["shift"], "noturno")
+        self.assertFalse(gap["violated"])
+
+
 class GapRankingTests(unittest.TestCase):
     def test_gap_between_two_giros(self) -> None:
         events = [
@@ -312,25 +400,43 @@ class GapRankingTests(unittest.TestCase):
         self.assertEqual(barris["giros"], 2)
         self.assertAlmostEqual(barris["worst_gap_hours"], 3.0, places=2)
 
-    def test_gap_crossing_dawn_is_marked_as_night(self) -> None:
-        # 22:00 local -> 06:00 local do dia seguinte
-        start = datetime(2026, 8, 3, 1, 0, tzinfo=timezone.utc)
-        end = datetime(2026, 8, 3, 9, 0, tzinfo=timezone.utc)
-        events = [
-            {"unit_code": "upa_barris", "created_at": start},
-            {"unit_code": "upa_barris", "created_at": end},
-        ]
-        ranking = compute_gap_ranking(events, {}, end, 7)
-        barris = next(item for item in ranking if item["unit_code"] == "upa_barris")
-        self.assertAlmostEqual(barris["worst_gap_hours"], 8.0, places=2)
-        self.assertGreaterEqual(barris["worst_gap_night_hours"], 0.4 * 8.0)
-
     def test_unit_without_giros_does_not_divide_by_zero(self) -> None:
         ranking = compute_gap_ranking([], {}, NOW, 7)
         self.assertEqual(len(ranking), len(UNIT_REGISTRY))
         for item in ranking:
             self.assertIsNone(item["avg_gap_hours"])
             self.assertIsNone(item["current_gap_hours"])
+            self.assertTrue(item["never_posted"])
+            self.assertEqual(item["violations"], [])
+
+    def test_violations_list_date_start_duration_and_shift(self) -> None:
+        events = _giros("upa_barris", (3, 8, 0), (3, 15, 0))  # 7h diurnas
+        ranking = compute_gap_ranking(events, {"upa_barris": _local(3, 15, 0)}, NOW, 7)
+        barris = next(item for item in ranking if item["unit_code"] == "upa_barris")
+        self.assertEqual(barris["violation_count"], 1)
+        violation = barris["violations"][0]
+        self.assertEqual(violation["start"], _local(3, 8, 0))
+        self.assertAlmostEqual(violation["hours"], 7.0, places=2)
+        self.assertEqual(violation["shift"], "diurno")
+        self.assertFalse(violation["ongoing"])
+
+    def test_open_silence_counts_as_one_ongoing_violation(self) -> None:
+        events = _giros("upa_barris", (3, 5, 0), (3, 6, 0))  # gap de 1h, sem violação
+        ranking = compute_gap_ranking(events, {"upa_barris": _local(3, 6, 0)}, NOW, 7)
+        barris = next(item for item in ranking if item["unit_code"] == "upa_barris")
+        self.assertEqual(barris["violation_count"], 1)
+        self.assertTrue(barris["violations"][0]["ongoing"])
+        self.assertAlmostEqual(barris["violations"][0]["hours"], 9.533, places=2)
+
+    def test_the_same_silence_is_never_counted_twice(self) -> None:
+        """Gap fechado 08→15 e gap em curso 15→agora: 2 violações distintas."""
+        events = _giros("upa_barris", (3, 8, 0), (3, 15, 0))
+        ranking = compute_gap_ranking(events, {"upa_barris": _local(3, 15, 0)}, NOW, 7)
+        barris = next(item for item in ranking if item["unit_code"] == "upa_barris")
+        # 15:00 → 15:32 ainda não estoura: segue só a violação fechada.
+        self.assertEqual(barris["violation_count"], 1)
+        total = sum(item["hours"] for item in barris["violations"])
+        self.assertAlmostEqual(total, 7.0, places=2)
 
     def test_ranking_is_sorted_by_average_gap_desc(self) -> None:
         events = []
@@ -344,64 +450,151 @@ class GapRankingTests(unittest.TestCase):
 
 
 class ComplianceReportTests(unittest.TestCase):
+    """Os balões do /cobranca. UPA STO. ANTÔNIO viola, UPA SAN MARTIN não."""
+
+    COORDINATORS = {
+        "upa_santo_antonio": ["JOILSON GUIMARAES", "Fernanda Magalhães"],
+        "upa_san_martin": ["Marcia Souza"],
+    }
+
     def _ranking(self) -> list[dict]:
-        events = []
-        base = NOW - timedelta(days=3)
-        for step in range(6):
-            events.append({"unit_code": "upa_santo_antonio", "created_at": base + timedelta(hours=9 * step)})
-            events.append({"unit_code": "upa_san_martin", "created_at": base + timedelta(hours=2.5 * step)})
-        last = {
-            "upa_santo_antonio": NOW - timedelta(hours=10.8),
-            "upa_san_martin": NOW - timedelta(hours=1),
-        }
+        events = [
+            # Sto. Antônio: 8h diurnas (violação) + 14h atravessando a noite
+            # (violação noturna) + silêncio em curso desde 06:00 (violação).
+            *_giros("upa_santo_antonio", (2, 8, 0), (2, 16, 0), (3, 6, 0)),
+            # San Martin: giros de 3 em 3 horas no diurno — sempre dentro do SLA.
+            *_giros("upa_san_martin", (3, 9, 0), (3, 12, 0), (3, 15, 0)),
+        ]
+        last = _everyone_else_is_up_to_date(
+            upa_santo_antonio=_local(3, 6, 0),
+            upa_san_martin=_local(3, 15, 0),
+        )
         return compute_gap_ranking(events, last, NOW, 7)
 
-    def test_names_the_registered_coordinator(self) -> None:
-        text = build_compliance_report_text(
+    def _messages(self, responsibles: dict | None = None) -> list[str]:
+        return build_compliance_messages(
             self._ranking(),
-            {"upa_santo_antonio": ["JOILSON GUIMARAES", "Fernanda Magalhães"]},
+            self.COORDINATORS if responsibles is None else responsibles,
             NOW,
             7,
         )
-        self.assertIn("JOILSON GUIMARAES", text)
-        self.assertIn("UPA STO. ANTÔNIO", text)
 
-    def test_unit_without_coordinator_is_explicit(self) -> None:
-        text = build_compliance_report_text(self._ranking(), {}, NOW, 7)
-        self.assertIn("sem coordenador cadastrado", text)
+    def test_first_balloon_ranks_by_time_without_posting(self) -> None:
+        header = self._messages()[0]
+        self.assertIn("RANKING — MAIS TEMPO SEM POSTAR", header)
+        self.assertIn("UPA STO. ANTÔNIO", header)
+        self.assertIn("SEM GIRO AGORA há 9h32", header)  # gap atual: 06:00 -> 15:32
+        self.assertIn("3 violações no período", header)
+        self.assertIn("JOILSON GUIMARAES", header)
 
-    def test_current_gap_section_is_present(self) -> None:
-        text = build_compliance_report_text(self._ranking(), {}, NOW, 7)
-        self.assertIn("AGORA (desde o último giro)", text)
-        self.assertIn("10h48", text)
-
-    def test_worst_gap_section_is_present(self) -> None:
-        text = build_compliance_report_text(self._ranking(), {}, NOW, 7)
-        self.assertIn("PIORES GAPS DO PERÍODO (7d)", text)
-
-    def test_disclaimer_about_author_is_always_present(self) -> None:
-        text = build_compliance_report_text(self._ranking(), {}, NOW, 7)
-        self.assertIn("coordenador cadastrado da unidade", text)
-
-    def test_no_phone_numbers_in_the_output(self) -> None:
-        text = build_compliance_report_text(
-            self._ranking(),
-            {"upa_santo_antonio": ["JOILSON GUIMARAES"]},
-            NOW,
-            7,
+    def test_units_silent_right_now_come_before_the_ones_already_back(self) -> None:
+        """Quem está estourado agora é o problema do dia; ficha grande vem depois."""
+        events = [
+            # Já normalizou, mas com 2 violações fechadas no período.
+            *_giros("upa_barris", (2, 8, 0), (2, 16, 0), (3, 0, 0), (3, 15, 0)),
+            # Em silêncio agora, com 1 violação só.
+            *_giros("upa_paripe", (3, 6, 0)),
+        ]
+        last = _everyone_else_is_up_to_date(
+            upa_barris=_local(3, 15, 0),
+            upa_paripe=_local(3, 6, 0),
         )
-        self.assertIsNone(re.search(r"\d{10,}", text))
+        ranking = compute_gap_ranking(events, last, NOW, 7)
+        header = build_compliance_messages(ranking, {}, NOW, 7)[0]
+        self.assertLess(header.index("UPA PARIPE"), header.index("UPA BARRIS"))
+        self.assertIn("🟢 em dia agora", header)
 
-    def test_fits_a_single_message(self) -> None:
+    def test_first_balloon_states_the_sla(self) -> None:
+        header = self._messages()[0]
+        self.assertIn("diurno (07h–19h) até 6h", header)
+        self.assertIn("noturno (19h–07h) até 12h", header)
+
+    def test_one_balloon_per_violating_unit(self) -> None:
+        messages = self._messages()
+        # ranking + 1 snippet (só Sto. Antônio viola) + consolidado
+        self.assertEqual(len(messages), 3)
+        self.assertIn("Olá, Joilson e Fernanda!", messages[1])
+        self.assertIn("UPA STO. ANTÔNIO", messages[1])
+
+    def test_unit_within_the_sla_gets_no_balloon(self) -> None:
+        messages = self._messages()
+        for message in messages:
+            self.assertNotIn("UPA SAN MARTIN", message)
+            self.assertNotIn("Marcia", message)
+        self.assertIn(f"Sem nenhuma violação na janela: {len(UNIT_REGISTRY) - 1} unidades", messages[0])
+
+    def test_snippet_lists_every_failure_with_date_time_and_shift(self) -> None:
+        snippet = self._messages()[1]
+        self.assertIn("silêncio em 02/08, das 08:00 às 16:00 (8h00, turno diurno; limite 6h)", snippet)
+        self.assertIn("silêncio de 02/08 16:00 a 03/08 06:00 (14h00, turno noturno; limite 12h)", snippet)
+        self.assertIn("sem atualização desde 03/08 06:00 — já são 9h32 (turno diurno; limite 6h)", snippet)
+        self.assertIn("registramos 3 períodos sem atualização", snippet)
+
+    def test_snippet_is_polite_and_ready_to_paste(self) -> None:
+        """Sem cabeçalho de sistema: no Telegram o copiar leva tudo junto."""
+        snippet = self._messages()[1]
+        self.assertTrue(snippet.startswith("Olá,"))
+        self.assertIn("Consegue verificar com a equipe? Obrigado!", snippet)
+        self.assertIn("O combinado é atualizar o giro a cada 6h", snippet)
+        for noise in ("📉", "🏆", "━", "👤", "/cobranca"):
+            self.assertNotIn(noise, snippet)
+
+    def test_snippet_addresses_the_team_when_there_is_no_coordinator(self) -> None:
+        snippet = self._messages(responsibles={})[1]
+        self.assertIn("Olá, equipe da UPA STO. ANTÔNIO!", snippet)
+        self.assertIn("sem coordenador cadastrado", self._messages(responsibles={})[0])
+
+    def test_last_balloon_consolidates_every_violation(self) -> None:
+        consolidated = self._messages()[-1]
+        self.assertIn("CONSOLIDADO", consolidated)
+        self.assertIn("3 violações em 1 unidade", consolidated)
+        self.assertIn("UPA STO. ANTÔNIO", consolidated)
+        self.assertIn("JOILSON GUIMARAES", consolidated)
+        self.assertIn("silêncio em 02/08, das 08:00 às 16:00", consolidated)
+
+    def test_units_that_never_posted_are_charged_too(self) -> None:
+        ranking = compute_gap_ranking([], {}, NOW, 7)
+        messages = build_compliance_messages(ranking, {}, NOW, 7)
+        self.assertIn("nunca postou giro", messages[0])
+        self.assertIn("Não localizamos nenhum giro de leitos", messages[1])
+        # Balão individual é limitado; o consolidado continua trazendo todas.
+        self.assertEqual(len(messages), 2 + MAX_COBRANCA_SNIPPETS)
+        self.assertIn("balão individual só para as", messages[0])
+        self.assertIn(f"em {len(UNIT_REGISTRY)} unidades", messages[-1])
+
+    def test_no_violation_in_the_window_is_a_single_balloon(self) -> None:
+        ranking = compute_gap_ranking([], _everyone_else_is_up_to_date(), NOW, 7)
+        messages = build_compliance_messages(ranking, self.COORDINATORS, NOW, 7)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("Nenhuma violação de SLA no período", messages[0])
+        self.assertIn("Nada a cobrar", messages[0])
+
+    def test_unparsed_warning_rides_in_the_ranking_balloon(self) -> None:
+        messages = build_compliance_messages(self._ranking(), self.COORDINATORS, NOW, 7, unparsed_count=3)
+        self.assertIn("3 mensagens não parseadas", messages[0])
+        for message in messages[1:]:
+            self.assertNotIn("não parseada", message)
+
+    def test_no_phone_numbers_in_any_balloon(self) -> None:
+        for message in self._messages():
+            self.assertIsNone(re.search(r"\d{10,}", message))
+
+    def test_every_balloon_survives_the_telegram_limit(self) -> None:
         events = []
-        base = NOW - timedelta(days=7)
         for unit in UNIT_REGISTRY:
-            for step in range(20):
-                events.append({"unit_code": unit["code"], "created_at": base + timedelta(hours=8 * step)})
+            for day, hour in ((1, 8), (1, 20), (2, 9), (2, 21), (3, 6)):
+                events.extend(_giros(unit["code"], (day, hour)))
         ranking = compute_gap_ranking(events, {}, NOW, 7)
         responsibles = {unit["code"]: ["Fulano de Tal Sobrenome", "Ciclana Silva"] for unit in UNIT_REGISTRY}
-        text = build_compliance_report_text(ranking, responsibles, NOW, 7, unparsed_count=3)
-        self.assertLessEqual(len(text), 4000)
+        messages = build_compliance_messages(ranking, responsibles, NOW, 7, unparsed_count=3)
+        for message in messages:
+            parts = split_message(message)
+            self.assertGreaterEqual(len(parts), 1)
+            for part in parts:
+                # 4096 é o teto duro do sendMessage; o prefixo "▸ parte i/n"
+                # é somado depois do corte em MESSAGE_CHUNK_LIMIT.
+                self.assertLessEqual(len(part), 4096)
+                self.assertNotIn("mensagem cortada", part)
 
 
 class OverCapacityTests(unittest.TestCase):
@@ -613,6 +806,11 @@ class WebhookDispatchTests(unittest.TestCase):
         payload = self._post("/resumo@girodeleitos_bot", self.GROUP_CHAT)
         self.assertIn("summary", payload)
         self.assertNotIn("Envie o giro com o nome da unidade", self._last_text())
+
+    def test_a_list_reply_becomes_several_balloons(self) -> None:
+        """É assim que o /cobranca entrega um snippet copiável por unidade."""
+        main._reply_to_chat(self.ADMIN_CHAT, ["ranking", "", "snippet", "consolidado"])
+        self.assertEqual([text for _, text in self.sent], ["ranking", "snippet", "consolidado"])
 
     def test_unknown_command_returns_help(self) -> None:
         self._post("/qualquercoisa", self.ADMIN_CHAT)

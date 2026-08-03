@@ -20,7 +20,7 @@ from db import get_capacity_timeline, get_dashboard_metrics, get_giro_activity, 
 from auth.deps import get_current_admin
 from parser_service import parse_whatsapp_message
 from reports import (
-    build_compliance_report_text,
+    build_compliance_messages,
     build_over_capacity_report_text,
     build_reports_help_lines,
     build_unparsed_report_text,
@@ -1223,11 +1223,16 @@ def is_report_chat_authorized(chat_id: int | str | None) -> bool:
     return str(chat_id) in allowed
 
 
-def _reply_to_chat(chat_id: int | str | None, text: str) -> tuple[bool, str | None]:
-    if chat_id is None or not text:
+def _reply_to_chat(chat_id: int | str | None, reply: str | list[str]) -> tuple[bool, str | None]:
+    """Responde no chat. Uma lista vira vários balões — é assim que o /cobranca
+    entrega um snippet por unidade, cada um copiável com um toque."""
+    balloons = [reply] if isinstance(reply, str) else list(reply)
+    balloons = [text for text in balloons if text]
+    if chat_id is None or not balloons:
         return False, None
     try:
-        send_telegram_message(chat_id, text)
+        for text in balloons:
+            send_telegram_message(chat_id, text)
         return bool(TELEGRAM_BOT_TOKEN), None
     except RuntimeError as exc:
         return False, str(exc)
@@ -1249,8 +1254,12 @@ async def _run_bot_command(
     command: str,
     args: str,
     chat_id: int | str | None,
-) -> tuple[str, str, dict[str, Any]]:
-    """Resolve um comando do bot -> (texto da resposta, status, extras da API)."""
+) -> tuple[str | list[str], str, dict[str, Any]]:
+    """Resolve um comando do bot -> (resposta, status, extras da API).
+
+    A resposta é um texto ou uma LISTA de textos, quando o comando entrega
+    balões separados (ver `_reply_to_chat`).
+    """
     now = datetime.now(timezone.utc)
     db_ready = is_database_configured()
 
@@ -1288,7 +1297,7 @@ async def _run_bot_command(
         unparsed = await run_in_threadpool(get_unparsed_summary, days, 1)
         ranking = compute_gap_ranking(activity["events"], activity["last_by_unit"], now, days)
         return (
-            build_compliance_report_text(ranking, responsibles, now, days, unparsed.get("total", 0)),
+            build_compliance_messages(ranking, responsibles, now, days, unparsed.get("total", 0)),
             "Comando de cobrança processado.",
             {},
         )
@@ -1347,9 +1356,9 @@ async def telegram_webhook(
     command = parse_bot_command(text)
     if command is not None:
         command_name, command_args = command
-        reply_text, status_message, extra = await _run_bot_command(command_name, command_args, chat_id)
+        reply, status_message, extra = await _run_bot_command(command_name, command_args, chat_id)
 
-        reply_sent, reply_error = _reply_to_chat(chat_id, reply_text)
+        reply_sent, reply_error = _reply_to_chat(chat_id, reply)
 
         return {
             "status": "accepted",

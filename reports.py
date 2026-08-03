@@ -43,10 +43,29 @@ STALE_HOURS = 10.0
 # no grupo é comum e derrubaria a média artificialmente.
 DUPLICATE_WINDOW_MINUTES = 5.0
 
-# Madrugada local em que o volume de giro cai de verdade (ver design §1.4).
-# Não é descontada da conta — só marca o gap com 🌙 para leitura justa.
-NIGHT_START_HOUR = 0
-NIGHT_END_HOUR = 5
+# SLA de atualização do giro, por turno. CONSTANTE ÚNICA de threshold: mexer
+# aqui muda ranking, snippets de cobrança e todos os rodapés de uma vez.
+# Futuro (fase 2): virar tabela por unidade, mesma forma chaveada por unit_code.
+GIRO_SLA = {
+    "day_start_hour": 7,       # início do turno diurno, hora local
+    "day_end_hour": 19,        # fim do diurno = início do noturno
+    "day_max_gap_hours": 6.0,  # diurno (07h–19h): gap acima disso é violação
+    "night_max_gap_hours": 12.0,  # noturno (19h–07h): gap acima disso é violação
+    # A cobrança é escrita em minutos. Sem esta folga, um gap de 6h00m20s vira
+    # "6h00 acima do limite de 6h" no texto que vai para o coordenador —
+    # indefensável, e o erro é do arredondamento, não da unidade.
+    "tolerance_minutes": 1.0,
+}
+
+# Guarda do varredor de turnos: unidade que nunca postou gera intervalo de
+# meses e o laço precisa de um teto.
+_SHIFT_SCAN_MAX_DAYS = 400
+
+# Quantas unidades ganham balão individual de cobrança e quantas violações são
+# listadas por unidade. Acima disso a mensagem avisa o que ficou de fora —
+# corte silencioso viraria "está tudo aqui" sem estar.
+MAX_COBRANCA_SNIPPETS = 8
+MAX_VIOLATIONS_LISTED = 6
 
 # Teto de duração atribuída a um único giro no cálculo de lotação (/lotacao).
 # Escolha: 6h, o mesmo limiar de "dado velho" de /api/stale-units. Depois de 6h
@@ -152,26 +171,72 @@ def traffic_light(hours: float | None) -> str:
     return "🔴"
 
 
-def night_overlap_hours(start: datetime, end: datetime) -> float:
-    """Horas do intervalo que caem na madrugada local (00h–05h)."""
+def fmt_date(value: Any) -> str:
+    """Só o dia, no fuso de exibição: '03/08'."""
+    moment = as_utc(value)
+    return "—" if moment is None else moment.astimezone(REPORT_TZ).strftime("%d/%m")
+
+
+def threshold_label(hours: float) -> str:
+    """'6h' para limite redondo, '6h30' para quebrado."""
+    return f"{int(hours)}h" if float(hours).is_integer() else fmt_duration(hours)
+
+
+def shift_split_hours(start: datetime, end: datetime) -> tuple[float, float]:
+    """Divide o intervalo entre os dois turnos locais: (diurno, noturno).
+
+    Diurno é a janela GIRO_SLA[day_start_hour]–[day_end_hour] de cada dia
+    local; tudo o que sobra é noturno. A soma das duas parcelas é sempre a
+    duração total do intervalo.
+    """
     if end <= start:
-        return 0.0
+        return 0.0, 0.0
     start_local = start.astimezone(REPORT_TZ)
     end_local = end.astimezone(REPORT_TZ)
-    total = 0.0
+    total = (end_local - start_local).total_seconds() / 3600
+
+    day_hours = 0.0
     day = start_local.date()
-    # Guarda contra intervalos absurdos (unidade que nunca postou, por ex.).
-    for _ in range(400):
+    for _ in range(_SHIFT_SCAN_MAX_DAYS):
         if day > end_local.date():
             break
-        night_start = datetime.combine(day, time(NIGHT_START_HOUR), tzinfo=REPORT_TZ)
-        night_end = datetime.combine(day, time(NIGHT_END_HOUR), tzinfo=REPORT_TZ)
-        overlap_start = max(start_local, night_start)
-        overlap_end = min(end_local, night_end)
-        if overlap_end > overlap_start:
-            total += (overlap_end - overlap_start).total_seconds() / 3600
+        window_start = datetime.combine(day, time(GIRO_SLA["day_start_hour"]), tzinfo=REPORT_TZ)
+        window_end = datetime.combine(day, time(GIRO_SLA["day_end_hour"]), tzinfo=REPORT_TZ)
+        overlap = min(end_local, window_end) - max(start_local, window_start)
+        if overlap.total_seconds() > 0:
+            day_hours += overlap.total_seconds() / 3600
         day += timedelta(days=1)
-    return total
+
+    return day_hours, max(0.0, total - day_hours)
+
+
+def classify_gap(start: datetime, end: datetime, *, ongoing: bool = False) -> dict[str, Any]:
+    """Descreve um silêncio entre `start` e `end` e diz se ele fere o SLA.
+
+    REGRA DE FRONTEIRA (a "regra mais simples documentada" do requisito): um
+    gap que cruza a virada de turno é julgado INTEIRO pelo turno em que passou
+    a MAIOR parte do tempo. Um gap = um turno = um limite, então o mesmo
+    silêncio nunca é punido duas vezes nem precisa de rateio proporcional para
+    ser justo. Empate exato (metade em cada turno) vai para o noturno, que é o
+    limite mais tolerante — na dúvida, a favor da unidade.
+    """
+    day_hours, night_hours = shift_split_hours(start, end)
+    hours = day_hours + night_hours
+    if day_hours > night_hours:
+        shift, limit = "diurno", float(GIRO_SLA["day_max_gap_hours"])
+    else:
+        shift, limit = "noturno", float(GIRO_SLA["night_max_gap_hours"])
+    return {
+        "start": start,
+        "end": end,
+        "hours": hours,
+        "day_hours": day_hours,
+        "night_hours": night_hours,
+        "shift": shift,
+        "limit_hours": limit,
+        "violated": hours > limit + GIRO_SLA["tolerance_minutes"] / 60,
+        "ongoing": ongoing,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +365,12 @@ def compute_gap_ranking(
     `events` são giros da janela (unit_code + created_at — chegada real, nunca
     o horário digitado, que tem drift documentado). Devolve uma linha por
     unidade cadastrada, inclusive as que nunca postaram.
+
+    Cada linha carrega a RELAÇÃO das violações de SLA (`violations`): os gaps
+    entre giros consecutivos que estouraram o limite do turno, mais o silêncio
+    em curso desde o último giro, se ele já estourou. As duas fontes não se
+    sobrepõem — o gap em curso começa onde o último gap fechado terminou —,
+    então nenhum silêncio é contado duas vezes.
     """
     window_start = now - timedelta(days=days)
 
@@ -315,17 +386,19 @@ def compute_gap_ranking(
     for unit_code in UNIT_NAME_BY_CODE:
         moments = _dedupe_events(by_unit.get(unit_code, []))
         gaps: list[float] = []
-        night_shares: list[float] = []
+        violations: list[dict[str, Any]] = []
         for previous, current in zip(moments, moments[1:]):
-            gap_hours = (current - previous).total_seconds() / 3600
-            gaps.append(gap_hours)
-            night_shares.append(night_overlap_hours(previous, current))
+            gap = classify_gap(previous, current)
+            gaps.append(gap["hours"])
+            if gap["violated"]:
+                violations.append(gap)
 
         last_moment = as_utc(last_by_unit.get(unit_code)) or (moments[-1] if moments else None)
         current_gap = (now - last_moment).total_seconds() / 3600 if last_moment else None
-
-        worst_gap = max(gaps) if gaps else None
-        worst_night = night_shares[gaps.index(worst_gap)] if gaps and worst_gap is not None else 0.0
+        if last_moment is not None:
+            open_gap = classify_gap(last_moment, now, ongoing=True)
+            if open_gap["violated"]:
+                violations.append(open_gap)
 
         ranking.append(
             {
@@ -333,10 +406,12 @@ def compute_gap_ranking(
                 "unit_name": short_unit_name(unit_code),
                 "giros": len(moments),
                 "avg_gap_hours": (sum(gaps) / len(gaps)) if gaps else None,
-                "worst_gap_hours": worst_gap,
-                "worst_gap_night_hours": worst_night,
+                "worst_gap_hours": max(gaps) if gaps else None,
                 "current_gap_hours": current_gap,
                 "last_giro_at": last_moment,
+                "never_posted": last_moment is None,
+                "violations": violations,
+                "violation_count": len(violations),
                 "window_start": window_start,
             }
         )
@@ -599,81 +674,275 @@ def _responsible_line(unit_code: str, responsibles: dict[str, list[str]]) -> str
     return f"     👤 {shown}"
 
 
-def build_compliance_report_text(
+def _sla_short() -> str:
+    """'diurno (07h–19h) até 6h · noturno (19h–07h) até 12h'."""
+    day_start, day_end = GIRO_SLA["day_start_hour"], GIRO_SLA["day_end_hour"]
+    return (
+        f"diurno ({day_start:02d}h–{day_end:02d}h) até {threshold_label(GIRO_SLA['day_max_gap_hours'])}"
+        f" · noturno ({day_end:02d}h–{day_start:02d}h) até {threshold_label(GIRO_SLA['night_max_gap_hours'])}"
+    )
+
+
+def _sla_sentence() -> str:
+    """A mesma regra em prosa, para dentro do texto que vai ser copiado."""
+    day_start, day_end = GIRO_SLA["day_start_hour"], GIRO_SLA["day_end_hour"]
+    return (
+        f"O combinado é atualizar o giro a cada {threshold_label(GIRO_SLA['day_max_gap_hours'])}"
+        f" no turno diurno ({day_start:02d}h–{day_end:02d}h) e a cada"
+        f" {threshold_label(GIRO_SLA['night_max_gap_hours'])} no noturno"
+        f" ({day_end:02d}h–{day_start:02d}h)."
+    )
+
+
+def _greeting(unit_name: str, names: list[str]) -> str:
+    """'Olá, Joilson!' — primeiro nome, porque o cadastro vem em caixa alta."""
+    firsts = [part.split()[0].capitalize() for part in names if part and part.split()]
+    if not firsts:
+        return f"Olá, equipe da {unit_name}!"
+    if len(firsts) == 1:
+        return f"Olá, {firsts[0]}!"
+    return f"Olá, {firsts[0]} e {firsts[1]}!"
+
+
+def _plural(count: int, singular: str, plural: str) -> str:
+    return f"{count} {singular if count == 1 else plural}"
+
+
+def _violation_bullet(violation: dict[str, Any]) -> str:
+    """Uma falha em prosa — o texto vai inteiro para o WhatsApp de alguém.
+
+    Gap que vira o dia sai com as duas datas: '17:45 às 05:43' sozinho esconde
+    que o silêncio durou 36h e não 12h.
+    """
+    tail = f"turno {violation['shift']}; limite {threshold_label(violation['limit_hours'])}"
+    duration = fmt_duration(violation["hours"])
+    start_date = fmt_date(violation["start"])
+    start_time = fmt_local(violation["start"], with_date=False)
+
+    if violation["ongoing"]:
+        return f"• sem atualização desde {start_date} {start_time} — já são {duration} ({tail})"
+    end_date = fmt_date(violation["end"])
+    end_time = fmt_local(violation["end"], with_date=False)
+    if end_date == start_date:
+        return f"• silêncio em {start_date}, das {start_time} às {end_time} ({duration}, {tail})"
+    return f"• silêncio de {start_date} {start_time} a {end_date} {end_time} ({duration}, {tail})"
+
+
+def _violation_bullets(violations: list[dict[str, Any]]) -> list[str]:
+    """As violações mais recentes primeiro no corte, em ordem cronológica."""
+    shown = violations[-MAX_VIOLATIONS_LISTED:]
+    lines = [_violation_bullet(violation) for violation in shown]
+    hidden = len(violations) - len(shown)
+    if hidden > 0:
+        lines.append(f"• (+ {_plural(hidden, 'ocorrência anterior', 'ocorrências anteriores')} no período)")
+    return lines
+
+
+def _is_silent_now(item: dict[str, Any]) -> bool:
+    """A unidade está com o SLA estourado NESTE momento?"""
+    return item["never_posted"] or any(violation["ongoing"] for violation in item["violations"])
+
+
+def delinquent_units(ranking: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Unidades que devem cobrança, da mais urgente para a menos.
+
+    Primeiro quem está estourado agora (nunca postou, depois maior tempo de
+    silêncio em curso) — é o que o gestor precisa resolver hoje. Depois quem
+    já normalizou, ordenado pelo tamanho da ficha no período.
+
+    Unidade sem nenhuma violação na janela não entra e, portanto, não ganha
+    balão de cobrança.
+    """
+    offenders = [item for item in ranking if item["violation_count"] > 0 or item["never_posted"]]
+    offenders.sort(
+        key=lambda item: (
+            0 if item["never_posted"] else (1 if _is_silent_now(item) else 2),
+            -item["violation_count"] if not _is_silent_now(item) else 0,
+            -(item["current_gap_hours"] or 0.0),
+            item["unit_name"],
+        )
+    )
+    return offenders
+
+
+def _build_ranking_message(
+    ranking: list[dict[str, Any]],
+    offenders: list[dict[str, Any]],
+    responsibles: dict[str, list[str]],
+    now: datetime,
+    days: int,
+    unparsed_count: int,
+) -> str:
+    """Balão 1: o ranking operacional, para o gestor ler — não para copiar."""
+    lines = [
+        "📉 COBRANÇA DE GIRO",
+        f"🗓️ Janela: {days} dia(s) · até {fmt_local(now)}",
+        f"⏱️ SLA: {_sla_short()}",
+        _SEPARATOR,
+        "",
+        "🏆 RANKING — MAIS TEMPO SEM POSTAR",
+    ]
+
+    for index, item in enumerate(offenders):
+        icon = _RANK_ICONS[index] if index < len(_RANK_ICONS) else "•"
+        lines.append(f"{icon} {item['unit_name']}")
+        if item["never_posted"]:
+            lines.append("     🔴 nunca postou giro")
+        elif _is_silent_now(item):
+            ongoing = next(violation for violation in item["violations"] if violation["ongoing"])
+            lines.append(
+                f"     🔴 SEM GIRO AGORA há {fmt_duration(item['current_gap_hours'])}"
+                f" (limite {ongoing['shift']} {threshold_label(ongoing['limit_hours'])})"
+            )
+        else:
+            lines.append(f"     🟢 em dia agora ({fmt_duration(item['current_gap_hours'])} sem giro)")
+        lines.append(f"     ⚠️ {_plural(item['violation_count'], 'violação', 'violações')} no período")
+        lines.append(_responsible_line(item["unit_code"], responsibles))
+
+    em_dia = len(ranking) - len(offenders)
+    if em_dia > 0:
+        lines.append("")
+        lines.append(f"✅ Sem nenhuma violação na janela: {_plural(em_dia, 'unidade', 'unidades')}.")
+
+    if unparsed_count:
+        lines.append("")
+        lines.append(
+            f"⚠️ {_plural(unparsed_count, 'mensagem não parseada', 'mensagens não parseadas')}"
+            f" na janela — ver /naoparseados {days}"
+        )
+
+    extras = len(offenders) - MAX_COBRANCA_SNIPPETS
+    lines.extend(["", "👇 A seguir, 1 balão por unidade: toque e segure para", "   copiar e mandar ao coordenador."])
+    if extras > 0:
+        lines.append(
+            f"   (balão individual só para as {MAX_COBRANCA_SNIPPETS} piores;"
+            f" as outras {extras} estão no consolidado final)"
+        )
+
+    lines.extend(
+        [
+            "",
+            "ℹ️ Gap que cruza a virada de turno é julgado pelo",
+            "   turno onde passou a maior parte do tempo — um",
+            "   silêncio nunca conta duas vezes. 👤 = coordenador",
+            "   cadastrado, não necessariamente quem enviou o giro.",
+            "   Base: horário de chegada do giro no sistema.",
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
+def build_unit_charge_snippet(
+    item: dict[str, Any],
+    responsibles: dict[str, list[str]],
+    days: int,
+) -> str:
+    """Balão por unidade: SÓ o texto a ser copiado.
+
+    Nada de cabeçalho de sistema aqui — no Telegram o "copiar" leva a mensagem
+    inteira, então qualquer enfeite iria junto para o WhatsApp do coordenador.
+    """
+    unit_name = item["unit_name"]
+    lines = [_greeting(unit_name, responsibles.get(item["unit_code"]) or []), ""]
+
+    if item["never_posted"]:
+        lines.append(
+            f"Não localizamos nenhum giro de leitos da {unit_name} nos nossos"
+            f" registros. Precisamos que a unidade comece a postar o giro no grupo."
+        )
+    else:
+        lines.append(
+            f"Sobre o giro de leitos da {unit_name}: nos últimos"
+            f" {_plural(days, 'dia', 'dias')} registramos"
+            f" {_plural(item['violation_count'], 'período', 'períodos')}"
+            f" sem atualização acima do combinado."
+        )
+        lines.append("")
+        lines.extend(_violation_bullets(item["violations"]))
+
+    lines.extend(["", _sla_sentence(), "", "Consegue verificar com a equipe? Obrigado!"])
+    return "\n".join(lines).strip()
+
+
+def _build_consolidated_message(
+    offenders: list[dict[str, Any]],
+    responsibles: dict[str, list[str]],
+    now: datetime,
+    days: int,
+) -> str:
+    """Último balão: todas as violações num texto só, para o gestor maior."""
+    total = sum(item["violation_count"] for item in offenders)
+    window_start = now - timedelta(days=days)
+    lines = [
+        f"CONSOLIDADO — CUMPRIMENTO DO GIRO DE LEITOS ({fmt_date(window_start)} a {fmt_date(now)})",
+        "",
+        f"SLA: {_sla_short()}.",
+        f"Resultado: {_plural(total, 'violação', 'violações')}"
+        f" em {_plural(len(offenders), 'unidade', 'unidades')}.",
+        "",
+    ]
+
+    for index, item in enumerate(offenders, start=1):
+        names = responsibles.get(item["unit_code"]) or []
+        coordinator = " · ".join(names[:2]) if names else "sem coordenador cadastrado"
+        if item["never_posted"]:
+            situacao = "nunca postou giro"
+        elif _is_silent_now(item):
+            situacao = f"SEM GIRO AGORA há {fmt_duration(item['current_gap_hours'])}"
+        else:
+            situacao = f"em dia agora ({fmt_duration(item['current_gap_hours'])} sem giro)"
+        lines.append(
+            f"{index}. {item['unit_name']} — {_plural(item['violation_count'], 'violação', 'violações')}"
+            f" · {situacao} · coord.: {coordinator}"
+        )
+        lines.extend(f"   {bullet}" for bullet in _violation_bullets(item["violations"]))
+        lines.append("")
+
+    lines.append("Contagem automática pelo horário de chegada do giro no sistema.")
+    return "\n".join(lines).strip()
+
+
+def build_compliance_messages(
     ranking: list[dict[str, Any]],
     responsibles: dict[str, list[str]],
     now: datetime,
     days: int,
     unparsed_count: int = 0,
-) -> str:
-    """Ranking de tempo sem postar giro, com o coordenador responsável."""
-    lines = [
-        "📉 QUEM ESTÁ SEM POSTAR GIRO",
-        f"🗓️ Janela: {days} dia(s) · {fmt_local(now)}",
-        _SEPARATOR,
-        "",
-        "⏰ AGORA (desde o último giro)",
-    ]
+) -> list[str]:
+    """Os balões do /cobranca, na ordem em que são enviados.
 
-    current = sorted(
-        ranking,
-        key=lambda item: (item["current_gap_hours"] is not None, -(item["current_gap_hours"] or 0.0)),
-    )
-    never_posted = [item for item in current if item["current_gap_hours"] is None]
-    atrasadas = [item for item in current if (item["current_gap_hours"] or 0.0) >= FRESH_HOURS]
-    em_dia = len(ranking) - len(atrasadas) - len(never_posted)
+    1. ranking das unidades em violação (para o gestor ler);
+    2. um balão por unidade em violação, pronto para copiar e colar;
+    3. consolidado de todas as violações, para o gestor maior.
 
-    for item in atrasadas[:8]:
-        gap = item["current_gap_hours"]
-        lines.append(f"{traffic_light(gap)} {item['unit_name']}  {fmt_duration(gap)}")
-        lines.append(_responsible_line(item["unit_code"], responsibles))
-    for item in never_posted[:4]:
-        lines.append(f"🔴 {item['unit_name']}  nunca postou")
-        lines.append(_responsible_line(item["unit_code"], responsibles))
-    if em_dia > 0:
-        lines.append(f"🟢 outras {em_dia} unidade(s): < {FRESH_HOURS:.0f}h")
+    Sem violação na janela, devolve um balão único dizendo exatamente isso.
+    """
+    offenders = delinquent_units(ranking)
 
-    lines.extend(["", f"📊 PIORES GAPS DO PERÍODO ({days}d)"])
-    com_dados = [item for item in ranking if item["worst_gap_hours"] is not None]
-    piores = sorted(com_dados, key=lambda item: -item["worst_gap_hours"])[:5]
-    if piores:
-        for index, item in enumerate(piores):
-            icon = _RANK_ICONS[index] if index < len(_RANK_ICONS) else "•"
-            night = ""
-            worst = item["worst_gap_hours"]
-            if worst and item.get("worst_gap_night_hours", 0.0) >= 0.4 * worst:
-                night = " 🌙"
-            lines.append(
-                f"{icon} {item['unit_name']}  pior {fmt_duration(worst)}{night}"
-                f"  · médio {fmt_duration(item['avg_gap_hours'])}  · {item['giros']} giros"
+    if not offenders:
+        return [
+            "\n".join(
+                [
+                    "✅ COBRANÇA DE GIRO",
+                    f"🗓️ Janela: {days} dia(s) · até {fmt_local(now)}",
+                    _SEPARATOR,
+                    "",
+                    "Nenhuma violação de SLA no período.",
+                    f"Todas as {len(ranking)} unidade(s) dentro do combinado:",
+                    f"{_sla_short()}.",
+                    "",
+                    "Nada a cobrar — nenhum balão de cobrança gerado.",
+                ]
             )
-            lines.append(_responsible_line(item["unit_code"], responsibles))
-    else:
-        lines.append("— sem giros suficientes na janela para calcular gaps.")
-
-    melhores = sorted(com_dados, key=lambda item: item["avg_gap_hours"] or 0.0)[:2]
-    if melhores:
-        lines.append("")
-        lines.append(
-            "✅ Melhores: "
-            + " · ".join(f"{item['unit_name']} {fmt_duration(item['avg_gap_hours'])}" for item in melhores)
-        )
-
-    if unparsed_count:
-        lines.append("")
-        lines.append(f"⚠️ {unparsed_count} mensagem(ns) não parseada(s) na janela — ver /naoparseados {days}")
-
-    lines.extend(
-        [
-            "",
-            "ℹ️ 👤 = coordenador cadastrado da unidade, não",
-            "   necessariamente quem enviou o giro (o autor",
-            "   ainda não é capturado pelo sistema).",
-            "   Base: horário de chegada do giro. 🌙 = gap",
-            "   majoritariamente de madrugada (00h–05h).",
         ]
+
+    messages = [_build_ranking_message(ranking, offenders, responsibles, now, days, unparsed_count)]
+    messages.extend(
+        build_unit_charge_snippet(item, responsibles, days)
+        for item in offenders[:MAX_COBRANCA_SNIPPETS]
     )
-    return "\n".join(lines).strip()
+    messages.append(_build_consolidated_message(offenders, responsibles, now, days))
+    return messages
 
 
 # ---------------------------------------------------------------------------
@@ -818,7 +1087,7 @@ def build_reports_help_lines() -> list[str]:
     return [
         "Relatórios de gestão:",
         "- /vagas — onde tem vaga agora",
-        "- /cobranca [dias] — tempo sem postar giro",
+        "- /cobranca [dias] — quem furou o SLA de giro (+ texto pronto)",
         "- /lotacao [dias] — tempo acima da capacidade",
         "- /naoparseados [dias] — giros fora do padrão",
     ]
