@@ -16,9 +16,21 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from db import get_dashboard_metrics, get_latest_events, get_latest_status_by_unit, get_parsed_event, get_pending_unit_confirmations, get_recent_alerts, get_registered_units, init_db, is_database_configured, resolve_pending_unit_confirmation, save_event, update_unit_reported_at, delete_event, admin_update_event, get_event_detail
+from db import get_capacity_timeline, get_dashboard_metrics, get_giro_activity, get_latest_events, get_latest_status_by_unit, get_parsed_event, get_pending_unit_confirmations, get_recent_alerts, get_registered_units, get_unit_responsibles, get_unparsed_summary, init_db, is_database_configured, record_unparsed_message, resolve_pending_unit_confirmation, save_event, update_unit_reported_at, delete_event, admin_update_event, get_event_detail
 from auth.deps import get_current_admin
 from parser_service import parse_whatsapp_message
+from reports import (
+    build_compliance_messages,
+    build_over_capacity_report_text,
+    build_reports_help_lines,
+    build_unparsed_report_text,
+    build_vacancy_report_text,
+    compute_gap_ranking,
+    compute_over_capacity_ranking,
+    parse_bot_command,
+    parse_days_arg,
+    split_message,
+)
 from units import normalize_unit_text, resolve_unit_from_text, resolve_unit_name
 
 
@@ -145,6 +157,11 @@ TELEGRAM_ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "").strip()
 TELEGRAM_ALERT_BOT_TOKEN = os.getenv("TELEGRAM_ALERT_BOT_TOKEN", "").strip() or TELEGRAM_BOT_TOKEN
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://mnrs.com.br").rstrip("/")
+# Chats autorizados a pedir relatório de gestão. Base = o admin já configurado;
+# TELEGRAM_REPORT_CHAT_IDS permite liberar outros chats sem mexer no código.
+# Restrito de propósito: /cobranca cita coordenadores nominalmente e não pode
+# vazar para o grupo operacional por acidente.
+TELEGRAM_REPORT_CHAT_IDS = os.getenv("TELEGRAM_REPORT_CHAT_IDS", "").strip()
 PUBLIC_WEBHOOK_PATH = os.getenv("PUBLIC_WEBHOOK_PATH", "/giro/api/webhook/telegram").strip() or "/giro/api/webhook/telegram"
 
 
@@ -278,9 +295,20 @@ def _looks_like_giro(text: str, data: dict[str, Any]) -> bool:
     return hits >= 2
 
 
-def _notify_unparsed_giro(text: str, issues: list[dict[str, str]]) -> None:
+def _notify_unparsed_giro(text: str, issues: list[dict[str, str]], source: str = "desconhecida") -> None:
     first_line = next((l.strip() for l in text.splitlines() if l.strip()), "")[:80]
-    reasons = "\n".join(f"❓ {i['message']}" for i in issues if i["severity"] == "blocking") or "❓ Motivo desconhecido"
+    blocking = [i["message"] for i in issues if i["severity"] == "blocking"]
+    reasons = "\n".join(f"❓ {message}" for message in blocking) or "❓ Motivo desconhecido"
+
+    # Persistir antes de alertar: o alerta é efêmero, e sem histórico não dá
+    # para responder "quantas, de onde e por quê" (/naoparseados).
+    if is_database_configured():
+        try:
+            record_unparsed_message(source, text, blocking or ["Motivo desconhecido"])
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Falha ao registrar mensagem não parseada: %s", exc)
+
     _notify_admin_telegram(
         "🚫 <b>Giro não reconhecido — não publicado</b>\n"
         f"📄 {html_escape(first_line)}\n"
@@ -458,6 +486,8 @@ def build_telegram_help_reply() -> str:
             "- /resumo",
             "- /alertas",
             "- /status",
+            "",
+            *build_reports_help_lines(),
         ]
     )
 
@@ -711,10 +741,7 @@ def build_alerts_text(alert_rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def send_telegram_message(chat_id: int | str, text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN:
-        return
-
+def _send_telegram_chunk(chat_id: int | str, text: str) -> None:
     payload = json.dumps(
         {
             "chat_id": chat_id,
@@ -734,6 +761,21 @@ def send_telegram_message(chat_id: int | str, text: str) -> None:
             response.read()
     except error.URLError as exc:
         raise RuntimeError(f"Falha ao responder no Telegram: {exc}") from exc
+
+
+def send_telegram_message(chat_id: int | str, text: str) -> None:
+    """Função única de envio do bot — todo comando passa por aqui.
+
+    Corta a resposta em partes de até MESSAGE_CHUNK_LIMIT (3.500) caracteres.
+    Sem isso o /resumo, que hoje gera 4.843 caracteres com as 16 unidades,
+    estoura o limite de 4.096 do sendMessage: a API devolve 400 e o usuário
+    fica sem resposta nenhuma.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    for part in split_message(text):
+        _send_telegram_chunk(chat_id, part)
 
 
 @app.get("/health")
@@ -1034,7 +1076,7 @@ async def whatsapp_bridge_ingest(payload: WhatsAppBridgeIngestPayload) -> dict[s
         # Avisar o admin no Telegram — só quando o texto parece um giro de
         # verdade (o adapter repassa toda mensagem do grupo, inclusive conversa)
         if _looks_like_giro(payload.text, data):
-            await run_in_threadpool(_notify_unparsed_giro, payload.text, issues)
+            await run_in_threadpool(_notify_unparsed_giro, payload.text, issues, payload.source)
 
         return {
             "status": "pending",
@@ -1150,6 +1192,146 @@ async def patch_pending_unit_resolution(event_id: int, payload: ResolvePendingUn
     }
 
 
+# ---------------------------------------------------------------------------
+# Comandos do bot Telegram
+# ---------------------------------------------------------------------------
+
+_HELP_COMMANDS = {"start", "ajuda", "help"}
+_SUMMARY_COMMANDS = {"resumo", "status", "giro"}
+_ALERT_COMMANDS = {"alertas", "alerta"}
+_VACANCY_COMMANDS = {"vagas", "vaga", "ondetemvaga", "leitos"}
+_COMPLIANCE_COMMANDS = {"cobranca", "cobrança", "ranking", "semgiro", "atraso"}
+_OVER_CAPACITY_COMMANDS = {"lotacao", "lotação", "superlotacao", "superlotação", "acima"}
+_UNPARSED_COMMANDS = {"naoparseados", "naoparseado", "nãoparseados", "forapadrao", "erros"}
+
+
+def report_chat_ids() -> set[str]:
+    ids: set[str] = set()
+    for raw in (TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_REPORT_CHAT_IDS):
+        for piece in (raw or "").split(","):
+            piece = piece.strip()
+            if piece:
+                ids.add(piece)
+    return ids
+
+
+def is_report_chat_authorized(chat_id: int | str | None) -> bool:
+    """Relatórios de gestão só para os chats de admin já configurados."""
+    allowed = report_chat_ids()
+    if not allowed or chat_id is None:
+        return False
+    return str(chat_id) in allowed
+
+
+def _reply_to_chat(chat_id: int | str | None, reply: str | list[str]) -> tuple[bool, str | None]:
+    """Responde no chat. Uma lista vira vários balões — é assim que o /cobranca
+    entrega um snippet por unidade, cada um copiável com um toque."""
+    balloons = [reply] if isinstance(reply, str) else list(reply)
+    balloons = [text for text in balloons if text]
+    if chat_id is None or not balloons:
+        return False, None
+    try:
+        for text in balloons:
+            send_telegram_message(chat_id, text)
+        return bool(TELEGRAM_BOT_TOKEN), None
+    except RuntimeError as exc:
+        return False, str(exc)
+
+
+_DENIED_TEXT = "\n".join(
+    [
+        "🔒 Relatório restrito.",
+        "",
+        "Este comando cita coordenadores nominalmente e só responde",
+        "nos chats de administração cadastrados.",
+        "",
+        "Peça a liberação ao administrador do bot.",
+    ]
+)
+
+
+async def _run_bot_command(
+    command: str,
+    args: str,
+    chat_id: int | str | None,
+) -> tuple[str | list[str], str, dict[str, Any]]:
+    """Resolve um comando do bot -> (resposta, status, extras da API).
+
+    A resposta é um texto ou uma LISTA de textos, quando o comando entrega
+    balões separados (ver `_reply_to_chat`).
+    """
+    now = datetime.now(timezone.utc)
+    db_ready = is_database_configured()
+
+    if command in _HELP_COMMANDS:
+        return build_telegram_help_reply(), "Comando de ajuda processado.", {}
+
+    if command in _SUMMARY_COMMANDS:
+        status_rows = await run_in_threadpool(get_latest_status_by_unit) if db_ready else []
+        summary_text = build_system_summary_text(status_rows)
+        return summary_text, "Comando de resumo processado.", {"summary": summary_text}
+
+    if command in _ALERT_COMMANDS:
+        alert_rows = await run_in_threadpool(get_recent_alerts, 10) if db_ready else []
+        return build_alerts_text(alert_rows), "Comando de alertas processado.", {"alerts": alert_rows}
+
+    if command in _VACANCY_COMMANDS:
+        if not is_report_chat_authorized(chat_id):
+            return _DENIED_TEXT, "Comando de vagas negado: chat não autorizado.", {}
+        status_rows = await run_in_threadpool(get_latest_status_by_unit) if db_ready else []
+        buckets = build_priority_buckets(status_rows)
+        return (
+            build_vacancy_report_text(buckets, status_rows, now=now, section=args),
+            "Comando de vagas processado.",
+            {},
+        )
+
+    if command in _COMPLIANCE_COMMANDS:
+        if not is_report_chat_authorized(chat_id):
+            return _DENIED_TEXT, "Comando de cobrança negado: chat não autorizado.", {}
+        days = parse_days_arg(args, default=7)
+        if not db_ready:
+            return "📭 Banco não configurado — sem dados para o ranking.", "Comando de cobrança sem banco.", {}
+        activity = await run_in_threadpool(get_giro_activity, days)
+        responsibles = await run_in_threadpool(get_unit_responsibles)
+        unparsed = await run_in_threadpool(get_unparsed_summary, days, 1)
+        ranking = compute_gap_ranking(activity["events"], activity["last_by_unit"], now, days)
+        return (
+            build_compliance_messages(ranking, responsibles, now, days, unparsed.get("total", 0)),
+            "Comando de cobrança processado.",
+            {},
+        )
+
+    if command in _OVER_CAPACITY_COMMANDS:
+        if not is_report_chat_authorized(chat_id):
+            return _DENIED_TEXT, "Comando de lotação negado: chat não autorizado.", {}
+        days = parse_days_arg(args, default=7)
+        if not db_ready:
+            return "📭 Banco não configurado — sem dados de lotação.", "Comando de lotação sem banco.", {}
+        timeline = await run_in_threadpool(get_capacity_timeline, days)
+        ranking = compute_over_capacity_ranking(timeline, now, days)
+        return (
+            build_over_capacity_report_text(ranking, now, days),
+            "Comando de lotação processado.",
+            {},
+        )
+
+    if command in _UNPARSED_COMMANDS:
+        if not is_report_chat_authorized(chat_id):
+            return _DENIED_TEXT, "Comando de não parseados negado: chat não autorizado.", {}
+        days = parse_days_arg(args, default=7)
+        if not db_ready:
+            return "📭 Banco não configurado — sem histórico de falhas.", "Comando de não parseados sem banco.", {}
+        summary = await run_in_threadpool(get_unparsed_summary, days, 5)
+        return (
+            build_unparsed_report_text(summary, now, days),
+            "Comando de não parseados processado.",
+            {},
+        )
+
+    return build_telegram_help_reply(), "Comando não operacional ignorado para o painel.", {}
+
+
 @app.post(
     "/api/webhook/telegram",
     summary="Webhook do bot Telegram",
@@ -1168,91 +1350,20 @@ async def telegram_webhook(
     if not text:
         raise HTTPException(status_code=400, detail="Update do Telegram sem campo de texto utilizável.")
 
-    normalized_text = text.strip().lower()
     chat = incoming_message.get("chat") or {}
     chat_id = chat.get("id")
 
-    if normalized_text == "/start":
-        reply_sent = False
-        reply_error: str | None = None
-        if chat_id is not None:
-            try:
-                send_telegram_message(chat_id, build_telegram_help_reply())
-                reply_sent = bool(TELEGRAM_BOT_TOKEN)
-            except RuntimeError as exc:
-                reply_error = str(exc)
+    command = parse_bot_command(text)
+    if command is not None:
+        command_name, command_args = command
+        reply, status_message, extra = await _run_bot_command(command_name, command_args, chat_id)
+
+        reply_sent, reply_error = _reply_to_chat(chat_id, reply)
 
         return {
             "status": "accepted",
-            "message": "Comando /start processado sem gerar evento operacional.",
-            "telegram_reply": {
-                "attempted": chat_id is not None,
-                "sent": reply_sent,
-                "error": reply_error,
-            },
-        }
-
-    if normalized_text in {"/resumo", "/status", "/giro"}:
-        status_rows = await run_in_threadpool(get_latest_status_by_unit) if is_database_configured() else []
-        summary_text = build_system_summary_text(status_rows)
-
-        reply_sent = False
-        reply_error: str | None = None
-        if chat_id is not None:
-            try:
-                send_telegram_message(chat_id, summary_text)
-                reply_sent = bool(TELEGRAM_BOT_TOKEN)
-            except RuntimeError as exc:
-                reply_error = str(exc)
-
-        return {
-            "status": "accepted",
-            "message": "Comando de resumo processado.",
-            "summary": summary_text,
-            "telegram_reply": {
-                "attempted": chat_id is not None,
-                "sent": reply_sent,
-                "error": reply_error,
-            },
-        }
-
-    if normalized_text in {"/alertas", "/alerta"}:
-        alert_rows = await run_in_threadpool(get_recent_alerts, 10) if is_database_configured() else []
-        alerts_text = build_alerts_text(alert_rows)
-
-        reply_sent = False
-        reply_error: str | None = None
-        if chat_id is not None:
-            try:
-                send_telegram_message(chat_id, alerts_text)
-                reply_sent = bool(TELEGRAM_BOT_TOKEN)
-            except RuntimeError as exc:
-                reply_error = str(exc)
-
-        return {
-            "status": "accepted",
-            "message": "Comando de alertas processado.",
-            "alerts": alert_rows,
-            "telegram_reply": {
-                "attempted": chat_id is not None,
-                "sent": reply_sent,
-                "error": reply_error,
-            },
-        }
-
-    if normalized_text.startswith("/"):
-        reply_sent = False
-        reply_error: str | None = None
-        if chat_id is not None:
-            try:
-                send_telegram_message(chat_id, build_telegram_help_reply())
-                reply_sent = bool(TELEGRAM_BOT_TOKEN)
-            except RuntimeError as exc:
-                reply_error = str(exc)
-
-        return {
-            "status": "accepted",
-            "message": "Comando não operacional ignorado para o painel.",
+            "message": status_message,
+            **extra,
             "telegram_reply": {
                 "attempted": chat_id is not None,
                 "sent": reply_sent,

@@ -42,6 +42,9 @@ services:
       TELEGRAM_ADMIN_CHAT_ID: ${TELEGRAM_ADMIN_CHAT_ID:-1438288563}
       TELEGRAM_ALERT_BOT_TOKEN: ${TELEGRAM_ALERT_BOT_TOKEN:-}
       TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
+      # Relatórios de gestão do bot (vazio = só TELEGRAM_ADMIN_CHAT_ID)
+      TELEGRAM_REPORT_CHAT_IDS: ${TELEGRAM_REPORT_CHAT_IDS:-}
+      REPORT_TIMEZONE: ${REPORT_TIMEZONE:-America/Sao_Paulo}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://mnrs.com.br}
       PUBLIC_WEBHOOK_PATH: ${PUBLIC_WEBHOOK_PATH:-/giro/api/webhook/telegram}
       DATABASE_URL: postgresql://giro:${POSTGRES_PASSWORD}@postgres:5432/giro_de_leitos

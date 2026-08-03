@@ -1915,6 +1915,227 @@ def admin_update_event(
 
 
 # ---------------------------------------------------------------------------
+# Relatórios de gestão (bot Telegram — ver reports.py)
+# ---------------------------------------------------------------------------
+
+
+def get_giro_activity(days: int = 7) -> dict[str, Any]:
+    """Giros da janela + último giro de cada unidade, para o ranking de gaps.
+
+    Usa `created_at` (chegada real no sistema), nunca `received_at` (horário
+    digitado no texto, que tem drift documentado e correção heurística em
+    main.build_dashboard_event). Cobrar alguém pelo horário digitado geraria
+    injustiça; o watcher de unidades sem giro já tomou a mesma decisão.
+    """
+    if not DATABASE_URL:
+        return {"events": [], "last_by_unit": {}}
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT unit_code, created_at
+                FROM parsed_events
+                WHERE unit_code IS NOT NULL
+                  AND created_at >= NOW() - make_interval(days => %s)
+                ORDER BY unit_code ASC, created_at ASC
+                """,
+                (days,),
+            )
+            events = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT unit_code, MAX(created_at) AS last_created_at
+                FROM parsed_events
+                WHERE unit_code IS NOT NULL
+                GROUP BY unit_code
+                """
+            )
+            last_rows = cur.fetchall()
+
+    return {
+        "events": events,
+        "last_by_unit": {row["unit_code"]: row["last_created_at"] for row in last_rows},
+    }
+
+
+def get_capacity_timeline(days: int = 7) -> list[dict[str, Any]]:
+    """Linha do tempo de `is_over_capacity` por giro, para o /lotacao.
+
+    Os flags saem do payload JSONB no próprio Postgres — trazer o payload
+    inteiro (com pacientes) para a aplicação seria caro e desnecessário.
+    """
+    if not DATABASE_URL:
+        return []
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    unit_code,
+                    created_at,
+                    COALESCE(payload->'data'->'rooms'->'red_room'->>'is_over_capacity', 'false')::boolean
+                        AS red_over,
+                    (
+                        COALESCE(payload->'data'->'rooms'->'yellow_room'->>'is_over_capacity', 'false')::boolean
+                        OR COALESCE(payload->'data'->'rooms'->'yellow_male'->>'is_over_capacity', 'false')::boolean
+                        OR COALESCE(payload->'data'->'rooms'->'yellow_female'->>'is_over_capacity', 'false')::boolean
+                    ) AS yellow_over
+                FROM parsed_events
+                WHERE unit_code IS NOT NULL
+                  AND created_at >= NOW() - make_interval(days => %s)
+                ORDER BY unit_code ASC, created_at ASC
+                """,
+                (days,),
+            )
+            return cur.fetchall()
+
+
+def get_unit_responsibles() -> dict[str, list[str]]:
+    """Coordenadores ativos por unidade — apenas o NOME.
+
+    Telefone (`users.phone`) é dado pessoal de profissional de saúde e nunca
+    sai em mensagem do bot; a coluna não é sequer selecionada aqui.
+
+    Quando a unidade tem coordenador *primário* (`users.unit_id`), só ele é
+    devolvido: `coordinator_units` inclui coordenadores de rede vinculados a
+    todas as unidades, que poluiriam a cobrança.
+    """
+    if not DATABASE_URL:
+        return {}
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    un.code AS unit_code,
+                    u.name AS name,
+                    (u.unit_id = un.id) AS is_primary
+                FROM coordinator_units cu
+                JOIN users u ON u.id = cu.user_id
+                JOIN units un ON un.id = cu.unit_id
+                WHERE u.status = 'active' AND u.role = 'coordinator'
+                ORDER BY un.code ASC, u.name ASC
+                """
+            )
+            rows = cur.fetchall()
+
+    grouped: dict[str, dict[str, list[str]]] = {}
+    for row in rows:
+        bucket = grouped.setdefault(row["unit_code"], {"primary": [], "other": []})
+        bucket["primary" if row["is_primary"] else "other"].append(row["name"])
+
+    return {
+        unit_code: (bucket["primary"] or bucket["other"])
+        for unit_code, bucket in grouped.items()
+    }
+
+
+def record_unparsed_message(
+    source: str,
+    raw_text: str,
+    reasons: list[str] | None = None,
+    unit_hint: str | None = None,
+) -> None:
+    """Persiste uma mensagem que parecia giro mas não pôde ser publicada."""
+    if not DATABASE_URL:
+        return
+
+    first_line = next((line.strip() for line in (raw_text or "").splitlines() if line.strip()), "")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO unparsed_messages (source, raw_text, first_line, reasons, unit_hint)
+                VALUES (%s, %s, %s, %s::jsonb, %s)
+                """,
+                (
+                    source or "desconhecida",
+                    (raw_text or "")[:4000],
+                    first_line[:280],
+                    _json_dumps(reasons or []),
+                    unit_hint,
+                ),
+            )
+        conn.commit()
+
+
+def get_unparsed_summary(days: int = 7, sample_limit: int = 5) -> dict[str, Any]:
+    """Contagens + amostra das mensagens não parseadas na janela."""
+    if not DATABASE_URL:
+        return {"total": 0, "by_source": [], "by_reason": [], "samples": []}
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT count(*) AS total
+                FROM unparsed_messages
+                WHERE created_at >= NOW() - make_interval(days => %s)
+                """,
+                (days,),
+            )
+            total = (cur.fetchone() or {}).get("total", 0)
+
+            cur.execute(
+                """
+                SELECT source, count(*) AS count
+                FROM unparsed_messages
+                WHERE created_at >= NOW() - make_interval(days => %s)
+                GROUP BY source
+                ORDER BY count DESC
+                """,
+                (days,),
+            )
+            by_source = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT reason, count(*) AS count
+                FROM unparsed_messages,
+                     LATERAL jsonb_array_elements_text(reasons) AS reason
+                WHERE created_at >= NOW() - make_interval(days => %s)
+                GROUP BY reason
+                ORDER BY count DESC
+                """,
+                (days,),
+            )
+            by_reason = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT created_at, source, first_line, reasons
+                FROM unparsed_messages
+                WHERE created_at >= NOW() - make_interval(days => %s)
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (days, sample_limit),
+            )
+            samples = cur.fetchall()
+
+    for sample in samples:
+        reasons = sample.get("reasons")
+        if not isinstance(reasons, list):
+            try:
+                reasons = json.loads(reasons or "[]")
+            except (TypeError, ValueError):
+                reasons = []
+        sample["reason"] = reasons[0] if reasons else None
+
+    return {
+        "total": total,
+        "by_source": by_source,
+        "by_reason": by_reason,
+        "samples": samples,
+    }
+
+
+# ---------------------------------------------------------------------------
 # SQL file-based migrations (auth/beds/etc)
 # ---------------------------------------------------------------------------
 
