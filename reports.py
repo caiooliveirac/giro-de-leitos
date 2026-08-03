@@ -658,13 +658,93 @@ def build_vacancy_report_text(
 
 
 # ---------------------------------------------------------------------------
+# Contatos por unidade (quem posta o giro)
+# ---------------------------------------------------------------------------
+
+# As UPAs postam o próprio giro pelo WhatsApp: quem posta É o contato da
+# unidade. Estas funções leem o mapa vindo de `db.get_unit_contacts()`
+# (unit_code -> [{phone, name, giro_count, last_seen_at}, ...], já ordenado por
+# quem mais posta) e nunca assumem que ele tem alguma coisa: a tabela nasce
+# vazia e o caminho de fallback — o coordenador cadastrado — é o de sempre.
+
+# Quantos números são mencionados por unidade. Mais que dois vira lista de
+# transmissão: o aviso deixa de ter dono e ninguém responde.
+MAX_MENTIONS_PER_UNIT = 2
+
+
+def unit_contacts(unit_code: str | None, contacts: dict[str, list[dict[str, Any]]] | None) -> list[dict[str, Any]]:
+    """Contatos conhecidos da unidade, os que mais postam primeiro."""
+    if not unit_code or not contacts:
+        return []
+    entries = contacts.get(unit_code) or []
+    return [entry for entry in entries if isinstance(entry, dict) and str(entry.get("phone") or "").strip()]
+
+
+def unit_mentions(
+    unit_code: str | None,
+    contacts: dict[str, list[dict[str, Any]]] | None,
+    limit: int = MAX_MENTIONS_PER_UNIT,
+) -> list[str]:
+    """Números (só dígitos) a mencionar por causa desta unidade."""
+    return [str(entry["phone"]).strip() for entry in unit_contacts(unit_code, contacts)[:limit]]
+
+
+def collect_alert_mentions(
+    offenders: list[dict[str, Any]],
+    contacts: dict[str, list[dict[str, Any]]] | None,
+    limit: int = MAX_MENTIONS_PER_UNIT,
+) -> list[str]:
+    """Menções da mensagem inteira, sem repetir quem posta por duas unidades."""
+    mentions: list[str] = []
+    for item in offenders:
+        mentions.extend(unit_mentions(item.get("unit_code"), contacts, limit))
+    return list(dict.fromkeys(mentions))
+
+
+def _first_name(value: str | None) -> str:
+    parts = (value or "").strip().split()
+    return parts[0].capitalize() if parts else ""
+
+
+def _mention_summary(unit_code: str | None, contacts: dict[str, list[dict[str, Any]]] | None) -> str | None:
+    """'@5571988887777' ou '@... · @... +1'. None quando ninguém é conhecido.
+
+    O ``@número`` no texto é redundante com o campo `mentions` do gateway (a
+    menção fantasma funciona sem ele), mas é o que faz o gestor VER de quem se
+    trata quando lê o aviso na notificação, antes de abrir a conversa.
+    """
+    entries = unit_contacts(unit_code, contacts)
+    if not entries:
+        return None
+    shown = " · ".join(f"@{str(entry['phone']).strip()}" for entry in entries[:MAX_MENTIONS_PER_UNIT])
+    extra = len(entries) - MAX_MENTIONS_PER_UNIT
+    return f"{shown} +{extra}" if extra > 0 else shown
+
+
+# ---------------------------------------------------------------------------
 # Builder: /cobranca
 # ---------------------------------------------------------------------------
 
 _RANK_ICONS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
 
 
-def _responsible_line(unit_code: str, responsibles: dict[str, list[str]]) -> str:
+def _responsible_line(
+    unit_code: str,
+    responsibles: dict[str, list[str]],
+    contacts: dict[str, list[dict[str, Any]]] | None = None,
+) -> str:
+    """Para quem falar sobre esta unidade.
+
+    Prioridade para quem POSTA o giro (aprendido da ingestão): o coordenador
+    cadastrado costuma não ser quem manda a mensagem no grupo, e cobrar a
+    pessoa errada é como não cobrar. Sem contato aprendido, cai no cadastro.
+    """
+    mention = _mention_summary(unit_code, contacts)
+    if mention:
+        names = [_first_name(entry.get("name")) for entry in unit_contacts(unit_code, contacts)[:1]]
+        who = f" ({names[0]})" if names and names[0] else ""
+        return f"     👤 posta o giro: {mention}{who}"
+
     names = responsibles.get(unit_code) or []
     if not names:
         return "     👤 — sem coordenador cadastrado"
@@ -696,7 +776,7 @@ def _sla_sentence() -> str:
 
 def _greeting(unit_name: str, names: list[str]) -> str:
     """'Olá, Joilson!' — primeiro nome, porque o cadastro vem em caixa alta."""
-    firsts = [part.split()[0].capitalize() for part in names if part and part.split()]
+    firsts = [_first_name(part) for part in names if _first_name(part)]
     if not firsts:
         return f"Olá, equipe da {unit_name}!"
     if len(firsts) == 1:
@@ -772,6 +852,7 @@ def _build_ranking_message(
     now: datetime,
     days: int,
     unparsed_count: int,
+    contacts: dict[str, list[dict[str, Any]]] | None = None,
 ) -> str:
     """Balão 1: o ranking operacional, para o gestor ler — não para copiar."""
     lines = [
@@ -797,7 +878,7 @@ def _build_ranking_message(
         else:
             lines.append(f"     🟢 em dia agora ({fmt_duration(item['current_gap_hours'])} sem giro)")
         lines.append(f"     ⚠️ {_plural(item['violation_count'], 'violação', 'violações')} no período")
-        lines.append(_responsible_line(item["unit_code"], responsibles))
+        lines.append(_responsible_line(item["unit_code"], responsibles, contacts))
 
     em_dia = len(ranking) - len(offenders)
     if em_dia > 0:
@@ -824,8 +905,9 @@ def _build_ranking_message(
             "",
             "ℹ️ Gap que cruza a virada de turno é julgado pelo",
             "   turno onde passou a maior parte do tempo — um",
-            "   silêncio nunca conta duas vezes. 👤 = coordenador",
-            "   cadastrado, não necessariamente quem enviou o giro.",
+            "   silêncio nunca conta duas vezes. 👤 = quem posta o",
+            "   giro pelo WhatsApp (aprendido dos envios); quando",
+            "   ninguém posta ainda, o coordenador cadastrado.",
             "   Base: horário de chegada do giro no sistema.",
         ]
     )
@@ -836,14 +918,22 @@ def build_unit_charge_snippet(
     item: dict[str, Any],
     responsibles: dict[str, list[str]],
     days: int,
+    contacts: dict[str, list[dict[str, Any]]] | None = None,
 ) -> str:
     """Balão por unidade: SÓ o texto a ser copiado.
 
     Nada de cabeçalho de sistema aqui — no Telegram o "copiar" leva a mensagem
-    inteira, então qualquer enfeite iria junto para o WhatsApp do coordenador.
+    inteira, então qualquer enfeite iria junto para o WhatsApp de quem recebe.
+
+    A saudação prefere o NOME de quem posta o giro; o coordenador cadastrado é
+    o fallback (e o genérico "equipe da UPA" o fallback do fallback).
     """
     unit_name = item["unit_name"]
-    lines = [_greeting(unit_name, responsibles.get(item["unit_code"]) or []), ""]
+    contact_names = [str(entry.get("name") or "") for entry in unit_contacts(item["unit_code"], contacts)]
+    greeting_names = [name for name in contact_names if name.strip()] or (
+        responsibles.get(item["unit_code"]) or []
+    )
+    lines = [_greeting(unit_name, greeting_names), ""]
 
     if item["never_posted"]:
         lines.append(
@@ -869,6 +959,7 @@ def _build_consolidated_message(
     responsibles: dict[str, list[str]],
     now: datetime,
     days: int,
+    contacts: dict[str, list[dict[str, Any]]] | None = None,
 ) -> str:
     """Último balão: todas as violações num texto só, para o gestor maior."""
     total = sum(item["violation_count"] for item in offenders)
@@ -884,7 +975,8 @@ def _build_consolidated_message(
 
     for index, item in enumerate(offenders, start=1):
         names = responsibles.get(item["unit_code"]) or []
-        coordinator = " · ".join(names[:2]) if names else "sem coordenador cadastrado"
+        mention = _mention_summary(item["unit_code"], contacts)
+        coordinator = mention or (" · ".join(names[:2]) if names else "sem coordenador cadastrado")
         if item["never_posted"]:
             situacao = "nunca postou giro"
         elif _is_silent_now(item):
@@ -893,7 +985,7 @@ def _build_consolidated_message(
             situacao = f"em dia agora ({fmt_duration(item['current_gap_hours'])} sem giro)"
         lines.append(
             f"{index}. {item['unit_name']} — {_plural(item['violation_count'], 'violação', 'violações')}"
-            f" · {situacao} · coord.: {coordinator}"
+            f" · {situacao} · {'posta' if mention else 'coord.'}: {coordinator}"
         )
         lines.extend(f"   {bullet}" for bullet in _violation_bullets(item["violations"]))
         lines.append("")
@@ -908,6 +1000,7 @@ def build_compliance_messages(
     now: datetime,
     days: int,
     unparsed_count: int = 0,
+    contacts: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[str]:
     """Os balões do /cobranca, na ordem em que são enviados.
 
@@ -916,6 +1009,10 @@ def build_compliance_messages(
     3. consolidado de todas as violações, para o gestor maior.
 
     Sem violação na janela, devolve um balão único dizendo exatamente isso.
+
+    `contacts` (quem posta o giro, de `db.get_unit_contacts()`) é opcional: sem
+    ele — ou enquanto a tabela estiver vazia — a cobrança sai idêntica à de
+    antes, nomeando o coordenador cadastrado.
     """
     offenders = delinquent_units(ranking)
 
@@ -936,12 +1033,14 @@ def build_compliance_messages(
             )
         ]
 
-    messages = [_build_ranking_message(ranking, offenders, responsibles, now, days, unparsed_count)]
+    messages = [
+        _build_ranking_message(ranking, offenders, responsibles, now, days, unparsed_count, contacts)
+    ]
     messages.extend(
-        build_unit_charge_snippet(item, responsibles, days)
+        build_unit_charge_snippet(item, responsibles, days, contacts)
         for item in offenders[:MAX_COBRANCA_SNIPPETS]
     )
-    messages.append(_build_consolidated_message(offenders, responsibles, now, days))
+    messages.append(_build_consolidated_message(offenders, responsibles, now, days, contacts))
     return messages
 
 
@@ -1075,6 +1174,78 @@ def build_over_capacity_report_text(
             "   está velho e o tempo deixa de ser contado.",
         ]
     )
+    return "\n".join(lines).strip()
+
+
+# ---------------------------------------------------------------------------
+# Builder: alerta de silêncio por WhatsApp (gestor)
+# ---------------------------------------------------------------------------
+
+# Teto de unidades citadas nominalmente no aviso. O alerta é lido no celular,
+# em pé, no corredor: passar disso vira relatório e para de ser lido. O que
+# não couber é anunciado como "+N", nunca cortado em silêncio.
+MAX_WHATSAPP_ALERT_UNITS = 8
+
+
+def _coordinator_summary(unit_code: str | None, responsibles: dict[str, list[str]]) -> str:
+    """'Joilson Santos', 'Joilson · Maria +2' ou 'sem coordenador'.
+
+    Só o nome — telefone de coordenador nunca sai em mensagem automática
+    (mesma regra de db.get_unit_responsibles).
+    """
+    names = responsibles.get(unit_code or "") or []
+    if not names:
+        return "sem coordenador"
+    shown = " · ".join(names[:2])
+    return f"{shown} +{len(names) - 2}" if len(names) > 2 else shown
+
+
+def build_whatsapp_stale_alert_text(
+    offenders: list[dict[str, Any]],
+    responsibles: dict[str, list[str]],
+    now: datetime,
+    threshold_hours: float | None = None,
+    contacts: dict[str, list[dict[str, Any]]] | None = None,
+) -> str:
+    """Aviso curto de UPA sem giro, em texto puro para o WhatsApp do gestor.
+
+    Não é relatório: uma linha por unidade com horas e quem posta, e nada
+    mais. Sem HTML (o WhatsApp não entende) — negrito é *asterisco*.
+
+    `threshold_hours=None` (o padrão) significa SLA por turno: o cabeçalho
+    mostra a regra e cada linha traz o limite que AQUELA unidade estourou —
+    "16h no noturno" e "7h no diurno" são as duas violações, e o gestor precisa
+    ver por quê. Um número fixo só aparece quando o operador forçou
+    ``WHATSAPP_ALERT_HOURS``.
+
+    `offenders` já vem filtrado por limiar e cooldown
+    (services.whatsapp_alerts.select_stale_offenders); aqui só se formata.
+    """
+    ordered = sorted(offenders, key=lambda item: item.get("age_hours") or 0.0, reverse=True)
+    shown = ordered[:MAX_WHATSAPP_ALERT_UNITS]
+    by_shift = threshold_hours is None
+    lines = [
+        "🔴 *UPA sem giro além do combinado*"
+        if by_shift
+        else f"🔴 *UPA sem giro há mais de {threshold_label(threshold_hours)}*",
+        f"{fmt_local(now)} · SLA {_sla_short()}" if by_shift else fmt_local(now),
+        "",
+    ]
+    for item in shown:
+        name = short_unit_name(item.get("unit_code"), item.get("unit_name"))
+        who = _mention_summary(item.get("unit_code"), contacts) or _coordinator_summary(
+            item.get("unit_code"), responsibles
+        )
+        limit = ""
+        if by_shift and item.get("limit_hours") is not None:
+            limit = f" (limite {item.get('shift', 'do turno')} {threshold_label(item['limit_hours'])})"
+        lines.append(f"• {name} — {fmt_duration(item.get('age_hours'))}{limit} · 👤 {who}")
+
+    remaining = len(ordered) - len(shown)
+    if remaining > 0:
+        lines.append(f"• +{remaining} unidade(s) também sem giro")
+
+    lines.extend(["", "Giro de Leitos · aviso automático"])
     return "\n".join(lines).strip()
 
 
