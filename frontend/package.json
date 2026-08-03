@@ -19,7 +19,7 @@
     "@radix-ui/react-toggle": "1.1.0",
     "@radix-ui/react-tabs": "1.1.1",
     "lucide-react": "0.451.0",
-    "zod": "3.23.8",
+    "zod": "4.4.3",
     "react-hook-form": "7.53.0",
     "@hookform/resolvers": "3.9.0",
     "next-pwa": "5.6.0",
