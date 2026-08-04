@@ -59,6 +59,15 @@ services:
       WHATSAPP_GW_AUTH: ${WHATSAPP_GW_AUTH:-}
       WHATSAPP_ALERT_HOURS: ${WHATSAPP_ALERT_HOURS:-12}
       WHATSAPP_ALERT_COOLDOWN_HOURS: ${WHATSAPP_ALERT_COOLDOWN_HOURS:-6}
+      # --- Grupo das UPAs: destino do que é dito ÀS unidades ---
+      WHATSAPP_GROUP_TO: ${WHATSAPP_GROUP_TO:-}
+      # A MESMA cobrança de silêncio também no grupo (nasce DESLIGADA)
+      WHATSAPP_ALERT_TO_GROUP: ${WHATSAPP_ALERT_TO_GROUP:-false}
+      # --- Restrição de UPA anunciada no grupo (nasce DESLIGADA) ---
+      WHATSAPP_RESTRICTION_ENABLED: ${WHATSAPP_RESTRICTION_ENABLED:-false}
+      TABELA_RESTRICTIONS_URL: ${TABELA_RESTRICTIONS_URL:-https://mnrs.com.br/tabela/api/upas/restrictions}
+      WHATSAPP_RESTRICTION_DIGEST_HOURS: ${WHATSAPP_RESTRICTION_DIGEST_HOURS:-4}
+      WHATSAPP_RESTRICTION_POLL_MINUTES: ${WHATSAPP_RESTRICTION_POLL_MINUTES:-2}
       # --- Auth / Crypto (fail-fast) ---
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET obrigatorio}
       CPF_ENCRYPTION_KEY: ${CPF_ENCRYPTION_KEY:?CPF_ENCRYPTION_KEY obrigatorio}

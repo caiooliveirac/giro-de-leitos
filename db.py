@@ -156,6 +156,14 @@ CREATE TABLE IF NOT EXISTS unit_contacts (
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (unit_code, sender_phone)
 );
+
+-- Estado do aviso de restrição de UPA no grupo do WhatsApp (ver
+-- migrations/011_whatsapp_restriction_state.sql).
+CREATE TABLE IF NOT EXISTS whatsapp_restriction_state (
+    state_key TEXT PRIMARY KEY,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
 
@@ -1297,6 +1305,88 @@ def record_whatsapp_alert_sent(unit_keys: list[str], sent_at: datetime | None = 
                     """,
                     (unit_key, moment),
                 )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Aviso de restrição de UPA no grupo do WhatsApp
+# ---------------------------------------------------------------------------
+
+
+def get_whatsapp_restriction_snapshot() -> dict[str, Any] | None:
+    """A última lista de restrições que o grupo já viu, ou None se nunca houve.
+
+    A diferença entre `None` e `{}` é o ponto inteiro desta função: `{}` quer
+    dizer "o grupo está em dia e não há nada restrito"; `None` quer dizer "esta
+    instalação nunca anunciou nada" — e nesse caso o watcher SEMEIA o snapshot
+    em silêncio em vez de anunciar como nova cada restrição que já estava lá.
+    """
+    if not DATABASE_URL:
+        return None
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM whatsapp_restriction_state WHERE state_key = 'snapshot'"
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    payload = row.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_whatsapp_restriction_snapshot(snapshot: dict[str, Any]) -> None:
+    """Sobrescreve o snapshot. Só depois do grupo ter sido avisado."""
+    if not DATABASE_URL:
+        return
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO whatsapp_restriction_state (state_key, payload, updated_at)
+                VALUES ('snapshot', %s::jsonb, NOW())
+                ON CONFLICT (state_key) DO UPDATE SET
+                    payload = EXCLUDED.payload,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (_json_dumps(snapshot),),
+            )
+        conn.commit()
+
+
+def claim_whatsapp_restriction_notice(notice_key: str) -> bool:
+    """Reserva a janela do lembrete. False = alguém já mandou esta.
+
+    INSERT ... ON CONFLICT DO NOTHING é a trava: dois processos (ou dois ticks
+    do mesmo processo) disputando a mesma janela, só um leva.
+    """
+    if not DATABASE_URL:
+        return True
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO whatsapp_restriction_state (state_key)
+                VALUES (%s)
+                ON CONFLICT (state_key) DO NOTHING
+                RETURNING state_key
+                """,
+                (notice_key,),
+            )
+            claimed = cur.fetchone() is not None
+        conn.commit()
+    return claimed
+
+
+def release_whatsapp_restriction_notice(notice_key: str) -> None:
+    """Devolve a janela quando o envio falhou — o próximo tick tenta de novo."""
+    if not DATABASE_URL:
+        return
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM whatsapp_restriction_state WHERE state_key = %s", (notice_key,)
+            )
         conn.commit()
 
 

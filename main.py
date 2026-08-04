@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from db import (
     admin_update_event,
+    claim_whatsapp_restriction_notice,
     delete_event,
     get_capacity_timeline,
     get_dashboard_metrics,
@@ -34,13 +35,16 @@ from db import (
     get_unit_responsibles,
     get_unparsed_summary,
     get_whatsapp_alert_state,
+    get_whatsapp_restriction_snapshot,
     init_db,
     is_database_configured,
     record_unparsed_message,
     record_whatsapp_alert_sent,
     register_telegram_alert_chat,
+    release_whatsapp_restriction_notice,
     resolve_pending_unit_confirmation,
     save_event,
+    save_whatsapp_restriction_snapshot,
     update_unit_reported_at,
 )
 from auth.deps import get_current_admin
@@ -65,6 +69,7 @@ from services.whatsapp_alerts import (
     normalize_phone,
     select_stale_offenders,
 )
+from services import upa_restrictions_wa
 from units import normalize_unit_text, resolve_unit_from_text, resolve_unit_name
 
 
@@ -207,6 +212,7 @@ async def startup_event() -> None:
     if is_database_configured():
         await run_in_threadpool(init_db)
     asyncio.create_task(_stale_units_watcher())
+    asyncio.create_task(_upa_restrictions_watcher())
 
 
 def build_dashboard_event(
@@ -452,6 +458,45 @@ def _notify_stale_whatsapp(status_rows: list[dict[str, Any]], now: datetime) -> 
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("Alerta WhatsApp de unidades sem giro falhou: %s", exc)
+
+
+async def _upa_restrictions_watcher() -> None:
+    """Avisa o grupo das UPAs quando a coordenação redireciona uma unidade.
+
+    Watcher próprio, separado do de silêncio, porque as duas coisas têm
+    cadências e donos diferentes: silêncio é varredura de 30min sobre o banco
+    local, restrição é leitura de 2min do contrato público do `tabela` e
+    precisa chegar rápido — quem já está com o paciente na porta não pode
+    descobrir o redirecionamento meia hora depois.
+
+    Nunca derruba a API: qualquer exceção vira log e a varredura seguinte
+    tenta de novo.
+    """
+    interval_seconds = max(upa_restrictions_wa.WHATSAPP_RESTRICTION_POLL_MINUTES, 1.0) * 60
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await run_in_threadpool(_run_upa_restrictions_cycle)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Watcher de restrição de UPA falhou: %s", exc)
+
+
+def _run_upa_restrictions_cycle() -> None:
+    """Uma varredura, com o banco plugado. Roda no threadpool (urllib+psycopg).
+
+    Sem banco o snapshot não sobrevive ao restart, e sem snapshot cada boot
+    re-anunciaria as restrições vigentes como novas — por isso o ciclo só roda
+    com `DATABASE_URL` configurada.
+    """
+    if not is_database_configured():
+        return
+    upa_restrictions_wa.run_restriction_cycle(
+        read_snapshot=get_whatsapp_restriction_snapshot,
+        write_snapshot=save_whatsapp_restriction_snapshot,
+        claim_notice=claim_whatsapp_restriction_notice,
+        release_notice=release_whatsapp_restriction_notice,
+    )
 
 
 def _configured_admin_chat_ids() -> list[str]:

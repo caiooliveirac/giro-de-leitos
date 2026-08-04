@@ -314,6 +314,37 @@ Nada nesse caminho pode falhar por falta de autoria.
 | `WHATSAPP_GW_AUTH` | vazio | `usuario:segredo` — o mesmo `APP_BASIC_AUTH` do container `whatsmeow-gw` |
 | `WHATSAPP_ALERT_HOURS` | vazio | **Override**: limiar fixo em horas. Vazio = SLA por turno (6h/12h) |
 | `WHATSAPP_ALERT_COOLDOWN_HOURS` | `6` | Janela mínima entre avisos da mesma unidade |
+| `WHATSAPP_GROUP_TO` | vazio | JID do grupo das UPAs (`120363...@g.us`) |
+| `WHATSAPP_ALERT_TO_GROUP` | `false` | `true` manda a **mesma** cobrança também para o grupo |
+
+Por padrão a cobrança tem **um destino só**, o gestor: o grupo das UPAs não é
+cobrado. `WHATSAPP_ALERT_TO_GROUP=true` acrescenta o grupo — mas a mensagem cita
+nominalmente quem posta o giro e o coordenador, então levá-la para lá muda quem
+lê isso, e por isso é opt-in.
+
+---
+
+## Restrição de UPA anunciada no grupo
+
+Quando a chefia restringe uma unidade no painel `/tabela`, o grupo do WhatsApp
+onde o giro é postado é avisado de que a demanda daquela unidade está sendo
+redirecionada **a pedido da Coordenação de Unidades Fixas** — nas mudanças e a
+cada **4h** (07, 11, 15, 19, 23, 03), enquanto houver restrição vigente.
+
+Implementado em `services/upa_restrictions_wa.py`, com watcher próprio
+(`main._upa_restrictions_watcher`). Só **lê** `GET /tabela/api/upas/restrictions`
+— o `tabela` continua dono do dado. Nasce desligado.
+
+Documento completo, incluindo as travas contra anúncio falso de liberação:
+[docs/restricao-upa-whatsapp.md](docs/restricao-upa-whatsapp.md).
+
+| Variável | Default | Observação |
+|---|---|---|
+| `WHATSAPP_RESTRICTION_ENABLED` | `false` | Interruptor geral |
+| `WHATSAPP_GROUP_TO` | vazio | Destino: JID do grupo das UPAs |
+| `TABELA_RESTRICTIONS_URL` | `https://mnrs.com.br/tabela/api/upas/restrictions` | Fonte (GET público) |
+| `WHATSAPP_RESTRICTION_DIGEST_HOURS` | `4` | Lembrete, ancorado em 07:00/19:00 |
+| `WHATSAPP_RESTRICTION_POLL_MINUTES` | `2` | Teto do atraso de uma mudança |
 
 ---
 
@@ -353,6 +384,14 @@ gravam).
 Quem posta o giro de cada unidade, **derivado da ingestão** (não é cadastro):
 uma linha por `(unit_code, sender_phone)` com contagem de giros, primeiro e
 último envio. É a origem das menções do alerta e do `/cobranca`.
+
+### `whatsapp_restriction_state`
+
+Memória do aviso de restrição no grupo: a linha `snapshot` guarda a última lista
+de restrições que o grupo já viu (é contra ela que cada varredura compara), e
+uma linha `digest:<data>T<hora>` por janela de 4h já enviada. Snapshot
+**ausente** e snapshot **vazio** significam coisas diferentes — ver
+[docs/restricao-upa-whatsapp.md](docs/restricao-upa-whatsapp.md).
 
 ---
 
