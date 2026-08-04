@@ -763,6 +763,18 @@ def _sla_short() -> str:
     )
 
 
+def _sla_plain() -> str:
+    """'diurno até 6h · noturno até 12h' — sem as faixas de horário.
+
+    O `_sla_short` aninha parênteses ("(diurno (07h–19h) até 6h ...)") e vira
+    ruído quando já está dentro de outro parêntese, no meio de uma frase.
+    """
+    return (
+        f"diurno até {threshold_label(GIRO_SLA['day_max_gap_hours'])}"
+        f" · noturno até {threshold_label(GIRO_SLA['night_max_gap_hours'])}"
+    )
+
+
 def _sla_sentence() -> str:
     """A mesma regra em prosa, para dentro do texto que vai ser copiado."""
     day_start, day_end = GIRO_SLA["day_start_hour"], GIRO_SLA["day_end_hour"]
@@ -1246,6 +1258,61 @@ def build_whatsapp_stale_alert_text(
         lines.append(f"• +{remaining} unidade(s) também sem giro")
 
     lines.extend(["", "Giro de Leitos · aviso automático"])
+    return "\n".join(lines).strip()
+
+
+def build_group_stale_request_text(
+    offenders: list[dict[str, Any]],
+    now: datetime,
+    threshold_hours: float | None = None,
+    contacts: dict[str, list[dict[str, Any]]] | None = None,
+) -> str:
+    """A mesma cobrança, escrita para o GRUPO das UPAs em vez do gestor.
+
+    Mesmos dados, mesmo SLA, mesma lista — muda quem lê. No WhatsApp do gestor
+    a mensagem é um relatório sobre terceiros ("UPA sem giro além do
+    combinado"); no grupo, quem lê é a própria pessoa citada, e um relatório de
+    violação lido em público cobra do jeito errado: gera constrangimento,
+    depois silêncio, e o canal se perde.
+
+    Então aqui o texto é um PEDIDO — diz o que falta, por que importa (é o giro
+    que a regulação usa para encaminhar) e não usa a palavra violação. A
+    menção de quem posta continua, porque é ela que faz a mensagem chegar em
+    quem pode resolver.
+
+    `offenders` já vem filtrado por limiar e cooldown — aqui só se formata.
+    """
+    ordered = sorted(offenders, key=lambda item: item.get("age_hours") or 0.0, reverse=True)
+    shown = ordered[:MAX_WHATSAPP_ALERT_UNITS]
+    by_shift = threshold_hours is None
+
+    lines = [
+        "🔄 *Giro de leitos — atualização pendente*",
+        fmt_local(now),
+        "",
+        "Estas unidades estão sem atualizar o giro há mais tempo que o combinado"
+        + (f" ({_sla_plain()}):" if by_shift else f" ({threshold_label(threshold_hours)}):"),
+        "",
+    ]
+    for item in shown:
+        name = short_unit_name(item.get("unit_code"), item.get("unit_name"))
+        who = _mention_summary(item.get("unit_code"), contacts)
+        quem = f" · 👤 {who}" if who else ""
+        lines.append(f"• {name} — {fmt_duration(item.get('age_hours'))}{quem}")
+
+    remaining = len(ordered) - len(shown)
+    if remaining > 0:
+        lines.append(f"• +{remaining} unidade(s) também pendente(s)")
+
+    lines.extend(
+        [
+            "",
+            "Quando puderem, por favor postem o giro atualizado aqui no grupo — é "
+            "ele que a regulação usa para encaminhar os pacientes.",
+            "",
+            "Giro de Leitos · aviso automático",
+        ]
+    )
     return "\n".join(lines).strip()
 
 
