@@ -1,43 +1,34 @@
 name: Configure WhatsApp group
 
-# Liga/desliga os avisos endereçados ao GRUPO das UPAs escrevendo no
-# .deploy-env do servidor — o arquivo que o `docker run --env-file` lê e que,
-# por não ser versionado, não pode ser alterado por um push.
+# Liga os avisos endereçados ao GRUPO das UPAs escrevendo no .deploy-env do
+# servidor — arquivo que o `docker run --env-file` lê e que, por não ser
+# versionado, nenhum push alcança.
 #
-# Existe porque a alternativa era SSH manual para uma edição de 4 linhas. Não
-# recria o container: depois de aplicar, rode o workflow "Deploy" com
-# component=api, que já tem canary + healthcheck + rollback.
+# Descobre sozinho as duas coisas que não estão no .deploy-env:
+#   • o JID do grupo  → unit systemd do giro-wa-adapter, ou o journal dele
+#                       (o grupo de onde os giros realmente chegam);
+#   • a credencial do gateway → APP_BASIC_AUTH do container whatsmeow.
 #
-# CUIDADO — este repositório é PÚBLICO e os logs do Actions também são. Nada
-# aqui pode imprimir o conteúdo do .deploy-env (tem senha do banco, JWT_SECRET,
-# SMTP_PASS). Só nomes de chave e valores mascarados saem no log.
+# NÃO recria o container. Depois de aplicar, rode o workflow "Deploy" com
+# component=api, que tem canary, healthcheck e rollback.
+#
+# CUIDADO — este repositório é PÚBLICO, e os logs do Actions também. Nada aqui
+# imprime o conteúdo do .deploy-env nem a credencial do gateway.
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "inspect = só relata o que encontrou · apply = grava"
+        description: "inspect = só relata · apply = grava"
         required: true
         type: choice
         options: [inspect, apply]
         default: inspect
       group_jid:
-        description: "JID do grupo (120363...@g.us). Vazio = descobrir no servidor"
+        description: "JID do grupo (vazio = descobrir no servidor)"
         required: false
         type: string
         default: ""
-      restriction:
-        description: "Aviso de restrição de UPA no grupo"
-        required: true
-        type: choice
-        options: ["true", "false"]
-        default: "true"
-      stale_to_group:
-        description: "Cobrança de giro parado também no grupo"
-        required: true
-        type: choice
-        options: ["true", "false"]
-        default: "true"
 
 concurrency:
   group: giro-de-leitos-deploy
@@ -59,91 +50,106 @@ jobs:
       - name: Configure group alerts
         env:
           MODE: ${{ inputs.mode }}
-          GROUP_JID_IN: ${{ inputs.group_jid }}
-          RESTRICTION: ${{ inputs.restriction }}
-          STALE_TO_GROUP: ${{ inputs.stale_to_group }}
+          JID_IN: ${{ inputs.group_jid }}
         run: |
           ssh -o ServerAliveInterval=20 -i ~/.ssh/id_ed25519 \
               ${{ secrets.PROD_SSH_USER }}@${{ secrets.PROD_SSH_HOST }} \
-              MODE="$MODE" GROUP_JID_IN="$GROUP_JID_IN" \
-              RESTRICTION="$RESTRICTION" STALE_TO_GROUP="$STALE_TO_GROUP" \
-              bash -s << 'REMOTE_SCRIPT'
+              MODE="$MODE" JID_IN="$JID_IN" bash -s << 'REMOTE_SCRIPT'
             set -euo pipefail
-            ENV_FILE=/home/ubuntu/giro-de-leitos/.deploy-env
+            F=/home/ubuntu/giro-de-leitos/.deploy-env
 
-            # Mostra só o suficiente para conferir identidade, nunca o valor
-            # inteiro — o log deste workflow é público.
+            if [ ! -f "$F" ]; then
+              echo "ERRO: $F nao existe nesta maquina."
+              echo "O giro-de-leitos roda em outro host? Confira PROD_SSH_HOST."
+              exit 1
+            fi
+
+            # Mostra so o suficiente para conferir identidade: log publico.
             mask() {
-              local v="${1:-}"
+              v="${1:-}"
               [ -z "$v" ] && { echo "(vazio)"; return; }
               [ "${#v}" -le 10 ] && { echo "***"; return; }
               echo "***${v: -10}"
             }
-
-            # Lê UMA chave sem dar `source` no arquivo: .deploy-env é formato
-            # docker --env-file (KEY=VALUE literal), não script shell válido.
-            get_kv() {
-              grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r' || true
+            # Le UMA chave sem dar `source`: .deploy-env e formato --env-file
+            # (KEY=VALUE literal), nao script shell valido.
+            get() {
+              grep -E "^$1=" "$F" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r' || true
             }
 
-            if [ ! -f "$ENV_FILE" ]; then
-              echo "ERRO: $ENV_FILE não existe nesta máquina."
-              echo "Confira se o giro-de-leitos roda AQUI (host correto)."
-              exit 1
-            fi
-
-            echo "=== estado atual ==="
-            for k in WHATSAPP_GROUP_TO GIRO_GROUP_JID WHATSAPP_GROUP_IDS \
-                     WHATSAPP_ALERT_ENABLED WHATSAPP_ALERT_TO_GROUP \
-                     WHATSAPP_RESTRICTION_ENABLED WHATSAPP_GW_URL; do
-              v="$(get_kv "$k")"
-              case "$k" in
-                *GROUP_TO|*GROUP_JID|*GROUP_IDS|*ALERT_TO) echo "  $k = $(mask "$v")" ;;
-                *) echo "  $k = ${v:-(vazio)}" ;;
-              esac
-            done
-
-            # --- Qual grupo? -------------------------------------------------
-            # Ordem: o que o operador passou > o que já está configurado como
-            # destino > o grupo de onde o giro é INGERIDO (é o mesmo grupo, e
-            # por isso a fonte mais confiável). Nunca adivinhar: transmitir
-            # para o grupo errado não tem desfazer.
-            JID="${GROUP_JID_IN:-}"
-            SRC="input do workflow"
-            if [ -z "$JID" ]; then JID="$(get_kv WHATSAPP_GROUP_TO)"; SRC="WHATSAPP_GROUP_TO já existente"; fi
-            if [ -z "$JID" ]; then JID="$(get_kv GIRO_GROUP_JID)";    SRC="GIRO_GROUP_JID (grupo de onde o giro chega)"; fi
-            if [ -z "$JID" ]; then
-              CANDIDATOS="$(get_kv WHATSAPP_GROUP_IDS)"
-              if [ -n "$CANDIDATOS" ] && ! echo "$CANDIDATOS" | grep -q ','; then
-                JID="$CANDIDATOS"; SRC="WHATSAPP_GROUP_IDS (valor único)"
-              fi
-            fi
-
-            if [ -z "$JID" ]; then
-              echo ""
-              echo "ERRO: não foi possível determinar o JID do grupo."
-              echo "Nenhum de WHATSAPP_GROUP_TO / GIRO_GROUP_JID / WHATSAPP_GROUP_IDS"
-              echo "traz um valor único. Grupos visíveis para o gateway:"
-              GW_URL="$(get_kv WHATSAPP_GW_URL)"; GW_URL="${GW_URL:-http://127.0.0.1:3080}"
-              GW_URL="$(echo "$GW_URL" | sed 's|host.docker.internal|127.0.0.1|')"
-              GW_AUTH="$(get_kv WHATSAPP_GW_AUTH)"
-              if [ -n "$GW_AUTH" ]; then
-                curl -s -u "$GW_AUTH" "${GW_URL%/}/user/my/groups" \
-                  | grep -oE '"JID":"[^"]+"|"Name":"[^"]+"' | sed 's/^/    /' | head -40 || true
+            # --- 1. Gateway whatsmeow (outro container, env proprio) ---------
+            GA="$(get WHATSAPP_GW_AUTH)"
+            GU="$(get WHATSAPP_GW_URL)"
+            GS=".deploy-env"
+            if [ -z "$GA" ]; then
+              C="$(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null \
+                   | grep -iE 'whatsapp-web-multidevice|whatsmeow' | awk '{print $1}')"
+              N="$(printf '%s' "$C" | grep -c . || true)"
+              if [ "$N" = "1" ]; then
+                GA="$(docker inspect "$C" \
+                      --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+                      | grep '^APP_BASIC_AUTH=' | head -1 | cut -d= -f2- || true)"
+                GS="container $C"
               else
-                echo "    (WHATSAPP_GW_AUTH ausente — não dá para listar)"
+                GS="INDETERMINADO ($N containers de gateway)"
               fi
+            fi
+            [ -z "$GU" ] && GU="http://host.docker.internal:3080"
+
+            # --- 2. Qual grupo? ----------------------------------------------
+            # Nunca adivinhar: transmitir para o grupo errado nao tem desfazer.
+            J="${JID_IN:-}"
+            JS="input do workflow"
+            if [ -z "$J" ]; then
+              J="$(get WHATSAPP_GROUP_TO)"
+              [ -n "$J" ] && JS="WHATSAPP_GROUP_TO ja existente"
+            fi
+            if [ -z "$J" ]; then
+              J="$(systemctl cat giro-wa-adapter 2>/dev/null \
+                   | grep -oE 'GIRO_GROUP_JID=[^"[:space:]]+' | head -1 | cut -d= -f2- || true)"
+              [ -n "$J" ] && JS="unit systemd do giro-wa-adapter"
+            fi
+            if [ -z "$J" ]; then
+              # Fonte mais confiavel quando o adapter esta em modo descoberta:
+              # o grupo de onde os giros REALMENTE chegaram.
+              J="$(journalctl -u giro-wa-adapter -n 500 --no-pager 2>/dev/null \
+                   | grep -oE 'chat=[0-9-]+@g\.us' | cut -d= -f2 \
+                   | sort | uniq -c | sort -rn | head -1 | awk '{print $2}' || true)"
+              [ -n "$J" ] && JS="journal do adapter (grupo de onde o giro chega)"
+            fi
+
+            echo "=== descoberta ==="
+            echo "  gateway: auth=$([ -n "$GA" ] && echo presente || echo AUSENTE)  [$GS]"
+            echo "  grupo:   $(mask "$J")  [${JS}]"
+
+            if [ -z "$J" ]; then
               echo ""
-              echo "Rode de novo passando group_jid explicitamente."
+              echo "ERRO: nao consegui determinar o JID do grupo."
+              echo "Rode de novo preenchendo o input group_jid."
+              exit 1
+            fi
+            case "$J" in
+              *@g.us) ;;
+              *) echo "ERRO: nao parece JID de grupo (esperado ...@g.us)"; exit 1 ;;
+            esac
+            if [ -z "$GA" ]; then
+              echo ""
+              echo "ERRO: sem credencial do gateway. Ligar os avisos agora criaria"
+              echo "um canal mudo — nada chegaria no grupo. Preencha"
+              echo "WHATSAPP_GW_AUTH no .deploy-env e rode de novo."
               exit 1
             fi
 
-            echo ""
-            echo "grupo escolhido: $(mask "$JID")  [fonte: $SRC]"
-            case "$JID" in
-              *@g.us) ;;
-              *) echo "ERRO: '$(mask "$JID")' não parece JID de grupo (esperado ...@g.us)"; exit 1 ;;
-            esac
+            # --- 3. O gateway responde? --------------------------------------
+            # A sessao do WhatsApp pode ter expirado e estar pedindo QR novo.
+            U="$(printf '%s' "$GU" | sed 's|host.docker.internal|127.0.0.1|')"
+            if curl -fsS -u "$GA" "${U%/}/user/my/groups" -o /dev/null 2>/dev/null; then
+              echo "  gateway responde: OK"
+            else
+              echo "  gateway responde: NAO (em $U)"
+              echo "  AVISO: a sessao do WhatsApp pode precisar de QR code novo."
+              echo "  A config sera gravada, mas os envios vao falhar ate isso ser resolvido."
+            fi
 
             if [ "$MODE" != "apply" ]; then
               echo ""
@@ -152,54 +158,48 @@ jobs:
               exit 0
             fi
 
-            # --- Gravar ------------------------------------------------------
-            BACKUP="$ENV_FILE.bak-$(date +%Y%m%d-%H%M%S)"
-            cp -p "$ENV_FILE" "$BACKUP"
-            chmod 600 "$BACKUP"
+            # --- 4. Gravar ---------------------------------------------------
+            B="$F.bak-$(date +%Y%m%d-%H%M%S)"
+            cp -p "$F" "$B"
+            chmod 600 "$B"
             echo ""
-            echo "backup: $(basename "$BACKUP")"
+            echo "backup: $(basename "$B")"
 
-            # Idempotente: remove TODAS as ocorrências da chave e reescreve uma
-            # só. Deixar duas linhas funcionaria (--env-file usa a última), mas
-            # confunde quem for ler o arquivo depois.
+            # Idempotente: remove todas as ocorrencias e reescreve uma so.
             set_kv() {
-              local key="$1" val="$2" tmp
-              tmp="$(mktemp)"
-              grep -vE "^$key=" "$ENV_FILE" > "$tmp" || true
-              printf '%s=%s\n' "$key" "$val" >> "$tmp"
-              cat "$tmp" > "$ENV_FILE"
-              rm -f "$tmp"
+              t="$(mktemp)"
+              grep -vE "^$1=" "$F" > "$t" || true
+              printf '%s=%s\n' "$1" "$2" >> "$t"
+              cat "$t" > "$F"
+              rm -f "$t"
             }
 
-            set_kv WHATSAPP_GROUP_TO "$JID"
-            set_kv WHATSAPP_RESTRICTION_ENABLED "$RESTRICTION"
-            set_kv TABELA_RESTRICTIONS_URL "https://mnrs.com.br/tabela/api/upas/restrictions"
-            set_kv WHATSAPP_RESTRICTION_DIGEST_HOURS "4"
-            set_kv WHATSAPP_RESTRICTION_POLL_MINUTES "2"
-            set_kv WHATSAPP_ALERT_TO_GROUP "$STALE_TO_GROUP"
-            # A cobrança no grupo depende do interruptor geral do canal de
-            # silêncio: com ele em false, alert_destinations() devolve vazio e
-            # nada sai, por mais que o destino do grupo esteja preenchido.
-            if [ "$STALE_TO_GROUP" = "true" ]; then
-              set_kv WHATSAPP_ALERT_ENABLED "true"
-            fi
-
-            chmod 600 "$ENV_FILE"
+            set_kv WHATSAPP_GW_AUTH "$GA"
+            set_kv WHATSAPP_GW_URL "$GU"
+            set_kv WHATSAPP_GROUP_TO "$J"
+            set_kv WHATSAPP_RESTRICTION_ENABLED true
+            set_kv TABELA_RESTRICTIONS_URL https://mnrs.com.br/tabela/api/upas/restrictions
+            set_kv WHATSAPP_RESTRICTION_DIGEST_HOURS 4
+            set_kv WHATSAPP_RESTRICTION_POLL_MINUTES 2
+            set_kv WHATSAPP_ALERT_ENABLED true
+            set_kv WHATSAPP_ALERT_TO_GROUP true
+            chmod 600 "$F"
 
             echo ""
-            echo "=== estado após gravar ==="
+            echo "=== gravado ==="
             for k in WHATSAPP_GROUP_TO WHATSAPP_RESTRICTION_ENABLED \
                      WHATSAPP_RESTRICTION_DIGEST_HOURS WHATSAPP_RESTRICTION_POLL_MINUTES \
                      WHATSAPP_ALERT_ENABLED WHATSAPP_ALERT_TO_GROUP; do
-              v="$(get_kv "$k")"
+              v="$(get "$k")"
               case "$k" in
                 *GROUP_TO) echo "  $k = $(mask "$v")" ;;
                 *) echo "  $k = ${v:-(vazio)}" ;;
               esac
             done
+            echo "  WHATSAPP_GW_AUTH = (gravado, nao exibido)"
 
             echo ""
-            echo "PRÓXIMO PASSO: rode o workflow 'Deploy' com component=api."
-            echo "O .deploy-env só é lido no docker run — o container atual"
-            echo "continua com a config antiga até ser recriado."
+            echo "PROXIMO PASSO: rode o workflow 'Deploy' com component=api."
+            echo "O .deploy-env so e lido no docker run — o container atual"
+            echo "continua com a config antiga ate ser recriado."
           REMOTE_SCRIPT
