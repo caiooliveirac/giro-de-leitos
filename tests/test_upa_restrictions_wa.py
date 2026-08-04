@@ -542,12 +542,106 @@ class StaleAlertGroupTests(unittest.TestCase):
                 mock.patch.object(whatsapp_alerts, "send_gateway_message", _falha_no_grupo):
             self.assertTrue(whatsapp_alerts.dispatch_stale_alert("🔴 cobrança"))
 
+    def test_group_gets_the_request_text_and_manager_the_report(self) -> None:
+        """Mesma lista, textos diferentes — muda quem lê, muda como se cobra."""
+        enviados: dict[str, str] = {}
+
+        def _captura(destino, texto, mentions=None):
+            enviados[destino] = texto
+
+        with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "5571999999999"), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO_GROUP", True), \
+                mock.patch.object(whatsapp_alerts, "send_gateway_message", _captura):
+            whatsapp_alerts.dispatch_stale_alert(
+                "🔴 relatório do gestor", group_message="🔄 pedido ao grupo"
+            )
+
+        self.assertEqual(enviados["5571999999999"], "🔴 relatório do gestor")
+        self.assertEqual(enviados["120363@g.us"], "🔄 pedido ao grupo")
+
+    def test_without_a_group_text_the_group_gets_the_default(self) -> None:
+        enviados: dict[str, str] = {}
+
+        def _captura(destino, texto, mentions=None):
+            enviados[destino] = texto
+
+        with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", ""), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO_GROUP", True), \
+                mock.patch.object(whatsapp_alerts, "send_gateway_message", _captura):
+            whatsapp_alerts.dispatch_stale_alert("🔴 único texto")
+
+        self.assertEqual(enviados["120363@g.us"], "🔴 único texto")
+
     def test_same_jid_twice_is_sent_once(self) -> None:
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
                 mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "120363@g.us"), \
                 mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
                 mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO_GROUP", True):
             self.assertEqual(whatsapp_alerts.alert_destinations(), ["120363@g.us"])
+
+
+class GroupStaleTextTests(unittest.TestCase):
+    """No grupo quem lê é a pessoa citada: pedido, não relatório de violação."""
+
+    def setUp(self) -> None:
+        from reports import build_group_stale_request_text
+
+        self.build = build_group_stale_request_text
+        self.offenders = [
+            {
+                "unit_key": "upa_barris",
+                "unit_code": "upa_barris",
+                "unit_name": "UPA Barris",
+                "age_hours": 8.2,
+                "shift": "diurno",
+                "limit_hours": 6.0,
+            }
+        ]
+
+    def test_asks_instead_of_accusing(self) -> None:
+        texto = self.build(self.offenders, NOW)
+        self.assertIn("por favor", texto.casefold())
+        self.assertNotIn("violação", texto.casefold())
+        self.assertNotIn("combinado):", texto.split("\n")[0])
+
+    def test_says_why_it_matters(self) -> None:
+        self.assertIn("regulação usa para encaminhar", self.build(self.offenders, NOW))
+
+    def test_keeps_the_unit_and_the_gap(self) -> None:
+        texto = self.build(self.offenders, NOW)
+        self.assertIn("BARRIS", texto.upper())
+        self.assertIn("8h12", texto)
+
+    def test_sla_line_has_no_nested_parentheses(self) -> None:
+        cabecalho = self.build(self.offenders, NOW).split("\n")[3]
+        self.assertIn("diurno até 6h", cabecalho)
+        self.assertNotIn("((", cabecalho.replace(" ", ""))
+
+    def test_no_coordinator_is_named_when_the_contact_is_unknown(self) -> None:
+        """Expor nome de coordenador em público é cobrança do jeito errado."""
+        texto = self.build(self.offenders, NOW, None, {})
+        self.assertNotIn("sem coordenador", texto)
+        self.assertNotIn("👤", texto)
+
+    def test_known_contact_is_mentioned(self) -> None:
+        contatos = {"upa_barris": [{"phone": "5571988887777", "name": "Maria"}]}
+        self.assertIn("@5571988887777", self.build(self.offenders, NOW, None, contatos))
+
+    def test_extra_units_are_announced_not_dropped(self) -> None:
+        from reports import MAX_WHATSAPP_ALERT_UNITS
+
+        muitos = [dict(self.offenders[0], unit_key=f"u{i}") for i in range(MAX_WHATSAPP_ALERT_UNITS + 2)]
+        self.assertIn("+2 unidade(s)", self.build(muitos, NOW))
+
+    def test_group_text_is_not_the_manager_text(self) -> None:
+        from reports import build_whatsapp_stale_alert_text
+
+        gestor = build_whatsapp_stale_alert_text(self.offenders, {}, NOW)
+        self.assertNotEqual(gestor, self.build(self.offenders, NOW))
 
 
 if __name__ == "__main__":

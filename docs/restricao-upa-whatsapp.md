@@ -161,10 +161,37 @@ o canal **ligado** mantém o aviso pendente para retentativa.
 por unidade). Historicamente esse aviso ia para **um destino só**, o WhatsApp do
 gestor (`WHATSAPP_ALERT_TO`) — o grupo nunca foi cobrado.
 
-`WHATSAPP_ALERT_TO_GROUP=true` passa a mandar a **mesma** cobrança também para
-`WHATSAPP_GROUP_TO`. Continua desligado por padrão: a mensagem cita nominalmente
-quem posta o giro de cada unidade e o coordenador, e levá-la do gestor para o
-grupo muda quem lê isso — decisão do dono do canal, não de um deploy.
+`WHATSAPP_ALERT_TO_GROUP=true` passa a mandar a mesma **lista** também para
+`WHATSAPP_GROUP_TO` — com outro **texto**. Continua desligado por padrão: levar
+a cobrança do gestor para o grupo muda quem lê, e isso é decisão do dono do
+canal, não de um deploy.
+
+O texto muda porque quem lê muda. No WhatsApp do gestor a mensagem é um
+relatório sobre terceiros ("🔴 UPA sem giro além do combinado", SLA no
+cabeçalho). No grupo, quem lê é a própria pessoa citada — e relatório de
+violação lido em público cobra do jeito errado: gera constrangimento, depois
+silêncio, e o canal se perde. Então o grupo recebe um **pedido**
+(`reports.build_group_stale_request_text`):
+
+```
+🔄 *Giro de leitos — atualização pendente*
+04/08 15:32
+
+Estas unidades estão sem atualizar o giro há mais tempo que o combinado
+(diurno até 6h · noturno até 12h):
+
+• UPA SAN MARTIN — 14h30
+• UPA BARRIS — 8h12 · 👤 @5571988887777
+
+Quando puderem, por favor postem o giro atualizado aqui no grupo — é ele que
+a regulação usa para encaminhar os pacientes.
+```
+
+Mesma lista, mesmo SLA, mesmas menções (a menção fantasma é o que faz o aviso
+chegar em quem pode resolver). Duas diferenças de conteúdo: não usa a palavra
+violação, e **não nomeia coordenador** quando o contato da unidade é
+desconhecido — no canal do gestor esse fallback ajuda, em público expõe alguém
+que talvez nem seja quem posta o giro.
 
 Com os dois destinos ligados, uma entrega parcial (gestor sim, grupo não) grava
 o cooldown assim mesmo: repetir a varredura para recuperar o grupo mandaria a

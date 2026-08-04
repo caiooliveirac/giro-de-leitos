@@ -318,9 +318,10 @@ Nada nesse caminho pode falhar por falta de autoria.
 | `WHATSAPP_ALERT_TO_GROUP` | `false` | `true` manda a **mesma** cobrança também para o grupo |
 
 Por padrão a cobrança tem **um destino só**, o gestor: o grupo das UPAs não é
-cobrado. `WHATSAPP_ALERT_TO_GROUP=true` acrescenta o grupo — mas a mensagem cita
-nominalmente quem posta o giro e o coordenador, então levá-la para lá muda quem
-lê isso, e por isso é opt-in.
+cobrado. `WHATSAPP_ALERT_TO_GROUP=true` acrescenta o grupo, com a mesma lista e
+**outro texto** — no grupo quem lê é a própria pessoa citada, então lá vai um
+pedido (`build_group_stale_request_text`) e não um relatório de violação. Opt-in
+porque muda quem lê a cobrança.
 
 ---
 

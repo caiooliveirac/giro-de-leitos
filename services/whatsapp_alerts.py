@@ -270,7 +270,12 @@ def send_gateway_message(
         response.read()
 
 
-def dispatch_stale_alert(message: str, mentions: Iterable[str] | None = None) -> bool:
+def dispatch_stale_alert(
+    message: str,
+    mentions: Iterable[str] | None = None,
+    *,
+    group_message: str | None = None,
+) -> bool:
     """Entrega o aviso. Devolve True quando ao menos um destino aceitou.
 
     Nunca levanta: desligado, destino vazio ou gateway fora do ar são todos
@@ -281,6 +286,10 @@ def dispatch_stale_alert(message: str, mentions: Iterable[str] | None = None) ->
     não) grava o cooldown assim mesmo: repetir a varredura para recuperar o
     grupo mandaria a mesma cobrança duas vezes para o gestor, e duplicar aviso
     é pior do que perder um.
+
+    `group_message` é o mesmo aviso reescrito para o grupo (pedido, não
+    relatório de violação — ver reports.build_group_stale_request_text). Sem
+    ele, o grupo recebe o texto do gestor.
     """
     if not message.strip():
         return False
@@ -302,8 +311,9 @@ def dispatch_stale_alert(message: str, mentions: Iterable[str] | None = None) ->
 
     entregues = 0
     for destino in destinos:
+        texto = group_message if (destino == WHATSAPP_GROUP_TO and group_message) else message
         try:
-            send_gateway_message(destino, message, mentions=mention_list)
+            send_gateway_message(destino, texto, mentions=mention_list)
         except Exception as exc:  # noqa: BLE001 - o watcher não pode cair por isto
             logger.warning("Falha ao enviar alerta WhatsApp para %s: %s", destino, exc)
             continue
@@ -311,7 +321,7 @@ def dispatch_stale_alert(message: str, mentions: Iterable[str] | None = None) ->
         logger.info(
             "Alerta WhatsApp enviado para %s (%d caracteres, %d menção(ões))",
             destino,
-            len(message),
+            len(texto),
             len(mention_list),
         )
 

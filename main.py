@@ -51,6 +51,7 @@ from auth.deps import get_current_admin
 from parser_service import parse_whatsapp_message
 from reports import (
     build_compliance_messages,
+    build_group_stale_request_text,
     build_over_capacity_report_text,
     build_reports_help_lines,
     build_unparsed_report_text,
@@ -452,8 +453,13 @@ def _notify_stale_whatsapp(status_rows: list[dict[str, Any]], now: datetime) -> 
         message = build_whatsapp_stale_alert_text(
             offenders, responsibles, now, WHATSAPP_ALERT_HOURS_OVERRIDE, contacts
         )
+        # O grupo recebe a MESMA lista com outro texto: pedido, não relatório
+        # de violação. Lá quem lê é a própria pessoa citada.
+        group_message = build_group_stale_request_text(
+            offenders, now, WHATSAPP_ALERT_HOURS_OVERRIDE, contacts
+        )
         mentions = collect_alert_mentions(offenders, contacts)
-        if dispatch_stale_alert(message, mentions) and is_database_configured():
+        if dispatch_stale_alert(message, mentions, group_message=group_message) and is_database_configured():
             record_whatsapp_alert_sent([item["unit_key"] for item in offenders], now)
     except Exception as exc:
         import logging
