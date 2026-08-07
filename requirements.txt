@@ -1,8 +1,8 @@
-fastapi==0.115.12
-psycopg[binary]==3.2.6
-uvicorn[standard]==0.34.0
+fastapi==0.141.1
+psycopg[binary]==3.3.4
+uvicorn[standard]==0.52.1
 bcrypt==4.2.1
 cryptography==44.0.0
-python-jose[cryptography]==3.3.0
-pydantic[email]==2.10.4
-python-multipart==0.0.20
+python-jose[cryptography]==3.5.0
+pydantic[email]==2.13.4
+python-multipart==0.0.32
