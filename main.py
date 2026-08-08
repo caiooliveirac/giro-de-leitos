@@ -1698,15 +1698,45 @@ async def telegram_webhook(
 
 
 @app.get("/api/stale-units", summary="UPAs com mais de N horas sem atualização")
-async def get_stale_units(hours: float = 6.0) -> dict[str, Any]:
+async def get_stale_units(hours: float = 6.0, sla: str | None = None) -> dict[str, Any]:
     """Retorna unidades que não enviaram giro nas últimas `hours` horas.
     Usa updated_at (quando a mensagem foi recebida pelo sistema) e não received_at
-    (horário extraído do texto da mensagem) para evitar falsos positivos."""
+    (horário extraído do texto da mensagem) para evitar falsos positivos.
+
+    Com `?sla=turno` o limiar deixa de ser fixo e passa a ser o SLA do turno
+    (diurno 6h, noturno 12h) — a MESMA regra do /cobranca e do alerta de
+    silêncio, via ``select_stale_offenders``. Existe porque quem consome de
+    fora (o secretário `tom`) não pode reimplementar o SLA: duas implementações
+    discordam no primeiro caso de fronteira, e aí o gestor recebe uma cobrança
+    que a tela não confirma.
+
+    Sem cooldown aqui — cooldown é regra de quem avisa SOZINHO; quem perguntou
+    quer a lista de agora, mesmo que já tenha sido avisado há uma hora.
+    """
     if not is_database_configured():
         return {"status": "disabled", "stale_units": []}
 
     units = await run_in_threadpool(get_latest_status_by_unit)
     now = datetime.now(timezone.utc)
+
+    if (sla or "").strip().casefold() == "turno":
+        offenders = select_stale_offenders(units, now, cooldown_hours=0)
+        return {
+            "status": "ok",
+            "criterio": "sla_por_turno",
+            "count": len(offenders),
+            "stale_units": [
+                {
+                    "unit_code": item["unit_code"],
+                    "displayed_name": item["unit_name"],
+                    "hours_ago": round(item["age_hours"], 1),
+                    "turno": item["shift"],
+                    "limite_horas": item["limit_hours"],
+                }
+                for item in offenders
+            ],
+        }
+
     threshold = now - __import__("datetime").timedelta(hours=hours)
 
     stale: list[dict[str, Any]] = []
