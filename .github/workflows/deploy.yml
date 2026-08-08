@@ -199,6 +199,15 @@ jobs:
               -p 127.0.0.1:8000:8000 \
               "$IMG_NEW"
 
+            # wa-net: rede compartilhada com o gateway do WhatsApp (whatsmeow-gw),
+            # que publica so em 127.0.0.1 do host e por isso NAO e alcancavel por
+            # host.docker.internal. Sem esta rede o alerta de UPA sem giro falha
+            # em silencio: o watcher loga timeout e a varredura seguinte tenta de
+            # novo, para sempre, sem ninguem ser avisado. Idempotente de proposito.
+            docker network create wa-net 2>/dev/null || true
+            docker network connect wa-net giro-de-leitos-api 2>/dev/null || true
+            docker network connect wa-net whatsmeow-gw 2>/dev/null || true
+
             echo "=== [api] aguardando 8000 voltar ==="
             ok=0
             for i in $(seq 1 30); do
