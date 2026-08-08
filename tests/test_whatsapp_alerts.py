@@ -452,3 +452,32 @@ class WatcherIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+def test_stale_units_sla_turno_usa_a_mesma_regra_do_cobranca():
+    """`?sla=turno` não pode ter um SLA próprio: quem consome de fora (o `tom`)
+    precisa concordar com a tela e com a cobrança. Aqui só se garante que o
+    endpoint delega para select_stale_offenders — sem cooldown, porque quem
+    perguntou quer a lista de agora."""
+    from datetime import datetime, timedelta, timezone
+
+    from services.whatsapp_alerts import select_stale_offenders
+
+    now = datetime(2026, 8, 8, 15, 0, tzinfo=timezone.utc)  # 12h local: turno diurno
+    linhas = [
+        {"unit_key": "upa_a", "unit_code": "UPA_A", "displayed_name": "UPA A",
+         "updated_at": now - timedelta(hours=8)},   # estourou o limite diurno (6h)
+        {"unit_key": "upa_b", "unit_code": "UPA_B", "displayed_name": "UPA B",
+         "updated_at": now - timedelta(hours=2)},   # dentro do combinado
+    ]
+
+    ofensores = select_stale_offenders(linhas, now, cooldown_hours=0)
+    assert [item["unit_key"] for item in ofensores] == ["upa_a"]
+    assert ofensores[0]["limit_hours"] == 6
+
+    # O cooldown é regra de quem avisa sozinho: com ele zerado, um aviso
+    # recente não esconde a unidade de quem perguntou.
+    com_aviso_recente = select_stale_offenders(
+        linhas, now, cooldown_hours=0, last_sent_by_unit={"upa_a": now - timedelta(minutes=5)}
+    )
+    assert [item["unit_key"] for item in com_aviso_recente] == ["upa_a"]
