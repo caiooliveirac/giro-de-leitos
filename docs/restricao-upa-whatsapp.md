@@ -158,20 +158,18 @@ o canal **ligado** mantém o aviso pendente para retentativa.
 
 `services/whatsapp_alerts.py` cobra quem está tempo demais sem postar o giro
 (SLA do `/cobranca`: diurno acima de 6h, noturno acima de 12h, cooldown de 6h
-por unidade). Historicamente esse aviso ia para **um destino só**, o WhatsApp do
-gestor (`WHATSAPP_ALERT_TO`) — o grupo nunca foi cobrado.
+por unidade). O destino é **um só: o grupo** (`WHATSAPP_GROUP_TO`).
 
-`WHATSAPP_ALERT_TO_GROUP=true` passa a mandar a mesma **lista** também para
-`WHATSAPP_GROUP_TO` — com outro **texto**. Continua desligado por padrão: levar
-a cobrança do gestor para o grupo muda quem lê, e isso é decisão do dono do
-canal, não de um deploy.
+Já foi para o privado do gestor, e foi erro: silêncio de unidade é rotina da
+operação, e rotina no privado vira paisagem — o canal é silenciado, que é a
+única falha irreversível deste código. O privado ficou reservado para anomalia
+(ver o catálogo de avisos do `tom`). Sem grupo configurado, nada sai: não há
+queda para o privado.
 
-O texto muda porque quem lê muda. No WhatsApp do gestor a mensagem é um
-relatório sobre terceiros ("🔴 UPA sem giro além do combinado", SLA no
-cabeçalho). No grupo, quem lê é a própria pessoa citada — e relatório de
-violação lido em público cobra do jeito errado: gera constrangimento, depois
-silêncio, e o canal se perde. Então o grupo recebe um **pedido**
-(`reports.build_group_stale_request_text`):
+O texto é o de quem lê. No grupo quem lê é a própria pessoa citada — e um
+relatório de violação lido em público cobra do jeito errado: gera
+constrangimento, depois silêncio, e o canal se perde. Então o grupo recebe um
+**pedido** (`reports.build_group_stale_request_text`):
 
 ```
 🔄 *Giro de leitos — atualização pendente*
