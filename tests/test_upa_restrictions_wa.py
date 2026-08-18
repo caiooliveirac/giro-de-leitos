@@ -501,87 +501,48 @@ class DispatchTests(unittest.TestCase):
 
 
 class StaleAlertGroupTests(unittest.TestCase):
-    """A cobrança de giro parado só chega ao grupo quando o dono liga."""
+    """A cobrança de giro parado vai ao grupo — e a lugar nenhum além dele."""
 
-    def test_group_is_not_a_destination_by_default(self) -> None:
+    def test_the_group_is_the_only_destination(self) -> None:
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "5571999999999"), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO_GROUP", False):
-            self.assertEqual(whatsapp_alerts.alert_destinations(), ["5571999999999"])
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"):
+            self.assertEqual(whatsapp_alerts.alert_destinations(), ["120363@g.us"])
 
-    def test_opt_in_adds_the_group(self) -> None:
+    def test_no_group_means_no_alert(self) -> None:
+        """Sem grupo o aviso morre: não existe queda para o privado."""
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "5571999999999"), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO_GROUP", True), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", ""), \
                 mock.patch.object(whatsapp_alerts, "send_gateway_message") as send:
-            enviado = whatsapp_alerts.dispatch_stale_alert("🔴 cobrança")
+            self.assertEqual(whatsapp_alerts.alert_destinations(), [])
+            self.assertFalse(whatsapp_alerts.dispatch_stale_alert("🔄 pedido"))
+        send.assert_not_called()
 
-        self.assertTrue(enviado)
-        self.assertEqual(
-            [call.args[0] for call in send.call_args_list], ["5571999999999", "120363@g.us"]
-        )
+    def test_disabled_channel_sends_nothing(self) -> None:
+        with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", False), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"):
+            self.assertEqual(whatsapp_alerts.alert_destinations(), [])
 
-    def test_group_only_when_the_manager_number_is_absent(self) -> None:
-        with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", ""), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO_GROUP", True):
-            self.assertEqual(whatsapp_alerts.alert_destinations(), ["120363@g.us"])
-
-    def test_failure_on_one_destination_does_not_lose_the_other(self) -> None:
-        def _falha_no_grupo(destino, _message, mentions=None):
-            if destino.endswith("@g.us"):
-                raise OSError("recusado")
-
-        with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "5571999999999"), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO_GROUP", True), \
-                mock.patch.object(whatsapp_alerts, "send_gateway_message", _falha_no_grupo):
-            self.assertTrue(whatsapp_alerts.dispatch_stale_alert("🔴 cobrança"))
-
-    def test_group_gets_the_request_text_and_manager_the_report(self) -> None:
-        """Mesma lista, textos diferentes — muda quem lê, muda como se cobra."""
+    def test_the_group_gets_the_text_it_was_given(self) -> None:
         enviados: dict[str, str] = {}
 
         def _captura(destino, texto, mentions=None):
             enviados[destino] = texto
 
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "5571999999999"), \
                 mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO_GROUP", True), \
                 mock.patch.object(whatsapp_alerts, "send_gateway_message", _captura):
-            whatsapp_alerts.dispatch_stale_alert(
-                "🔴 relatório do gestor", group_message="🔄 pedido ao grupo"
-            )
+            self.assertTrue(whatsapp_alerts.dispatch_stale_alert("🔄 pedido ao grupo"))
 
-        self.assertEqual(enviados["5571999999999"], "🔴 relatório do gestor")
-        self.assertEqual(enviados["120363@g.us"], "🔄 pedido ao grupo")
+        self.assertEqual(enviados, {"120363@g.us": "🔄 pedido ao grupo"})
 
-    def test_without_a_group_text_the_group_gets_the_default(self) -> None:
-        enviados: dict[str, str] = {}
-
-        def _captura(destino, texto, mentions=None):
-            enviados[destino] = texto
+    def test_gateway_failure_is_not_a_delivery(self) -> None:
+        def _falha(destino, _message, mentions=None):
+            raise OSError("recusado")
 
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", ""), \
                 mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO_GROUP", True), \
-                mock.patch.object(whatsapp_alerts, "send_gateway_message", _captura):
-            whatsapp_alerts.dispatch_stale_alert("🔴 único texto")
-
-        self.assertEqual(enviados["120363@g.us"], "🔴 único texto")
-
-    def test_same_jid_twice_is_sent_once(self) -> None:
-        with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "120363@g.us"), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO_GROUP", True):
-            self.assertEqual(whatsapp_alerts.alert_destinations(), ["120363@g.us"])
+                mock.patch.object(whatsapp_alerts, "send_gateway_message", _falha):
+            self.assertFalse(whatsapp_alerts.dispatch_stale_alert("🔄 pedido"))
 
 
 class GroupStaleTextTests(unittest.TestCase):
@@ -636,13 +597,6 @@ class GroupStaleTextTests(unittest.TestCase):
 
         muitos = [dict(self.offenders[0], unit_key=f"u{i}") for i in range(MAX_WHATSAPP_ALERT_UNITS + 2)]
         self.assertIn("+2 unidade(s)", self.build(muitos, NOW))
-
-    def test_group_text_is_not_the_manager_text(self) -> None:
-        from reports import build_whatsapp_stale_alert_text
-
-        gestor = build_whatsapp_stale_alert_text(self.offenders, {}, NOW)
-        self.assertNotEqual(gestor, self.build(self.offenders, NOW))
-
 
 if __name__ == "__main__":
     unittest.main()

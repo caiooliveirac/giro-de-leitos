@@ -1,10 +1,10 @@
-"""Alerta curto de UPA sem giro, entregue no WhatsApp do gestor.
+"""Cobrança curta de UPA sem giro, entregue no GRUPO das UPAs no WhatsApp.
 
-Canal ADICIONAL ao watcher de Telegram do admin (``STALE_ALERT_HOURS``, 10h
-por padrão). O Telegram é onde o admin acompanha o dia a dia; o WhatsApp do
-gestor é onde só entra o que já passou do ponto de virar cobrança. Misturar os
-dois transformaria o canal em spam e ele seria silenciado — que é a única
-falha irreversível deste código.
+Já foi para o privado do gestor, e foi erro: silêncio de unidade é o dia normal
+da operação, e rotina no privado vira paisagem — o canal é silenciado, que é a
+única falha irreversível deste código. Quem tem que postar o giro está no
+grupo, e é lá que a cobrança faz alguém se mexer. O privado do gestor ficou
+reservado para anomalia.
 
 Três travas, nesta ordem:
 1. limiar POR TURNO, o mesmo SLA do /cobranca (``reports.GIRO_SLA``): diurno
@@ -15,7 +15,7 @@ Três travas, nesta ordem:
 2. cooldown por unidade (``WHATSAPP_ALERT_COOLDOWN_HOURS``, default 6h),
    com estado persistido em ``whatsapp_alert_state``;
 3. nasce DESLIGADO — sem ``WHATSAPP_ALERT_ENABLED=true`` e sem
-   ``WHATSAPP_ALERT_TO`` nada sai: o módulo apenas loga o que enviaria.
+   ``WHATSAPP_GROUP_TO`` nada sai: o módulo apenas loga o que enviaria.
 
 O envio usa o gateway whatsmeow já em produção
 (``aldinokemal2104/go-whatsapp-web-multidevice``): ``POST /send/message`` com
@@ -72,18 +72,11 @@ def _env_float_optional(name: str) -> float | None:
 # Interruptor geral. Default false de propósito: o canal só liga quando o dono
 # decidir, nunca por um deploy.
 WHATSAPP_ALERT_ENABLED = _env_bool("WHATSAPP_ALERT_ENABLED", False)
-# Destino do gestor (número com DDI, ex.: 5571999999999, ou JID completo).
-WHATSAPP_ALERT_TO = os.getenv("WHATSAPP_ALERT_TO", "").strip()
 # JID do grupo das UPAs (120363XXXXXXXXX@g.us) — o mesmo grupo de onde o giro
 # é ingerido. Mora aqui, e não no módulo de restrição, porque é o destino
 # compartilhado de tudo que é endereçado às unidades e este é o módulo de
 # baixo (importar na outra direção fecharia um ciclo).
 WHATSAPP_GROUP_TO = os.getenv("WHATSAPP_GROUP_TO", "").strip()
-# Manda a MESMA cobrança de silêncio também para o grupo. Default false: passar
-# de "o gestor foi avisado" para "as unidades foram cobradas na frente umas das
-# outras" muda o alcance da mensagem, e essa é uma decisão do dono do canal,
-# não de um deploy.
-WHATSAPP_ALERT_TO_GROUP = _env_bool("WHATSAPP_ALERT_TO_GROUP", False)
 # URL do gateway. O default é o endereço visto DO HOST; a API roda em
 # container na rede giro-de-leitos_default e o whatsmeow-gw publica só em
 # 127.0.0.1:3080 do host — em produção configure
@@ -114,18 +107,15 @@ if WHATSAPP_ALERT_HOURS_OVERRIDE is not None:
 
 
 def alert_destinations() -> list[str]:
-    """Para onde a cobrança de silêncio vai nesta configuração.
+    """Para onde a cobrança de silêncio vai: o grupo das UPAs, e só ele.
 
-    Um destino no padrão (o gestor). Com ``WHATSAPP_ALERT_TO_GROUP=true`` entra
-    também o grupo das UPAs — a mesma mensagem, agora lida por quem deveria ter
-    postado o giro. Lista vazia = dry-run.
+    Lista vazia = dry-run (canal desligado ou grupo não configurado). Não há
+    caminho para o privado aqui — se um dia voltar, volta como decisão escrita,
+    não como efeito colateral de configuração.
     """
-    if not WHATSAPP_ALERT_ENABLED:
+    if not WHATSAPP_ALERT_ENABLED or not WHATSAPP_GROUP_TO:
         return []
-    candidatos = [WHATSAPP_ALERT_TO]
-    if WHATSAPP_ALERT_TO_GROUP:
-        candidatos.append(WHATSAPP_GROUP_TO)
-    return [destino for destino in dict.fromkeys(candidatos) if destino]
+    return [WHATSAPP_GROUP_TO]
 
 
 def is_enabled() -> bool:
@@ -270,26 +260,15 @@ def send_gateway_message(
         response.read()
 
 
-def dispatch_stale_alert(
-    message: str,
-    mentions: Iterable[str] | None = None,
-    *,
-    group_message: str | None = None,
-) -> bool:
-    """Entrega o aviso. Devolve True quando ao menos um destino aceitou.
+def dispatch_stale_alert(message: str, mentions: Iterable[str] | None = None) -> bool:
+    """Entrega o aviso no grupo. True quando o gateway aceitou.
 
     Nunca levanta: desligado, destino vazio ou gateway fora do ar são todos
     "não enviou" — e quem chama trata os três do mesmo jeito (não grava
     cooldown, tenta de novo na próxima varredura).
 
-    Com os dois destinos ligados, um "True" parcial (gestor entregue, grupo
-    não) grava o cooldown assim mesmo: repetir a varredura para recuperar o
-    grupo mandaria a mesma cobrança duas vezes para o gestor, e duplicar aviso
-    é pior do que perder um.
-
-    `group_message` é o mesmo aviso reescrito para o grupo (pedido, não
-    relatório de violação — ver reports.build_group_stale_request_text). Sem
-    ele, o grupo recebe o texto do gestor.
+    O texto é o do grupo (pedido, não relatório de violação — ver
+    reports.build_group_stale_request_text).
     """
     if not message.strip():
         return False
@@ -303,7 +282,7 @@ def dispatch_stale_alert(
         logger.info(
             "[dry-run] alerta WhatsApp NÃO enviado (%s). Enviaria para %r mencionando %s:\n%s",
             motivo,
-            WHATSAPP_ALERT_TO or "(vazio)",
+            WHATSAPP_GROUP_TO or "(vazio)",
             mention_list or "(ninguém)",
             message,
         )
@@ -311,7 +290,7 @@ def dispatch_stale_alert(
 
     entregues = 0
     for destino in destinos:
-        texto = group_message if (destino == WHATSAPP_GROUP_TO and group_message) else message
+        texto = message
         try:
             send_gateway_message(destino, texto, mentions=mention_list)
         except Exception as exc:  # noqa: BLE001 - o watcher não pode cair por isto

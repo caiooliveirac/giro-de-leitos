@@ -56,7 +56,6 @@ from reports import (
     build_reports_help_lines,
     build_unparsed_report_text,
     build_vacancy_report_text,
-    build_whatsapp_stale_alert_text,
     collect_alert_mentions,
     compute_gap_ranking,
     compute_over_capacity_ranking,
@@ -363,11 +362,13 @@ def _notify_unparsed_giro(text: str, issues: list[dict[str, str]], source: str =
             import logging
             logging.getLogger(__name__).warning("Falha ao registrar mensagem não parseada: %s", exc)
 
-    _notify_admin_telegram(
+    # Só o GRUPO, e sem repetir o giro de volta: quem tem que completar o dado
+    # está lá, e o texto original está três mensagens acima. Despejar o giro no
+    # privado de dois admins não fazia ninguém agir — só enchia o celular.
+    _notify_group_telegram(
         "🚫 <b>Giro não reconhecido — não publicado</b>\n"
         f"📄 {html_escape(first_line)}\n"
-        f"{html_escape(reasons)}\n\n"
-        f"<pre>{html_escape(text[:500])}</pre>"
+        f"{html_escape(reasons)}"
     )
 
 
@@ -416,8 +417,10 @@ async def _stale_units_watcher() -> None:
                 lines = "\n".join(
                     f"• {html_escape(name)} — há {age:.0f}h sem giro" for name, age in newly_stale
                 )
+                # Grupo, não privado: quem posta o giro está lá. O privado do
+                # coordenador é para anomalia, não para rotina de unidade.
                 await run_in_threadpool(
-                    _notify_admin_telegram,
+                    _notify_group_telegram,
                     f"⏰ <b>UPA há mais de {STALE_ALERT_HOURS:.0f}h sem giro</b>\n{lines}",
                 )
             # Canal separado, limiar mais alto: o gestor só é incomodado no
@@ -431,16 +434,16 @@ async def _stale_units_watcher() -> None:
 
 
 def _notify_stale_whatsapp(status_rows: list[dict[str, Any]], now: datetime) -> None:
-    """Aviso curto de silêncio para o WhatsApp do gestor. Nunca levanta.
+    """Cobrança curta de silêncio no GRUPO das UPAs. Nunca levanta.
 
-    Uma mensagem só, com as unidades que estouraram o SLA do turno (diurno 6h,
-    noturno 12h — o mesmo do /cobranca) e estão fora do cooldown. Sem violação,
+    Uma mensagem só, no grupo, com as unidades que estouraram o SLA do turno
+    (diurno 6h, noturno 12h — o mesmo do /cobranca) e estão fora do cooldown. Sem violação,
     nada é enviado. O cooldown só é gravado quando o gateway aceita — dry-run e
     falha de rede não consomem a janela.
 
     A mensagem menciona quem POSTA o giro de cada unidade (`unit_contacts`).
-    Sem contato aprendido — e a tabela nasce vazia — o texto cai no coordenador
-    cadastrado e a lista de menções sai vazia, exatamente como antes.
+    Sem contato aprendido — e a tabela nasce vazia — a lista de menções sai
+    vazia e o pedido vale para a unidade inteira.
     """
     try:
         last_sent = get_whatsapp_alert_state() if is_database_configured() else {}
@@ -448,18 +451,14 @@ def _notify_stale_whatsapp(status_rows: list[dict[str, Any]], now: datetime) -> 
         if not offenders:
             return
 
-        responsibles = get_unit_responsibles() if is_database_configured() else {}
         contacts = get_unit_contacts() if is_database_configured() else {}
-        message = build_whatsapp_stale_alert_text(
-            offenders, responsibles, now, WHATSAPP_ALERT_HOURS_OVERRIDE, contacts
-        )
-        # O grupo recebe a MESMA lista com outro texto: pedido, não relatório
-        # de violação. Lá quem lê é a própria pessoa citada.
-        group_message = build_group_stale_request_text(
+        # Um texto só, e é o do grupo: pedido, não relatório de violação. Lá
+        # quem lê é a própria pessoa citada, e é ela que resolve.
+        message = build_group_stale_request_text(
             offenders, now, WHATSAPP_ALERT_HOURS_OVERRIDE, contacts
         )
         mentions = collect_alert_mentions(offenders, contacts)
-        if dispatch_stale_alert(message, mentions, group_message=group_message) and is_database_configured():
+        if dispatch_stale_alert(message, mentions) and is_database_configured():
             record_whatsapp_alert_sent([item["unit_key"] for item in offenders], now)
     except Exception as exc:
         import logging
@@ -505,16 +504,6 @@ def _run_upa_restrictions_cycle() -> None:
     )
 
 
-def _configured_admin_chat_ids() -> list[str]:
-    raw_values = [TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_ADMIN_CHAT_IDS]
-    return list(dict.fromkeys(
-        chat_id.strip()
-        for raw in raw_values
-        for chat_id in raw.split(",")
-        if chat_id.strip()
-    ))
-
-
 def _configured_group_chat_ids() -> list[str]:
     return list(dict.fromkeys(
         chat_id.strip()
@@ -540,27 +529,30 @@ def _send_telegram_with_token(token: str, chat_id: int | str, message: str, *, h
         response.read()
 
 
-def _notify_admin_telegram(message: str) -> None:
-    """Envia alerta para todos os chats privados de admin configurados."""
+def _notify_group_telegram(message: str) -> None:
+    """Alerta que é assunto do grupo. Sem grupo configurado, não sai — cair no
+    privado do admin é justamente o que se quis parar de fazer."""
     if not TELEGRAM_ALERT_BOT_TOKEN:
         return
-    for chat_id in _configured_admin_chat_ids():
+    for chat_id in _configured_group_chat_ids():
         try:
             _send_telegram_with_token(TELEGRAM_ALERT_BOT_TOKEN, chat_id, message, html=True)
         except Exception as exc:
             import logging
-            logging.getLogger(__name__).warning("Falha ao notificar admin Telegram %s: %s", chat_id, exc)
+            logging.getLogger(__name__).warning("Falha ao notificar grupo Telegram %s: %s", chat_id, exc)
 
 
 def _notify_transition_alerts(alerts: list[dict[str, Any]]) -> None:
-    """Dispara transições para admins e grupos que já interagiram com o bot."""
+    """Dispara transições para os grupos que já interagiram com o bot.
+
+    Privado do coordenador NÃO entra: transição de leito é o dia normal da
+    unidade, e o privado é reservado para anomalia."""
     if not alerts:
         return
     message = build_alerts_text(alerts)
     destinations: list[tuple[str, int | str]] = [
-        (TELEGRAM_ALERT_BOT_TOKEN, chat_id) for chat_id in _configured_admin_chat_ids()
+        (TELEGRAM_BOT_TOKEN, chat_id) for chat_id in _configured_group_chat_ids()
     ]
-    destinations.extend((TELEGRAM_BOT_TOKEN, chat_id) for chat_id in _configured_group_chat_ids())
     if TELEGRAM_BOT_TOKEN and is_database_configured():
         destinations.extend(
             (TELEGRAM_BOT_TOKEN, row["chat_id"])

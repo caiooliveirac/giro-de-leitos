@@ -1212,55 +1212,6 @@ def _coordinator_summary(unit_code: str | None, responsibles: dict[str, list[str
     return f"{shown} +{len(names) - 2}" if len(names) > 2 else shown
 
 
-def build_whatsapp_stale_alert_text(
-    offenders: list[dict[str, Any]],
-    responsibles: dict[str, list[str]],
-    now: datetime,
-    threshold_hours: float | None = None,
-    contacts: dict[str, list[dict[str, Any]]] | None = None,
-) -> str:
-    """Aviso curto de UPA sem giro, em texto puro para o WhatsApp do gestor.
-
-    Não é relatório: uma linha por unidade com horas e quem posta, e nada
-    mais. Sem HTML (o WhatsApp não entende) — negrito é *asterisco*.
-
-    `threshold_hours=None` (o padrão) significa SLA por turno: o cabeçalho
-    mostra a regra e cada linha traz o limite que AQUELA unidade estourou —
-    "16h no noturno" e "7h no diurno" são as duas violações, e o gestor precisa
-    ver por quê. Um número fixo só aparece quando o operador forçou
-    ``WHATSAPP_ALERT_HOURS``.
-
-    `offenders` já vem filtrado por limiar e cooldown
-    (services.whatsapp_alerts.select_stale_offenders); aqui só se formata.
-    """
-    ordered = sorted(offenders, key=lambda item: item.get("age_hours") or 0.0, reverse=True)
-    shown = ordered[:MAX_WHATSAPP_ALERT_UNITS]
-    by_shift = threshold_hours is None
-    lines = [
-        "🔴 *UPA sem giro além do combinado*"
-        if by_shift
-        else f"🔴 *UPA sem giro há mais de {threshold_label(threshold_hours)}*",
-        f"{fmt_local(now)} · SLA {_sla_short()}" if by_shift else fmt_local(now),
-        "",
-    ]
-    for item in shown:
-        name = short_unit_name(item.get("unit_code"), item.get("unit_name"))
-        who = _mention_summary(item.get("unit_code"), contacts) or _coordinator_summary(
-            item.get("unit_code"), responsibles
-        )
-        limit = ""
-        if by_shift and item.get("limit_hours") is not None:
-            limit = f" (limite {item.get('shift', 'do turno')} {threshold_label(item['limit_hours'])})"
-        lines.append(f"• {name} — {fmt_duration(item.get('age_hours'))}{limit} · 👤 {who}")
-
-    remaining = len(ordered) - len(shown)
-    if remaining > 0:
-        lines.append(f"• +{remaining} unidade(s) também sem giro")
-
-    lines.extend(["", "Giro de Leitos · aviso automático"])
-    return "\n".join(lines).strip()
-
-
 def build_group_stale_request_text(
     offenders: list[dict[str, Any]],
     now: datetime,

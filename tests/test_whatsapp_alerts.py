@@ -18,7 +18,7 @@ os.environ.setdefault("JWT_SECRET", "test-secret-whatsapp")
 os.environ.setdefault("CPF_ENCRYPTION_KEY", "OmaP3i0nC2P9MwJv5wDhlb0aBpfNn5Y73I9c8wL2cIc=")
 os.environ.setdefault("CPF_HASH_PEPPER", "test-pepper")
 
-from reports import GIRO_SLA, MAX_WHATSAPP_ALERT_UNITS, build_whatsapp_stale_alert_text  # noqa: E402
+from reports import GIRO_SLA, MAX_WHATSAPP_ALERT_UNITS, build_group_stale_request_text  # noqa: E402
 from services import whatsapp_alerts  # noqa: E402
 
 
@@ -127,21 +127,20 @@ class ShiftSlaTests(unittest.TestCase):
         ]
 
         offenders = whatsapp_alerts.select_stale_offenders(rows, NOW)
-        text = build_whatsapp_stale_alert_text(offenders, {}, NOW)
+        text = build_group_stale_request_text(offenders, NOW)
 
-        self.assertIn("🔴 *UPA sem giro além do combinado*", text)
-        self.assertIn("SLA diurno (07h–19h) até 6h · noturno (19h–07h) até 12h", text)
-        self.assertIn("• UPA BARRIS — 7h00 (limite diurno 6h)", text)
-        self.assertIn("(limite noturno 12h)", text)
+        self.assertIn("🔄 *Giro de leitos — atualização pendente*", text)
+        self.assertIn("UPA BARRIS", text.upper())
+        self.assertIn("7h00", text)
 
     def test_alert_text_stays_short_under_the_shift_rule(self) -> None:
         offenders = whatsapp_alerts.select_stale_offenders(
             [_status_row(f"u{i}", f"code{i}", f"UPA {i}", 13.0 + i) for i in range(3)], NOW
         )
 
-        text = build_whatsapp_stale_alert_text(offenders, {}, NOW)
+        text = build_group_stale_request_text(offenders, NOW)
 
-        self.assertLessEqual(len(text.splitlines()), 8)
+        self.assertLessEqual(len(text.splitlines()), 12)
 
 
 class ThresholdTests(unittest.TestCase):
@@ -243,7 +242,7 @@ class DispatchTests(unittest.TestCase):
 
     def test_dry_run_does_not_call_the_gateway(self) -> None:
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", False), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "5571999999999"), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
                 mock.patch.object(whatsapp_alerts, "send_gateway_message") as send:
             sent = whatsapp_alerts.dispatch_stale_alert("🔴 alerta de teste")
 
@@ -252,7 +251,7 @@ class DispatchTests(unittest.TestCase):
 
     def test_empty_destination_is_dry_run_even_when_enabled(self) -> None:
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", ""), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", ""), \
                 mock.patch.object(whatsapp_alerts, "send_gateway_message") as send:
             sent = whatsapp_alerts.dispatch_stale_alert("🔴 alerta de teste")
 
@@ -261,25 +260,25 @@ class DispatchTests(unittest.TestCase):
 
     def test_empty_message_is_never_sent(self) -> None:
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "5571999999999"), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
                 mock.patch.object(whatsapp_alerts, "send_gateway_message") as send:
             sent = whatsapp_alerts.dispatch_stale_alert("   ")
 
         self.assertFalse(sent)
         send.assert_not_called()
 
-    def test_enabled_sends_once_to_the_configured_number(self) -> None:
+    def test_enabled_sends_once_to_the_group(self) -> None:
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "5571999999999"), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
                 mock.patch.object(whatsapp_alerts, "send_gateway_message") as send:
             sent = whatsapp_alerts.dispatch_stale_alert("🔴 alerta de teste")
 
         self.assertTrue(sent)
-        send.assert_called_once_with("5571999999999", "🔴 alerta de teste", mentions=[])
+        send.assert_called_once_with("120363@g.us", "🔴 alerta de teste", mentions=[])
 
     def test_gateway_failure_never_raises_and_reports_not_sent(self) -> None:
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "5571999999999"), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
                 mock.patch.object(
                     whatsapp_alerts, "send_gateway_message", side_effect=OSError("connection refused")
                 ):
@@ -329,7 +328,7 @@ class DispatchTests(unittest.TestCase):
 
 
 class MessageFormattingTests(unittest.TestCase):
-    def test_line_per_unit_with_hours_and_coordinator(self) -> None:
+    def test_line_per_unit_with_the_gap(self) -> None:
         offenders = whatsapp_alerts.select_stale_offenders(
             [
                 _status_row("a", "upa_barris", "UPA BARRIS", 14.5),
@@ -339,16 +338,13 @@ class MessageFormattingTests(unittest.TestCase):
             threshold_hours=12.0,
         )
 
-        text = build_whatsapp_stale_alert_text(
-            offenders,
-            {"upa_barris": ["JOILSON SANTOS"]},
-            NOW,
-            12.0,
-        )
+        text = build_group_stale_request_text(offenders, NOW, 12.0)
 
-        self.assertIn("🔴 *UPA sem giro há mais de 12h*", text)
-        self.assertIn("• UPA BARRIS — 14h30 · 👤 JOILSON SANTOS", text)
-        self.assertIn("• PA SÃO MARCOS — 13h00 · 👤 sem coordenador", text)
+        self.assertIn("🔄 *Giro de leitos — atualização pendente*", text)
+        self.assertIn("• UPA BARRIS — 14h30", text)
+        self.assertIn("• PA SÃO MARCOS — 13h00", text)
+        # No grupo não se nomeia coordenador: quem lê é a própria unidade.
+        self.assertNotIn("👤", text)
         self.assertIn("Giro de Leitos · aviso automático", text)
 
     def test_message_stays_short(self) -> None:
@@ -359,9 +355,9 @@ class MessageFormattingTests(unittest.TestCase):
             threshold_hours=12.0,
         )
 
-        text = build_whatsapp_stale_alert_text(offenders, {}, NOW, 12.0)
+        text = build_group_stale_request_text(offenders, NOW)
 
-        self.assertLessEqual(len(text.splitlines()), 8)
+        self.assertLessEqual(len(text.splitlines()), 12)
         self.assertNotIn("Vermelha", text)
         self.assertNotIn("<b>", text)
 
@@ -373,22 +369,11 @@ class MessageFormattingTests(unittest.TestCase):
             threshold_hours=12.0,
         )
 
-        text = build_whatsapp_stale_alert_text(offenders, {}, NOW, 12.0)
+        text = build_group_stale_request_text(offenders, NOW)
 
         named = [line for line in text.splitlines() if line.startswith("• UPA ")]
         self.assertEqual(len(named), MAX_WHATSAPP_ALERT_UNITS)
-        self.assertIn("• +3 unidade(s) também sem giro", text)
-
-    def test_many_coordinators_are_trimmed(self) -> None:
-        offenders = whatsapp_alerts.select_stale_offenders(
-            [_status_row("a", "upa_barris", "UPA BARRIS", 14.0)], NOW, threshold_hours=12.0
-        )
-
-        text = build_whatsapp_stale_alert_text(
-            offenders, {"upa_barris": ["ANA", "BRUNO", "CARLA", "DIEGO"]}, NOW, 12.0
-        )
-
-        self.assertIn("👤 ANA · BRUNO +2", text)
+        self.assertIn("• +3 unidade(s) também pendente(s)", text)
 
 
 class NoOffendersTests(unittest.TestCase):
@@ -399,7 +384,7 @@ class NoOffendersTests(unittest.TestCase):
 
         self.assertEqual(offenders, [])
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "5571999999999"), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
                 mock.patch.object(whatsapp_alerts, "send_gateway_message") as send:
             # Espelha o caminho de main._notify_stale_whatsapp: sem infrator,
             # nem chega a montar mensagem.

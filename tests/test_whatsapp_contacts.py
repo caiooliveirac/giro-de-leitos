@@ -23,7 +23,6 @@ import db  # noqa: E402
 import main  # noqa: E402
 from reports import (  # noqa: E402
     build_compliance_messages,
-    build_whatsapp_stale_alert_text,
     collect_alert_mentions,
     compute_gap_ranking,
     unit_mentions,
@@ -212,60 +211,6 @@ class MentionTests(unittest.TestCase):
                 self.assertEqual(collect_alert_mentions(offenders, contacts), [])
 
 
-class AlertTextWithMentionsTests(unittest.TestCase):
-    def test_unit_line_mentions_who_posts(self) -> None:
-        text = build_whatsapp_stale_alert_text(
-            [_offender("upa_barris", "UPA BARRIS", 9.0)], {}, NOW, None, CONTACTS
-        )
-
-        self.assertIn(f"• UPA BARRIS — 9h00 (limite diurno 6h) · 👤 @{BARRIS} · @{BARRIS_2}", text)
-
-    def test_contact_wins_over_the_registered_coordinator(self) -> None:
-        """Nomear o coordenador não resolvia: quem posta é quem responde."""
-        text = build_whatsapp_stale_alert_text(
-            [_offender("upa_barris", "UPA BARRIS", 9.0)],
-            {"upa_barris": ["JOILSON SANTOS"]},
-            NOW,
-            None,
-            CONTACTS,
-        )
-
-        self.assertIn(f"@{BARRIS}", text)
-        self.assertNotIn("JOILSON SANTOS", text)
-
-    def test_unit_without_contact_falls_back_to_the_coordinator(self) -> None:
-        text = build_whatsapp_stale_alert_text(
-            [_offender("upa_valeria", "UPA VALÉRIA", 9.0)],
-            {"upa_valeria": ["JOILSON SANTOS"]},
-            NOW,
-            None,
-            CONTACTS,
-        )
-
-        self.assertIn("👤 JOILSON SANTOS", text)
-
-    def test_no_contact_and_no_coordinator_says_so(self) -> None:
-        text = build_whatsapp_stale_alert_text([_offender("upa_valeria", "UPA VALÉRIA", 9.0)], {}, NOW, None, {})
-
-        self.assertIn("👤 sem coordenador", text)
-
-    def test_more_than_two_contacts_are_trimmed_with_a_counter(self) -> None:
-        contacts = {"upa_barris": [_contact(BARRIS), _contact(BARRIS_2), _contact(SAO_MARCOS)]}
-
-        text = build_whatsapp_stale_alert_text([_offender("upa_barris", "UPA BARRIS", 9.0)], {}, NOW, None, contacts)
-
-        self.assertIn(f"@{BARRIS} · @{BARRIS_2} +1", text)
-
-    def test_empty_contacts_produce_the_same_text_as_before(self) -> None:
-        offenders = [_offender("upa_barris", "UPA BARRIS", 9.0)]
-        responsibles = {"upa_barris": ["JOILSON SANTOS"]}
-
-        self.assertEqual(
-            build_whatsapp_stale_alert_text(offenders, responsibles, NOW, None, {}),
-            build_whatsapp_stale_alert_text(offenders, responsibles, NOW),
-        )
-
-
 class GatewayMentionPayloadTests(unittest.TestCase):
     """Nenhum destes testes pode encostar na rede."""
 
@@ -311,16 +256,16 @@ class GatewayMentionPayloadTests(unittest.TestCase):
 
     def test_dispatch_forwards_the_mentions_without_touching_the_network(self) -> None:
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", True), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "5571999999999"), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
                 mock.patch.object(whatsapp_alerts, "send_gateway_message") as send:
             sent = whatsapp_alerts.dispatch_stale_alert("aviso", [f"{BARRIS}@s.whatsapp.net"])
 
         self.assertTrue(sent)
-        send.assert_called_once_with("5571999999999", "aviso", mentions=[BARRIS])
+        send.assert_called_once_with("120363@g.us", "aviso", mentions=[BARRIS])
 
     def test_dry_run_with_mentions_still_sends_nothing(self) -> None:
         with mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_ENABLED", False), \
-                mock.patch.object(whatsapp_alerts, "WHATSAPP_ALERT_TO", "5571999999999"), \
+                mock.patch.object(whatsapp_alerts, "WHATSAPP_GROUP_TO", "120363@g.us"), \
                 mock.patch.object(whatsapp_alerts, "send_gateway_message") as send:
             sent = whatsapp_alerts.dispatch_stale_alert("aviso", [BARRIS])
 
@@ -353,15 +298,17 @@ class WatcherWiringTests(unittest.TestCase):
         self.assertEqual(mentions, [BARRIS, BARRIS_2])
 
     def test_empty_contacts_table_does_not_break_the_watcher(self) -> None:
+        """Sem contato aprendido o pedido continua saindo — sem menção e sem
+        expor o coordenador, que no grupo seria cobrança em público."""
         with mock.patch.object(main, "is_database_configured", return_value=True), \
                 mock.patch.object(main, "get_whatsapp_alert_state", return_value={}), \
-                mock.patch.object(main, "get_unit_responsibles", return_value={"upa_barris": ["JOILSON"]}), \
                 mock.patch.object(main, "get_unit_contacts", return_value={}), \
                 mock.patch.object(main, "dispatch_stale_alert", return_value=False) as dispatch:
             main._notify_stale_whatsapp(self._rows(), NOW)
 
         message, mentions = dispatch.call_args.args
-        self.assertIn("👤 JOILSON", message)
+        self.assertIn("UPA BARRIS", message.upper())
+        self.assertNotIn("👤", message)
         self.assertEqual(mentions, [])
 
     def test_contacts_lookup_failure_never_reaches_the_watcher(self) -> None:
