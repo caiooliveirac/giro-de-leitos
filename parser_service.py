@@ -26,7 +26,7 @@ TIME_PATTERNS = [
     ),
     # 2) Standalone HH:MM
     re.compile(
-        r"(?i)(?:⏰|🕐|🕑|🕒|🕓|🕔|🕕|🕖|🕗|🕘|🕙|🕚|🕛)?\s*(\d{1,2})\s*:\s*(\d{2})(?:\s*(?:h|hs|horas?|min))?\b"
+        r"(?i)(?:⏰|🕐|🕑|🕒|🕓|🕔|🕕|🕖|🕗|🕘|🕙|🕚|🕛)?\s*(\d{1,2})\s*:\s*(\d{2})(?:\s*(?:hrs?|hs?|horas?|min))?\b"
     ),
     # 3) Standalone NNhNN: "09h05", "14h30min" (sem label, usa h como separador)
     re.compile(
@@ -455,6 +455,11 @@ def _extract_reported_datetime(text: str, fallback: datetime | None = None) -> d
         if not block_key or block_key in seen_blocks:
             continue
         seen_blocks.add(block_key)
+
+        # Tirar a data antes de procurar hora: em "DATA: 03/10/2026 ÀS 14:30" o
+        # "26 às 14:" do ano casava com o padrão de escala e a linha inteira
+        # era descartada — o giro caía no horário de recebimento.
+        block = DATE_IN_LINE_PATTERN.sub(" ", block)
 
         # Pular linhas que contêm horário de plantão/escala (ex: "07:00 ÀS 19:00")
         if SCHEDULE_EXCLUDE_PATTERN.search(block):

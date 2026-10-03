@@ -247,6 +247,20 @@ class ParserRegressionTests(unittest.TestCase):
         self.assertTrue(spec["has_psychiatrist"])
         self.assertFalse(spec["has_orthopedist"])
 
+    # Formatos reais (texto sintético) que caíam no horário de recebimento:
+    # 125 de 2404 giros em 30 dias, medido em 2026-10-03.
+    def test_time_after_date_with_as_is_not_taken_for_a_schedule(self) -> None:
+        text = "PA TESTE\nDATA: 07/03/2026 ÀS  14:30  H\n✅ DENTISTA (07:00 às 19:00hs)\nSALA VERMELHA: (01/02)"
+        self.assertEqual(parse_whatsapp_message(text)["reported_at"], "2026-03-07T17:30:00+00:00")
+
+    def test_time_with_hrs_suffix(self) -> None:
+        text = "UPA TESTE\nDATA: 07.03.2026\n⏰  07:30hrs\nSALA VERMELHA: (01/02)"
+        self.assertEqual(parse_whatsapp_message(text)["reported_at"], "2026-03-07T10:30:00+00:00")
+
+    def test_schedule_alone_is_still_not_a_report_time(self) -> None:
+        text = "PA TESTE\nDATA : 07/03/2026\n(✅) DENTISTA (07:00 às 19:00hs)\nSALA VERMELHA: (01/02)"
+        self.assertIsNone(parse_whatsapp_message(text)["reported_at"])
+
 
 if __name__ == "__main__":
     unittest.main()
