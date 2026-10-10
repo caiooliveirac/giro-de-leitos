@@ -58,9 +58,19 @@ jobs:
   deploy:
     name: Deploy (rsync + canary swap)
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, mac-deploy]
     timeout-minutes: 30
     steps:
+      # Runner self-hosted no Mac do Caio (label mac-deploy): a porta 22 do magalu só
+      # aceita as redes de trabalho e o tailnet, então a VM do GitHub não entra mais.
+      # HOME isolado para o job não gravar chave nem known_hosts no ~/.ssh real do Mac.
+      - name: Isolar HOME do job
+        run: |
+          mkdir -p "$RUNNER_TEMP/home"
+          echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+          # GNU rsync do Homebrew na frente do openrsync do macOS.
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
