@@ -1015,7 +1015,9 @@ async def healthcheck() -> dict[str, str]:
 
 @app.get("/api/health")
 async def api_healthcheck() -> dict[str, str]:
-    return {"status": "ok"}
+    # commit: posto pelo scripts/deploy-magalu.sh no docker run; o job aguardar
+    # do deploy.yml espera este SHA para dar o deploy por publicado.
+    return {"status": "ok", "commit": os.getenv("GIT_COMMIT_SHA", "")}
 
 
 @app.get("/api/last-event", summary="Último evento parseado")

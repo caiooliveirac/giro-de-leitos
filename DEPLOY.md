@@ -1,8 +1,10 @@
 # Deploy — Giro de Leitos
 
-Deploy automatizado via GitHub Actions no padrão da box `samu` (EC2 `56.125.255.58`).
-Mesmo padrão dos outros apps que vivem nessa máquina (taximetro-digital, plantoes etc):
-**rsync source -> build image -> canary container -> healthcheck -> atomic swap -> rollback se falhar**.
+Produção no servidor **magalu** (docker: `giro-de-leitos-api` + `giro-de-leitos-frontend`).
+Desde 2026-11-06 o deploy roda **no próprio servidor**, sem SSH e sem runner no Mac
+(a porta 22 do magalu fechou para a internet em 2026-10-10):
+**testes no GitHub -> branch `live` -> auto-promote no servidor -> rsync -> build image ->
+canary container -> healthcheck -> atomic swap -> rollback se falhar**.
 
 A `whatsapp-bridge` (Baileys) **nunca** é tocada pelo deploy — ela mantém a sessão WhatsApp
 viva e qualquer restart força novo QR code. O swap só substitui `giro-de-leitos-api` e
@@ -11,6 +13,11 @@ viva e qualquer restart força novo QR code. O swap só substitui `giro-de-leito
 ---
 
 ## 1. GitHub Secrets (one-time)
+
+> O deploy não usa mais nenhum destes secrets (não há SSH nem notificação Telegram no
+> `deploy.yml`). Os `PROD_SSH_*` só restam para `rollback.yml` e
+> `configure-whatsapp-group.yml`, que dependem de SSH e não alcançam o magalu de uma VM
+> do GitHub desde 2026-10-10.
 
 No repositório (`Settings -> Secrets and variables -> Actions`):
 
@@ -119,7 +126,7 @@ DNS: `giro.mnrs.com.br` deve apontar para o EC2. Em geral o wildcard da Cloudfla
 6. **Push em `main`** ou rode manualmente:
 
    ```
-   GitHub -> Actions -> "Deploy" -> Run workflow -> component=both
+   GitHub -> Actions -> "Deploy" -> Run workflow
    ```
 
 7. Pós-primeiro deploy, seed dos coordenadores (CSV não vai pelo rsync):
@@ -136,37 +143,47 @@ DNS: `giro.mnrs.com.br` deve apontar para o EC2. Em geral o wildcard da Cloudfla
 
 ## 5. Deploy de rotina
 
-- **Push em `main`** dispara `test -> deploy` automaticamente.
-- **Manual** (sem alterar código, ex: rebuild com `.deploy-env` novo):
-  `Actions -> Deploy -> Run workflow -> component=api|frontend|both`.
+- **Push em `main`** (de qualquer aparelho, inclusive merge pelo celular) basta.
+- **Manual** (sem alterar código): `Actions -> Deploy -> Run workflow` revalida e libera a
+  ponta da `main`. No servidor: `labctl promote giro-de-leitos [<sha>]` (sem ref =
+  `origin/main`, sem o portão dos testes).
 
-O workflow:
+O caminho:
 
-1. Roda `pytest` + `tsc --noEmit`.
-2. rsync do source.
-3. Backup `pg_dump` do postgres (mantém últimos 8).
-4. Build `giro-api:<sha>` + `giro-frontend:<sha>`.
-5. Sobe canary em portas altas (`8051` / `3052`), healthcheck `/api/health` e `/`.
-6. **Atomic swap** nas portas reais (`8000` / `3050`) — downtime ~1-3s.
-7. Tagueia versão anterior como `giro-api:previous` / `giro-frontend:previous`.
-8. Notifica Telegram (se secrets presentes).
+1. `deploy.yml` (VM do GitHub): `pytest` + `tsc --noEmit`.
+2. Verde: o job `liberar` move a branch **`live`** para o SHA (fast-forward pela API).
+3. No servidor, o `auto-promote.timer` (a cada minuto) segue a `live` e roda
+   `labctl promote giro-de-leitos <sha>`; o `PROMOTE_CMD` de `~/labctl/apps/giro-de-leitos.conf`
+   executa o `scripts/deploy-magalu.sh` **do commit alvo**:
+   1. checkout limpo do SHA em `/home/ubuntu/deploy-src/giro-de-leitos` (o `LIVE_DIR`);
+   2. rsync para `/home/ubuntu/giro-de-leitos` (preserva `.deploy-env` e o que é do servidor);
+   3. backup `pg_dump` do postgres (mantém últimos 8, em `/home/ubuntu/giro-backups`);
+   4. build `giro-api:<sha>` + `giro-frontend:<sha>`;
+   5. canary em portas altas (`8051` / `3052`), healthcheck `/api/health`, `/api/summary` e `/`;
+   6. **atomic swap** nas portas reais (`8000` / `3050`) — downtime ~1-3s; a imagem
+      anterior vira `:previous`; se a nova não responder, volta sozinho para a anterior;
+   7. apaga imagens antigas (fica a do ar e a `:previous`).
+4. O job `aguardar` fica verde quando `https://giro.mnrs.com.br/api/health` responde
+   `"commit": "<sha>"`.
+
+Um SHA que falhou no servidor não é tentado de novo: corrige-se com commit novo.
+Log: `ssh magalu journalctl -u auto-promote -n 80` e `labctl history giro-de-leitos`.
+
+> O `.git` de `/home/ubuntu/giro-de-leitos` é antigo (o rsync sempre o excluiu) e **não**
+> diz o que está no ar. O commit no ar é o do `/api/health` (e o HEAD de
+> `/home/ubuntu/deploy-src/giro-de-leitos`).
 
 ---
 
 ## 6. Rollback
 
-`Actions -> Rollback -> Run workflow -> component=both -> confirm=ROLLBACK`.
-
-Reverte para a imagem `:previous` (a que rodava antes do último deploy bem-sucedido).
-Healthcheck pós-rollback obrigatório.
-
-> Só existe `:previous` se já houve pelo menos **dois** deploys bem-sucedidos.
-> O primeiro deploy não cria `:previous` — não há para onde reverter.
-
-Rollback manual (mais raro):
+- **Revert na `main`** (padrão): o revert passa pelos testes e publica como qualquer push.
+- **No servidor**: `labctl rollback giro-de-leitos` — redeploy do commit anterior registrado
+  (`scripts/deploy-magalu.sh <sha-anterior>`; com o cache do docker é rápido).
+- **Imediato**, só a API, para a imagem `:previous`:
 
 ```bash
-ssh samu
+ssh magalu
 docker rm -f giro-de-leitos-api
 docker run -d --name giro-de-leitos-api --restart unless-stopped \
   --network giro-de-leitos_default \
@@ -175,7 +192,10 @@ docker run -d --name giro-de-leitos-api --restart unless-stopped \
   --env-file /home/ubuntu/giro-de-leitos/.deploy-env \
   -p 127.0.0.1:8000:8000 \
   giro-api:previous
+docker network connect wa-net giro-de-leitos-api
 ```
+
+`Actions -> Rollback` depende de SSH e não alcança o magalu desde 2026-10-10.
 
 ---
 
@@ -183,10 +203,10 @@ docker run -d --name giro-de-leitos-api --restart unless-stopped \
 
 | Sintoma                                                | O que checar                                                                 | Ação                                  |
 |--------------------------------------------------------|------------------------------------------------------------------------------|----------------------------------------|
-| Workflow falha em "healthcheck canary"                 | `docker logs giro-api-canary` no servidor                                    | Corrigir bug; produção segue intacta   |
-| API 502 após swap                                      | `docker logs giro-de-leitos-api --tail 100`                                  | `Actions -> Rollback`                  |
+| Deploy falha em "canary" (`journalctl -u auto-promote`) | saída do `scripts/deploy-magalu.sh` no journal                               | Corrigir bug; produção segue intacta   |
+| API 502 após swap                                      | `docker logs giro-de-leitos-api --tail 100`                                  | Revert na `main` ou `labctl rollback giro-de-leitos` |
 | Bridge logando "ECONNREFUSED parser-api:8000"          | Bridge perdeu a rede docker. Rede `giro-de-leitos_default` deletada por engano | `docker network create giro-de-leitos_default` + `docker network connect` em ambos |
-| Frontend 502                                           | `docker logs giro-de-leitos-frontend`                                        | `Actions -> Rollback -> frontend`      |
+| Frontend 502                                           | `docker logs giro-de-leitos-frontend`                                        | Revert na `main` ou `labctl rollback giro-de-leitos` |
 | Postgres não responde                                  | postgres roda nativo no host: `sudo systemctl status postgresql`             | `sudo systemctl restart postgresql`; restaurar do último dump em `/home/ubuntu/giro-backups/` se necessário |
 | QR code do WhatsApp pedindo de novo                    | Alguém parou a bridge                                                        | `docker compose up -d whatsapp-bridge` + ler logs para escanear QR |
 

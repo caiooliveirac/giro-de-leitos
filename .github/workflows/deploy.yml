@@ -1,25 +1,29 @@
 name: Deploy
 
+# Deploy no servidor magalu (docker: api + frontend), sem SSH e sem runner no Mac:
+#
+#   1. aqui, na VM do GitHub: testes (pytest + tsc) do commit da main;
+#   2. verde: move a branch `live` para esse SHA (só avança, fast-forward);
+#   3. no servidor: o auto-promote.timer (a cada minuto) vê a `live` andar e
+#      roda `labctl promote giro-de-leitos <sha>` → scripts/deploy-magalu.sh do
+#      próprio commit (rsync, backup, build, canary, swap; falhou antes do
+#      swap, a produção nem é tocada; falhou depois, volta sozinha);
+#   4. aqui: espera o /api/health público responder com esse SHA.
+#
+# Funciona de qualquer aparelho: merge/push na main pelo celular basta.
+
 on:
   push:
     branches: [main]
+  # Revalida e libera a ponta da main de novo (ex.: a `live` não andou).
   workflow_dispatch:
-    inputs:
-      component:
-        description: "Componente a publicar"
-        required: true
-        type: choice
-        options: [both, api, frontend]
-        default: both
 
 concurrency:
   group: giro-de-leitos-deploy
   cancel-in-progress: false
 
-env:
-  APP: giro-de-leitos
-  REMOTE: ${{ secrets.PROD_SSH_USER }}@${{ secrets.PROD_SSH_HOST }}
-  DEPLOY_DIR: /home/ubuntu/giro-de-leitos
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -55,284 +59,60 @@ jobs:
         working-directory: frontend
         run: pnpm exec tsc --noEmit
 
-  deploy:
-    name: Deploy (rsync + canary swap)
+  liberar:
+    name: Liberar para o LIVE (branch live)
     needs: test
-    runs-on: [self-hosted, macOS, mac-deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: write
+    steps:
+      # Pela API: o GitHub confere o fast-forward do lado dele (re-run de um
+      # run antigo não faz a live voltar; rollback é revert na main).
+      - name: Mover a live para o SHA testado
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/live" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/live" \
+              -f sha="${GITHUB_SHA}" -F force=false >/dev/null
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref=refs/heads/live -f sha="${GITHUB_SHA}" >/dev/null
+          fi
+          echo "live -> ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
+
+  aguardar:
+    name: Esperar o servidor publicar
+    needs: liberar
+    runs-on: ubuntu-latest
+    # Timer de 1 min + build das duas imagens (~3–6 min) + fila de outros apps.
     timeout-minutes: 30
     steps:
-      # Runner self-hosted no Mac do Caio (label mac-deploy): a porta 22 do magalu só
-      # aceita as redes de trabalho e o tailnet, então a VM do GitHub não entra mais.
-      # HOME isolado para o job não gravar chave nem known_hosts no ~/.ssh real do Mac.
-      - name: Isolar HOME do job
+      - name: /api/health público com o SHA novo
         run: |
-          mkdir -p "$RUNNER_TEMP/home"
-          echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
-          # GNU rsync do Homebrew na frente do openrsync do macOS.
-          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          set -u
+          url=https://giro.mnrs.com.br/api/health
+          while true; do
+            no_ar="$(curl -fsS -m 10 "${url}" | jq -r '.commit // empty' 2>/dev/null || true)"
+            if [ "${no_ar}" = "${GITHUB_SHA}" ]; then
+              echo "No ar: ${no_ar}"
+              break
+            fi
+            echo "Ainda em ${no_ar:-?}; esperando ${GITHUB_SHA:0:7}..."
+            sleep 20
+          done
+          # O frontend troca segundos depois da api, no mesmo deploy.
+          sleep 30
+          curl -fsS -m 10 -o /dev/null https://giro.mnrs.com.br/ && echo "Frontend OK"
 
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup SSH
+      - name: Resumo
+        if: always()
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H ${{ secrets.PROD_SSH_HOST }} >> ~/.ssh/known_hosts
-
-      - name: Rsync source to server
-        run: |
-          rsync -az --delete \
-            --exclude '.git' \
-            --exclude 'node_modules' \
-            --exclude '.next' \
-            --exclude '.venv' \
-            --exclude '__pycache__' \
-            --exclude '.env.local' \
-            --exclude '.pytest_cache' \
-            --exclude 'credentials*.json' \
-            --exclude 'coordenadores.csv' \
-            --exclude '.deploy-env' \
-            --exclude '*.zip' \
-            -e "ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519" \
-            ./ ${{ env.REMOTE }}:${{ env.DEPLOY_DIR }}/
-
-      - name: Backup database
-        run: |
-          ssh -i ~/.ssh/id_ed25519 ${{ env.REMOTE }} 'bash -s' << 'EOF'
-            set -euo pipefail
-            mkdir -p /home/ubuntu/giro-backups
-            ts=$(date +%Y%m%dT%H%M%S)
-            # Postgres roda NATIVO no host (nao em container docker). pg_dump precisa
-            # estar instalado no host (deve estar; verificar com `which pg_dump`).
-            # DATABASE_URL usa host.docker.internal:5432 para que a API (em container)
-            # alcance o host; aqui, no host, trocamos por 127.0.0.1.
-            if ! command -v pg_dump > /dev/null 2>&1; then
-              echo "WARN: pg_dump nao instalado no host, pulando backup"
-              exit 0
-            fi
-            if [ ! -f /home/ubuntu/giro-de-leitos/.deploy-env ]; then
-              echo "WARN: .deploy-env ausente, pulando backup"
-              exit 0
-            fi
-            # Extrai só o DATABASE_URL sem dar `source` no arquivo: .deploy-env
-            # é formato docker --env-file (KEY=VALUE literal, valores podem ter
-            # espaços p.ex. SMTP_PASS/SMTP_FROM) e NÃO é um script shell válido.
-            DUMP_URL=$(grep -E '^DATABASE_URL=' /home/ubuntu/giro-de-leitos/.deploy-env | head -1 | cut -d= -f2- | tr -d '\r' | sed 's|host.docker.internal|127.0.0.1|g')
-            if [ -z "$DUMP_URL" ]; then
-              echo "WARN: DATABASE_URL ausente no .deploy-env, pulando backup"
-              exit 0
-            fi
-            # magalu: o Postgres do giro roda em container (giro-de-leitos-db-local)
-            # com hostname interno "postgres" e porta nao publicada no host.
-            # Nesse caso o dump roda DENTRO do container; senao, no host como antes.
-            if echo "$DUMP_URL" | grep -q "@postgres:"; then
-              IN_URL=$(echo "$DUMP_URL" | sed "s|@postgres:|@127.0.0.1:|")
-              docker exec giro-de-leitos-db-local pg_dump "$IN_URL" | gzip > /home/ubuntu/giro-backups/db-$ts.sql.gz
-            else
-              pg_dump "$DUMP_URL" | gzip > /home/ubuntu/giro-backups/db-$ts.sql.gz
-            fi
-            ls -t /home/ubuntu/giro-backups/db-*.sql.gz | tail -n +8 | xargs -r rm
-            echo "backup: db-$ts.sql.gz ($(du -h /home/ubuntu/giro-backups/db-$ts.sql.gz | cut -f1))"
-          EOF
-
-      - name: Build and swap API (canary)
-        if: ${{ github.event_name == 'push' || inputs.component == 'api' || inputs.component == 'both' }}
-        run: |
-          ssh -o ServerAliveInterval=20 -o ServerAliveCountMax=180 \
-              -i ~/.ssh/id_ed25519 \
-              ${{ env.REMOTE }} bash -s << 'REMOTE_SCRIPT'
-            set -euo pipefail
-            cd /home/ubuntu/giro-de-leitos
-
-            SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "manual-$(date +%s)")
-            IMG_NEW="giro-api:$SHA"
-            IMG_PREV=$(docker inspect giro-de-leitos-api --format '{{.Config.Image}}' 2>/dev/null || echo "")
-
-            echo "=== [api] build $IMG_NEW ==="
-            docker build --pull -t "$IMG_NEW" -t giro-api:candidate .
-
-            if [ -n "$IMG_PREV" ] && [ "$IMG_PREV" != "$IMG_NEW" ]; then
-              echo "=== [api] taggeando anterior como giro-api:previous ($IMG_PREV) ==="
-              docker tag "$IMG_PREV" giro-api:previous || true
-            fi
-
-            echo "=== [api] canary em 127.0.0.1:8051 ==="
-            # Postgres roda no host: precisamos de host.docker.internal => host-gateway
-            # para o canary conseguir conectar no DB. Canary nao precisa do alias
-            # parser-api (bridge so fala com o container final).
-            docker rm -f giro-api-canary 2>/dev/null || true
-            docker run -d --name giro-api-canary \
-              --network giro-de-leitos_default \
-              --add-host=host.docker.internal:host-gateway \
-              --env-file /home/ubuntu/giro-de-leitos/.deploy-env \
-              -p 127.0.0.1:8051:8000 \
-              "$IMG_NEW"
-
-            echo "=== [api] healthcheck canary ==="
-            ok=0
-            for i in $(seq 1 30); do
-              if curl -fsS http://127.0.0.1:8051/api/health > /dev/null 2>&1; then
-                ok=1; echo "canary OK em ${i}s"; break
-              fi
-              sleep 1
-            done
-            if [ "$ok" -eq 0 ]; then
-              echo "ERRO: canary nao passou no healthcheck"
-              docker logs --tail 80 giro-api-canary || true
-              docker rm -f giro-api-canary || true
-              exit 1
-            fi
-
-            echo "=== [api] verificando /api/summary no canary ==="
-            curl -fsS http://127.0.0.1:8051/api/summary > /dev/null || {
-              echo "ERRO: /api/summary falhou no canary"
-              docker logs --tail 80 giro-api-canary || true
-              docker rm -f giro-api-canary || true
-              exit 1
-            }
-
-            echo "=== [api] ATOMIC SWAP em 127.0.0.1:8000 ==="
-            # --network-alias parser-api: a bridge resolve http://parser-api:8000 via
-            #   DNS interno da rede docker. O nome do container ja vira primeiro alias
-            #   automatico, mas precisamos do segundo para manter compatibilidade.
-            # --add-host: postgres roda no host (host.docker.internal => host-gateway).
-            docker rm -f giro-de-leitos-api 2>/dev/null || true
-            docker run -d --name giro-de-leitos-api \
-              --restart unless-stopped \
-              --network giro-de-leitos_default \
-              --network-alias parser-api \
-              --add-host=host.docker.internal:host-gateway \
-              --env-file /home/ubuntu/giro-de-leitos/.deploy-env \
-              -p 127.0.0.1:8000:8000 \
-              "$IMG_NEW"
-
-            # wa-net: rede compartilhada com o gateway do WhatsApp (whatsmeow-gw),
-            # que publica so em 127.0.0.1 do host e por isso NAO e alcancavel por
-            # host.docker.internal. Sem esta rede o alerta de UPA sem giro falha
-            # em silencio: o watcher loga timeout e a varredura seguinte tenta de
-            # novo, para sempre, sem ninguem ser avisado. Idempotente de proposito.
-            docker network create wa-net 2>/dev/null || true
-            docker network connect wa-net giro-de-leitos-api 2>/dev/null || true
-            docker network connect wa-net whatsmeow-gw 2>/dev/null || true
-
-            echo "=== [api] aguardando 8000 voltar ==="
-            ok=0
-            for i in $(seq 1 30); do
-              if curl -fsS http://127.0.0.1:8000/api/health > /dev/null 2>&1; then
-                ok=1; echo "producao OK em ${i}s"; break
-              fi
-              sleep 1
-            done
-            if [ "$ok" -eq 0 ]; then
-              echo "ERRO: api nova nao saudavel em 8000. Tente rollback manual."
-              docker logs --tail 80 giro-de-leitos-api || true
-              exit 1
-            fi
-
-            echo "=== [api] limpando canary ==="
-            docker rm -f giro-api-canary 2>/dev/null || true
-
-            echo "=== [api] verificando bridge ainda conversa com a api ==="
-            sleep 2
-            docker logs giro-whatsapp-bridge --tail 10 | head -20 || true
-
-            echo "=== [api] OK. SHA novo: $SHA. anterior taggeado como giro-api:previous"
-          REMOTE_SCRIPT
-
-      - name: Build and swap Frontend (canary)
-        if: ${{ github.event_name == 'push' || inputs.component == 'frontend' || inputs.component == 'both' }}
-        run: |
-          ssh -o ServerAliveInterval=20 -o ServerAliveCountMax=180 \
-              -i ~/.ssh/id_ed25519 \
-              ${{ env.REMOTE }} bash -s << 'REMOTE_SCRIPT'
-            set -euo pipefail
-            cd /home/ubuntu/giro-de-leitos
-
-            SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "manual-$(date +%s)")
-            IMG_NEW="giro-frontend:$SHA"
-            IMG_PREV=$(docker inspect giro-de-leitos-frontend --format '{{.Config.Image}}' 2>/dev/null || echo "")
-
-            echo "=== [frontend] build $IMG_NEW ==="
-            docker build --pull -t "$IMG_NEW" -t giro-frontend:candidate -f frontend/Dockerfile frontend/
-
-            if [ -n "$IMG_PREV" ] && [ "$IMG_PREV" != "$IMG_NEW" ]; then
-              echo "=== [frontend] taggeando anterior como giro-frontend:previous ==="
-              docker tag "$IMG_PREV" giro-frontend:previous || true
-            fi
-
-            echo "=== [frontend] canary em 127.0.0.1:3052 ==="
-            docker rm -f giro-frontend-canary 2>/dev/null || true
-            docker run -d --name giro-frontend-canary \
-              -p 127.0.0.1:3052:3000 \
-              "$IMG_NEW"
-
-            echo "=== [frontend] healthcheck canary ==="
-            ok=0
-            for i in $(seq 1 40); do
-              if curl -fsS http://127.0.0.1:3052/ > /dev/null 2>&1; then
-                ok=1; echo "canary OK em ${i}s"; break
-              fi
-              sleep 1
-            done
-            if [ "$ok" -eq 0 ]; then
-              echo "ERRO: canary frontend nao saudavel"
-              docker logs --tail 80 giro-frontend-canary || true
-              docker rm -f giro-frontend-canary || true
-              exit 1
-            fi
-
-            echo "=== [frontend] swap em 127.0.0.1:3050 ==="
-            docker rm -f giro-de-leitos-frontend 2>/dev/null || true
-            docker run -d --name giro-de-leitos-frontend \
-              --restart unless-stopped \
-              -p 127.0.0.1:3050:3000 \
-              "$IMG_NEW"
-
-            ok=0
-            for i in $(seq 1 30); do
-              if curl -fsS http://127.0.0.1:3050/ > /dev/null 2>&1; then
-                ok=1; echo "frontend producao OK em ${i}s"; break
-              fi
-              sleep 1
-            done
-            if [ "$ok" -eq 0 ]; then
-              echo "ERRO: frontend novo nao saudavel em 3050"
-              docker logs --tail 80 giro-de-leitos-frontend || true
-              exit 1
-            fi
-
-            docker rm -f giro-frontend-canary 2>/dev/null || true
-            echo "=== [frontend] OK. SHA $SHA em 3050"
-          REMOTE_SCRIPT
-
-      - name: Notify Telegram (success)
-        if: success()
-        env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
-          GIT_SHA: ${{ github.sha }}
-        run: |
-          if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
-            echo "telegram secrets ausentes, pulando notificacao"; exit 0
-          fi
-          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TG_CHAT}" \
-            --data-urlencode "text=Giro de Leitos deploy OK -- ${GIT_SHA}" || true
-
-      - name: Notify Telegram (failure)
-        if: failure()
-        env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
-          GIT_SHA: ${{ github.sha }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
-            echo "telegram secrets ausentes, pulando notificacao"; exit 0
-          fi
-          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TG_CHAT}" \
-            --data-urlencode "text=Giro de Leitos deploy FALHOU -- ${GIT_SHA} -- ${RUN_URL}" || true
+          {
+            echo "### Deploy giro.mnrs.com.br (magalu/docker, auto-promote)"
+            echo "- Commit: ${GITHUB_SHA}"
+            echo "- Público: https://giro.mnrs.com.br/api/health"
+            echo "- Se não publicou: \`ssh magalu journalctl -u auto-promote -n 80\` e \`labctl history giro-de-leitos\`"
+          } >> "$GITHUB_STEP_SUMMARY"

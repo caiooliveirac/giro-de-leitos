@@ -472,15 +472,8 @@ Serviços esperados:
 
 ## Deploy em produção
 
-```bash
-docker compose -f docker-compose.prod.yml up -d --build
-```
-
-Quando a alteração for só no parser/API:
-
-```bash
-docker compose -f docker-compose.prod.yml up -d --build parser-api
-```
+Push na `main`: o `deploy.yml` testa e libera a branch `live`; o servidor magalu publica
+sozinho (`scripts/deploy-magalu.sh`, via `auto-promote`). Detalhes e rollback: `DEPLOY.md`.
 
 ---
 
