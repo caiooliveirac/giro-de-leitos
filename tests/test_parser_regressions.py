@@ -264,3 +264,26 @@ class ParserRegressionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def test_giro_reentregue_usa_data_da_mensagem_nao_do_servidor():
+    """Gateway fora 30h (18/11/2026): a fila chegou de uma vez. Giro enviado
+    17/11 05:02 (Bahia) com "05:02" no texto não pode virar 18/11 nem "agora"."""
+    from datetime import datetime, timezone
+    from parser_service import parse_whatsapp_message
+
+    enviado = datetime(2026, 11, 17, 8, 2, tzinfo=timezone.utc)  # 05:02 Bahia
+    texto = "UPA BARRIS\nHORÁRIO: 05:02\nSALA VERMELHA 2/4\nSALA AMARELA 5/10"
+    parsed = parse_whatsapp_message(texto, reference=enviado)
+    assert parsed["reported_at"] == "2026-11-17T08:02:00+00:00"
+
+
+def test_build_dashboard_event_com_hora_da_mensagem_nao_marca_anomalia():
+    from datetime import datetime, timezone
+    from main import build_dashboard_event
+
+    enviado = datetime(2026, 11, 17, 20, 50, tzinfo=timezone.utc)  # 17:50 Bahia
+    texto = "UPA DE BROTAS\nHORÁRIO: 17:50\nSALA VERMELHA 2/4\nSALA AMARELA 5/10"
+    event = build_dashboard_event(texto, "whatsmeow", received_at=enviado)
+    assert event["received_at"] == "2026-11-17T20:50:00+00:00"
+    assert event["data"]["ingested_at"] == "2026-11-17T20:50:00+00:00"
+    assert "_time_anomaly" not in event["data"]

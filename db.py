@@ -807,7 +807,7 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
                         %(has_surgeon)s,
                         %(has_psychiatrist)s,
                         %(payload)s::jsonb,
-                        NOW()
+                        COALESCE(%(ingested_at)s::timestamptz, NOW())
                     )
                     ON CONFLICT (unit_key) DO UPDATE SET
                         unit_code = EXCLUDED.unit_code,
@@ -834,7 +834,7 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
                         has_surgeon = EXCLUDED.has_surgeon,
                         has_psychiatrist = EXCLUDED.has_psychiatrist,
                         payload = EXCLUDED.payload,
-                        updated_at = NOW()
+                        updated_at = EXCLUDED.updated_at
                     """,
                     {
                         "unit_key": unit_key,
@@ -844,6 +844,9 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
                         "source": event.get("source"),
                         "received_at": event.get("received_at"),
                         "last_event_id": event_id,
+                        # Hora real da mensagem (o adapter manda o timestamp do
+                        # WhatsApp): fila reentregue não vira "recebido agora".
+                        "ingested_at": data.get("ingested_at"),
                         "is_critical": bool(data.get("is_critical")),
                         "red_occupied": red_occupied,
                         "red_capacity": red_capacity,

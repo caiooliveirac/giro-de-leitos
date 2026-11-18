@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import {
   buildIngestBody,
   extractSender,
+  extractSentAt,
   extractText,
   handlePayload,
   normalizePhone,
@@ -177,4 +178,18 @@ test("giro sem autoria continua sendo enviado", async () => {
   assert.equal(chamadas.length, 1);
   assert.equal(chamadas[0].text, "GIRO");
   assert.equal(chamadas[0].sender_phone, undefined);
+});
+
+test("buildIngestBody repassa a hora da mensagem (payload.timestamp) como received_at", () => {
+  const body = buildIngestBody({
+    event: "message",
+    payload: { chat_id: "1@g.us", from: "5571988887777@s.whatsapp.net", body: "giro", timestamp: "2026-11-17T20:50:00Z" },
+  });
+  assert.equal(body.received_at, "2026-11-17T20:50:00.000Z");
+});
+
+test("extractSentAt aceita epoch em segundos e ignora lixo", () => {
+  assert.equal(extractSentAt({ timestamp: 1763412600 }), "2025-11-17T20:50:00.000Z");
+  assert.equal(extractSentAt({ payload: { timestamp: "nao-e-data" } }), null);
+  assert.equal(extractSentAt({ payload: {} }), null);
 });

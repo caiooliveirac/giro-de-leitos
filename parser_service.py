@@ -415,8 +415,15 @@ def _extract_red_room_patients(lines: list[str]) -> list[dict[str, Any]]:
     return patients
 
 
-def _extract_reported_datetime(text: str, fallback: datetime | None = None) -> datetime | None:
-    base = fallback.astimezone(LOCAL_TIMEZONE) if fallback else datetime.now(LOCAL_TIMEZONE)
+def _extract_reported_datetime(
+    text: str,
+    fallback: datetime | None = None,
+    reference: datetime | None = None,
+) -> datetime | None:
+    """``reference`` é a hora em que a mensagem foi enviada (padrão: agora).
+    Data ausente no texto e o ajuste de meia-noite se resolvem contra ela."""
+    reference_local = (reference or datetime.now(timezone.utc)).astimezone(LOCAL_TIMEZONE)
+    base = fallback.astimezone(LOCAL_TIMEZONE) if fallback else reference_local
 
     date_match = DATE_PATTERN.search(text)
     if date_match:
@@ -492,7 +499,7 @@ def _extract_reported_datetime(text: str, fallback: datetime | None = None) -> d
     # Sanity check: se a data+hora extraída do texto ficou mais de 18h no
     # passado em relação ao momento atual, o remetente provavelmente esqueceu
     # de trocar a data após a meia-noite.  Ajusta +1 dia se isso resolver.
-    now_local = datetime.now(LOCAL_TIMEZONE)
+    now_local = reference_local
     drift = (now_local - local_dt).total_seconds()
     if drift > 18 * 3600:
         adjusted = local_dt + timedelta(days=1)
@@ -868,7 +875,7 @@ def _extract_specialists(text: str) -> dict[str, bool]:
     return result
 
 
-def parse_whatsapp_message(text: str) -> dict[str, Any]:
+def parse_whatsapp_message(text: str, reference: datetime | None = None) -> dict[str, Any]:
     lines = text.splitlines()
     upa_name = _extract_upa_name(text)
     red_room = _extract_red_room(lines)
@@ -881,7 +888,7 @@ def parse_whatsapp_message(text: str) -> dict[str, Any]:
     corridor_patients = _extract_corridor_patients(text)
     specialists = _extract_specialists(text)
     isolation_mode = "split" if any([isolation_male, isolation_female, isolation_pediatric]) else ("unisex" if isolation_total else None)
-    reported_at = _extract_reported_datetime(text)
+    reported_at = _extract_reported_datetime(text, reference=reference)
 
     is_critical = bool(red_room and not red_room["has_capacity"])
 

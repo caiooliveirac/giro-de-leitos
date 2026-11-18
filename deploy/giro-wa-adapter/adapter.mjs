@@ -22,6 +22,37 @@ const PORT = Number(process.env.ADAPTER_PORT || 3081);
 const INGEST = process.env.GIRO_INGEST_URL || "http://127.0.0.1:8000/api/ingest/whatsapp-bridge";
 const GROUP_JID = (process.env.GIRO_GROUP_JID || "").trim();
 
+// Destino das perguntas privadas (app `tom`). Vazio = comportamento antigo,
+// mensagem privada é descartada. A allowlist é a mesma do TOM_WA_TO: só quem
+// recebe o briefing pode perguntar sobre ele.
+const TOM_HOOK_URL = (process.env.TOM_HOOK_URL || "").trim();
+const TOM_ALLOWLIST = (process.env.TOM_ALLOWLIST || "")
+  .split(",")
+  .map((item) => item.replace(/\D/g, ""))
+  .filter(Boolean);
+// Segredo compartilhado com o tom: quem chegar na porta 3082 sem ele não é o
+// adaptador. A porta já é só de loopback; isto cobre o outro processo do
+// servidor que um dia resolva falar com ela.
+const TOM_HOOK_SECRET = (process.env.TOM_HOOK_SECRET || "").trim();
+// Número pareado no gateway. Mensagem que ELE mandou volta pelo webhook em
+// alguns gateways: sem este descarte, a resposta do tom vira nova pergunta e
+// os dois conversam sozinhos para sempre.
+const TOM_SELF_PHONE = (process.env.TOM_SELF_PHONE || "").replace(/\D/g, "");
+
+// `fromMe` em todas as grafias que já vi entre versões e forks. Ausente em
+// todas = mensagem recebida.
+export function ehEcoDoProprioNumero(p) {
+  const fontes = [p, p?.payload, p?.key, p?.payload?.key, p?.message?.key].filter(
+    (fonte) => fonte && typeof fonte === "object",
+  );
+  for (const fonte of fontes) {
+    for (const campo of ["from_me", "fromMe", "is_from_me", "isFromMe", "self"]) {
+      if (fonte[campo] === true || fonte[campo] === "true") return true;
+    }
+  }
+  return false;
+}
+
 // Ordem de tentativa do JID/telefone do autor. `participant` e `sender_jid`
 // são os campos que o whatsmeow usa para "quem falou dentro do grupo";
 // `from`/`author` aparecem em versões e forks diferentes. `chat_id` NÃO entra
@@ -83,6 +114,25 @@ function senderObjects(p) {
 export function extractText(p) {
   const pl = p?.payload || p;
   return pl?.body || pl?.text || pl?.caption || p?.message?.text || null;
+}
+
+// Hora em que a mensagem foi ENVIADA no WhatsApp (`payload.timestamp`, RFC3339
+// no go-whatsapp-web-multidevice). Sem ela o ingest carimba a hora em que o
+// webhook chegou: quando o gateway cai e reconecta, a fila atrasada chega toda
+// de uma vez e giros de 30h atrás aparecem no painel como "agora" (18/11/2026).
+// Aceita também epoch em segundos/ms, que outros forks mandam.
+export function extractSentAt(p) {
+  const pl = p?.payload || p;
+  const raw = pl?.timestamp ?? p?.timestamp ?? pl?.message?.timestamp;
+  if (raw === undefined || raw === null || raw === "") return null;
+  let d;
+  if (typeof raw === "number" || /^\d+$/.test(String(raw))) {
+    const n = Number(raw);
+    d = new Date(n < 1e12 ? n * 1000 : n);
+  } else {
+    d = new Date(String(raw));
+  }
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
 export function extractChat(p) {
@@ -162,6 +212,8 @@ export function buildIngestBody(p, { source = "whatsmeow" } = {}) {
   // vazio igual, e um corpo enxuto é mais fácil de ler no log do servidor.
   if (sender.phone) body.sender_phone = sender.phone;
   if (sender.name) body.sender_name = sender.name;
+  const sentAt = extractSentAt(p);
+  if (sentAt) body.received_at = sentAt;
   return body;
 }
 
@@ -180,6 +232,46 @@ export async function handlePayload(p, { fetchImpl = fetch, log = console.log } 
       ` nome=${sender.name || "-"}(${sender.nameField || "-"})` +
       (sender.rejectedGroupJid ? " [jid do grupo descartado]" : ""),
   );
+  // Mensagem PRIVADA de um número da allowlist é pergunta para o `tom`. O
+  // gateway só aceita um webhook, então a bifurcação mora aqui: grupo segue
+  // para o ingest do giro, privado conhecido segue para o tom, o resto morre
+  // como sempre morreu. Falha ao encaminhar não derruba o hook — o giro não
+  // pode parar por causa do secretário.
+  // O que um humano digita NO número pareado, na conversa com alguém da
+  // allowlist, também segue — marcado `doNumero`, para o tom ouvir só o
+  // comando "mudo"/"responde" e ignorar o resto. No privado o chat é o JID do
+  // outro lado: autor diferente do chat é o próprio número falando. O que o
+  // tom envia pela API do gateway não volta pelo webhook (conferido no
+  // journal), então não há eco para confundir com gente.
+  const chatPhone = isGroup ? "" : normalizePhone(chat);
+  const doNumero = Boolean(chatPhone) && TOM_ALLOWLIST.includes(chatPhone)
+    && (ehEcoDoProprioNumero(p) || (Boolean(sender.phone) && sender.phone !== chatPhone));
+  if (
+    !isGroup && text && TOM_HOOK_URL
+    && (doNumero || (
+      TOM_ALLOWLIST.includes(sender.phone)
+      && sender.phone !== TOM_SELF_PHONE
+      && !ehEcoDoProprioNumero(p)
+    ))
+  ) {
+    try {
+      const r = await fetchImpl(TOM_HOOK_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(TOM_HOOK_SECRET ? { "x-tom-secret": TOM_HOOK_SECRET } : {}),
+        },
+        body: JSON.stringify(doNumero
+          ? { from: chatPhone, text, doNumero: true }
+          : { from: sender.phone, name: sender.name, text }),
+      });
+      log(`[tom] encaminhado ${r.status}`);
+    } catch (e) {
+      log(`[tom] encaminhamento falhou: ${e.message}`);
+    }
+    return null;
+  }
+
   if (!isGroup || !text) return null;
   if (GROUP_JID && !chat.includes(GROUP_JID)) return null;
 

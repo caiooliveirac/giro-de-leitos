@@ -102,6 +102,7 @@ class WhatsAppBridgeIngestPayload(BaseModel):
     unit_hint: str | None = Field(default=None, description="Nome da UPA identificada pelo telefone do remetente")
     sender_phone: str | None = Field(default=None, description="Telefone do remetente (formato 55XXXXXXXXXXX ou JID completo)")
     sender_name: str | None = Field(default=None, description="Nome exibido do remetente no WhatsApp (push name), quando o webhook trouxer")
+    received_at: datetime | None = Field(default=None, description="Hora em que a mensagem foi enviada no WhatsApp (timestamp do gateway). Ausente = hora de chegada do webhook")
     dry_run: bool = Field(default=False, description="Se True, parseia e retorna o resultado mas NÃO salva no banco nem publica no dashboard")
 
 
@@ -225,7 +226,12 @@ def build_dashboard_event(
     sender_name: str | None = None,
 ) -> dict[str, Any]:
     ingested_at = received_at or datetime.now(timezone.utc)
-    parsed = parse_whatsapp_message(text)
+    if ingested_at.tzinfo is None:
+        ingested_at = ingested_at.replace(tzinfo=timezone.utc)
+    # A data e a virada de meia-noite do horário digitado se resolvem contra a
+    # hora da MENSAGEM, não contra o relógio do servidor: giro reentregue
+    # depois de o gateway ficar fora caía no dia seguinte ou virava "agora".
+    parsed = parse_whatsapp_message(text, reference=ingested_at)
     reported_upa_name = parsed.get("upa_name")
     reported_name_match = resolve_unit_name(reported_upa_name)
     raw_text_match = resolve_unit_from_text(text)
@@ -1263,6 +1269,7 @@ async def whatsapp_bridge_ingest(payload: WhatsAppBridgeIngestPayload) -> dict[s
         unit_hint=payload.unit_hint,
         sender_phone=payload.sender_phone,
         sender_name=payload.sender_name,
+        received_at=payload.received_at,
     )
 
     data = event.get("data", {})
