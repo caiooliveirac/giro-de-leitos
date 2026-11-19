@@ -34,6 +34,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -97,6 +99,19 @@ def gw_messages(jid: str, since: datetime) -> list[dict]:
             raise RuntimeError("paginação do gateway não terminou")
 
 
+def gw_messages_retry(jid: str, since: datetime, wait_s: int = 90) -> list[dict]:
+    """O watchdog dispara a reconciliação logo depois de recriar o gateway, e a
+    API dele leva alguns segundos para subir: espera em vez de falhar."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            return gw_messages(jid, since)
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"API do gateway não respondeu em {wait_s}s: {exc}") from exc
+            time.sleep(5)
+
+
 def known_in_db(hours: float) -> tuple[set[str], set[str]]:
     # Margem larga no created_at: o lote reentregue em 18/11 foi gravado horas
     # depois de enviado, e o reprocessamento pode demorar o mesmo tanto.
@@ -145,6 +160,7 @@ def telegram(text: str) -> None:
     data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
     try:
         urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data, timeout=15).read()
+        log("telegram enviado: " + text.splitlines()[0][:120])
     except Exception as exc:  # o resumo é acessório; o backfill já foi feito
         log(f"falha ao avisar no Telegram: {exc}")
 
@@ -176,7 +192,11 @@ def main() -> int:
     since = now - timedelta(hours=args.window_hours)
     settled = now - timedelta(minutes=SETTLE_MINUTES)
 
-    msgs = gw_messages(jid, since)
+    try:
+        msgs = gw_messages_retry(jid, since)
+    except RuntimeError as exc:
+        log(f"ERRO: {exc}")
+        return 3
     # Mesmo filtro do adapter: só mensagem de grupo com texto. E nunca o que o
     # PRÓPRIO número pareado postou: são os alertas automáticos do sistema
     # ("🔄 Giro de leitos — atualização pendente", services/whatsapp_alerts.py),
