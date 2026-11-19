@@ -1,0 +1,10 @@
+[Unit]
+Description=Checa a cada 5 min se o giro de leitos parou de chegar (e corrige)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Unit=giro-watchdog.service
+
+[Install]
+WantedBy=timers.target

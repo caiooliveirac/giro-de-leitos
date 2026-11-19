@@ -71,6 +71,13 @@ ALTER TABLE parsed_events ADD COLUMN IF NOT EXISTS unit_matched_alias TEXT;
 ALTER TABLE parsed_events ADD COLUMN IF NOT EXISTS sender_phone TEXT;
 ALTER TABLE parsed_events ADD COLUMN IF NOT EXISTS sender_name TEXT;
 
+-- Id da mensagem do WhatsApp: torna a ingestão idempotente para o
+-- reconciliador (ver migrations/012_parsed_events_wa_message_id.sql).
+ALTER TABLE parsed_events ADD COLUMN IF NOT EXISTS wa_message_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_parsed_events_wa_message_id
+    ON parsed_events (wa_message_id)
+    WHERE wa_message_id IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_parsed_events_upa_received_at
     ON parsed_events (upa_name, received_at DESC);
 
@@ -610,8 +617,31 @@ def _touch_unit_contact(
     )
 
 
+def _to_utc(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
 def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
-    """Salva evento e retorna info de anomalias detectadas (ou None)."""
+    """Salva evento e retorna info de anomalias detectadas (ou None).
+
+    Duas guardas tornam seguro reprocessar mensagens atrasadas (reconciliador,
+    fila reentregue pelo gateway):
+
+    - ``duplicate``: a mensagem do WhatsApp (``wa_message_id``) já foi gravada.
+      Nada é escrito.
+    - ``stale``: a mensagem foi ENVIADA antes da que está hoje no painel da
+      unidade. Ela entra no histórico (``parsed_events``), mas não sobrepõe o
+      estado atual nem gera alerta de transição: um giro de ontem nunca pode
+      apagar o de agora.
+    """
     if not DATABASE_URL:
         return None
 
@@ -629,6 +659,11 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
     # um erro (a maior parte do histórico não tem autor).
     sender_phone = normalize_phone(data.get("sender_phone"))
     sender_name = (data.get("sender_name") or "").strip() or None
+    wa_message_id = (str(data.get("wa_message_id") or "").strip()) or None
+    # Hora de ENVIO da mensagem (o adapter/reconciliador mandam o timestamp do
+    # WhatsApp). É a ordem real dos giros; a hora digitada no texto pode estar
+    # errada e não serve para decidir qual é o mais recente.
+    sent_at = _to_utc(data.get("ingested_at"))
 
     red_occupied, red_capacity = _room_values(rooms.get("red_room"))
     yellow_occupied, yellow_capacity = _room_values(rooms.get("yellow_room"))
@@ -677,6 +712,7 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
                     has_psychiatrist,
                     sender_phone,
                     sender_name,
+                    wa_message_id,
                     payload
                 ) VALUES (
                     %(source)s,
@@ -708,8 +744,10 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
                     %(has_psychiatrist)s,
                     %(sender_phone)s,
                     %(sender_name)s,
+                    %(wa_message_id)s,
                     %(payload)s::jsonb
                 )
+                ON CONFLICT (wa_message_id) WHERE wa_message_id IS NOT NULL DO NOTHING
                 RETURNING id
                 """,
                 {
@@ -742,11 +780,32 @@ def save_event(event: dict[str, Any]) -> dict[str, Any] | None:
                     "has_psychiatrist": bool(specialists.get("has_psychiatrist")),
                     "sender_phone": sender_phone or None,
                     "sender_name": sender_name,
+                    "wa_message_id": wa_message_id,
                     "payload": _json_dumps(event),
                 },
             )
             event_id_row = cur.fetchone()
+            if event_id_row is None and wa_message_id:
+                # Mesma mensagem já gravada (webhook ao vivo x reconciliador).
+                conn.commit()
+                return {"duplicate": True, "wa_message_id": wa_message_id}
             event_id = event_id_row["id"] if event_id_row else None
+
+            previous_sent_at = _to_utc(previous_status.get("updated_at")) if previous_status else None
+            if sent_at and previous_sent_at and sent_at < previous_sent_at:
+                # Atrasada: só histórico. O painel segue com o giro mais novo.
+                if unit_code and sender_phone:
+                    _touch_unit_contact(cur, unit_code, sender_phone, sender_name)
+                conn.commit()
+                return {
+                    "stale": True,
+                    "event_id": event_id,
+                    "unit_code": unit_code,
+                    "unit_name": displayed_name,
+                    "sent_at": sent_at.isoformat(),
+                    "current_sent_at": previous_sent_at.isoformat(),
+                    "current_event_id": previous_status.get("last_event_id"),
+                }
 
             if unit_code and sender_phone:
                 _touch_unit_contact(cur, unit_code, sender_phone, sender_name)

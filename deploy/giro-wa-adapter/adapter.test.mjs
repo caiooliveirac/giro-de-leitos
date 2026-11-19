@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import {
   buildIngestBody,
   extractSender,
+  extractMessageId,
   extractSentAt,
   extractText,
   handlePayload,
@@ -192,4 +193,19 @@ test("extractSentAt aceita epoch em segundos e ignora lixo", () => {
   assert.equal(extractSentAt({ timestamp: 1763412600 }), "2025-11-17T20:50:00.000Z");
   assert.equal(extractSentAt({ payload: { timestamp: "nao-e-data" } }), null);
   assert.equal(extractSentAt({ payload: {} }), null);
+});
+
+test("buildIngestBody repassa o id da mensagem (payload.id) como wa_message_id", () => {
+  const body = buildIngestBody({
+    event: "message",
+    payload: { id: "3EB0ABCDEF123456", chat_id: "1@g.us", body: "giro", timestamp: "2026-11-17T20:50:00Z" },
+  });
+  assert.equal(body.wa_message_id, "3EB0ABCDEF123456");
+});
+
+test("extractMessageId degrada para null sem id e ignora valor absurdo", () => {
+  assert.equal(extractMessageId({ payload: { body: "giro" } }), null);
+  assert.equal(extractMessageId({ payload: { id: "   " } }), null);
+  assert.equal(extractMessageId({ payload: { id: "x".repeat(500) } }), null);
+  assert.equal(buildIngestBody({ payload: { chat_id: "1@g.us", body: "giro" } }).wa_message_id, undefined);
 });
