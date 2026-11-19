@@ -1,0 +1,9 @@
+[Unit]
+Description=Watchdog do giro de leitos: detecta, religa o gateway WhatsApp e dispara a reconciliacao
+After=docker.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+ExecStart=/usr/bin/python3 -I /home/ubuntu/giro-ops/watchdog.py
+TimeoutStartSec=300

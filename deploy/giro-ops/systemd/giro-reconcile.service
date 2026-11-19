@@ -1,0 +1,9 @@
+[Unit]
+Description=Reconciliacao do giro de leitos: lanca mensagens do grupo que nao chegaram ao banco
+After=docker.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+ExecStart=/usr/bin/python3 -I /home/ubuntu/giro-ops/reconcile.py
+TimeoutStartSec=600

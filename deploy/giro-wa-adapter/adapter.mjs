@@ -135,6 +135,18 @@ export function extractSentAt(p) {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
+// Id da mensagem no WhatsApp (`payload.id` no go-whatsapp-web-multidevice; o
+// mesmo id que a API /chat/<jid>/messages do gateway devolve). Vai ao ingest
+// como `wa_message_id`: é o que torna a ingestão idempotente, para o
+// reconciliador poder reenviar o que faltou sem duplicar o que já chegou.
+export function extractMessageId(p) {
+  const pl = p?.payload || p;
+  const raw = pl?.id ?? pl?.message_id ?? pl?.message?.id ?? pl?.key?.id ?? p?.message_id;
+  if (raw === undefined || raw === null) return null;
+  const id = String(raw).trim();
+  return id && id.length <= 200 ? id : null;
+}
+
 export function extractChat(p) {
   const pl = p?.payload || p;
   return pl?.chat_id || pl?.chat || pl?.sender_jid || pl?.from || p?.from || "";
@@ -214,6 +226,8 @@ export function buildIngestBody(p, { source = "whatsmeow" } = {}) {
   if (sender.name) body.sender_name = sender.name;
   const sentAt = extractSentAt(p);
   if (sentAt) body.received_at = sentAt;
+  const messageId = extractMessageId(p);
+  if (messageId) body.wa_message_id = messageId;
   return body;
 }
 

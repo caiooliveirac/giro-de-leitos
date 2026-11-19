@@ -104,6 +104,8 @@ class WhatsAppBridgeIngestPayload(BaseModel):
     sender_name: str | None = Field(default=None, description="Nome exibido do remetente no WhatsApp (push name), quando o webhook trouxer")
     received_at: datetime | None = Field(default=None, description="Hora em que a mensagem foi enviada no WhatsApp (timestamp do gateway). Ausente = hora de chegada do webhook")
     dry_run: bool = Field(default=False, description="Se True, parseia e retorna o resultado mas NÃO salva no banco nem publica no dashboard")
+    wa_message_id: str | None = Field(default=None, max_length=200, description="Id da mensagem no WhatsApp. Torna a ingestão idempotente: a mesma mensagem não vira dois eventos")
+    backfill: bool = Field(default=False, description="Reprocessamento de mensagem atrasada (reconciliador): grava e atualiza o painel se for o giro mais novo, mas NÃO dispara alertas no Telegram")
 
 
 class UpdateReportedAtPayload(BaseModel):
@@ -327,15 +329,31 @@ def build_dashboard_event(
 
 
 async def publish_event(event: dict[str, Any]) -> dict[str, Any]:
-    app.state.last_dashboard_event = event
+    event, _ = await publish_event_with_result(event)
+    return event
+
+
+async def publish_event_with_result(
+    event: dict[str, Any], *, notify: bool = True
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Grava e publica. Devolve também o resultado do save_event.
+
+    Mensagem duplicada ou atrasada (ver save_event) não vira "último evento"
+    do painel nem é transmitida: o painel continua no giro mais novo.
+    ``notify=False`` (backfill) grava sem disparar alertas de transição — um
+    alerta de 20h atrás no grupo só confunde quem está de plantão.
+    """
     save_result: dict[str, Any] | None = None
     if is_database_configured():
         save_result = await run_in_threadpool(save_event, event)
+    if save_result and (save_result.get("duplicate") or save_result.get("stale")):
+        return event, save_result
+    app.state.last_dashboard_event = event
     await manager.broadcast_json(event)
     transition_alerts = (save_result or {}).get("transition_alerts") or []
-    if transition_alerts:
+    if transition_alerts and notify:
         await run_in_threadpool(_notify_transition_alerts, transition_alerts)
-    return event
+    return event, save_result
 
 
 _GIRO_KEYWORDS = ("vermelha", "amarela", "isolamento", "atendimento", "giro", "obituario")
@@ -352,6 +370,18 @@ def _looks_like_giro(text: str, data: dict[str, Any]) -> bool:
     normalized = normalize_unit_text(text)
     hits = sum(1 for kw in _GIRO_KEYWORDS if kw in normalized)
     return hits >= 2
+
+
+def _record_unparsed_quietly(text: str, issues: list[dict[str, str]], source: str = "desconhecida") -> None:
+    """Só o registro de /naoparseados, sem Telegram (backfill)."""
+    if not is_database_configured():
+        return
+    blocking = [i["message"] for i in issues if i["severity"] == "blocking"]
+    try:
+        record_unparsed_message(source, text, blocking or ["Motivo desconhecido"])
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Falha ao registrar mensagem não parseada: %s", exc)
 
 
 def _notify_unparsed_giro(text: str, issues: list[dict[str, str]], source: str = "desconhecida") -> None:
@@ -1271,6 +1301,9 @@ async def whatsapp_bridge_ingest(payload: WhatsAppBridgeIngestPayload) -> dict[s
         sender_name=payload.sender_name,
         received_at=payload.received_at,
     )
+    wa_message_id = (payload.wa_message_id or "").strip() or None
+    if wa_message_id:
+        event.setdefault("data", {})["wa_message_id"] = wa_message_id
 
     data = event.get("data", {})
     warnings = data.get("warnings", [])
@@ -1313,15 +1346,27 @@ async def whatsapp_bridge_ingest(payload: WhatsAppBridgeIngestPayload) -> dict[s
 
     if has_blocking:
         # Salvar como pendente mas NÃO publicar no dashboard
+        pending_result: dict[str, Any] | None = None
         if is_database_configured():
-            await run_in_threadpool(save_event, event)
+            pending_result = await run_in_threadpool(save_event, event)
+        if pending_result and pending_result.get("duplicate"):
+            return {
+                "status": "duplicate",
+                "message": "Mensagem já recebida antes — nada gravado.",
+                "wa_message_id": wa_message_id,
+            }
         # Broadcast de refresh para mostrar pendência
         await manager.broadcast_json(event)
 
         # Avisar o admin no Telegram — só quando o texto parece um giro de
-        # verdade (o adapter repassa toda mensagem do grupo, inclusive conversa)
+        # verdade (o adapter repassa toda mensagem do grupo, inclusive conversa).
+        # No backfill só registra (/naoparseados): avisar no grupo um giro de
+        # horas atrás não faz ninguém agir.
         if _looks_like_giro(payload.text, data):
-            await run_in_threadpool(_notify_unparsed_giro, payload.text, issues, payload.source)
+            if payload.backfill:
+                await run_in_threadpool(_record_unparsed_quietly, payload.text, issues, payload.source)
+            else:
+                await run_in_threadpool(_notify_unparsed_giro, payload.text, issues, payload.source)
 
         return {
             "status": "pending",
@@ -1332,7 +1377,24 @@ async def whatsapp_bridge_ingest(payload: WhatsAppBridgeIngestPayload) -> dict[s
         }
 
     # Tudo OK — publicar normalmente
-    event = await publish_event(event)
+    event, save_result = await publish_event_with_result(event, notify=not payload.backfill)
+
+    if save_result and save_result.get("duplicate"):
+        return {
+            "status": "duplicate",
+            "message": "Mensagem já recebida antes — nada gravado.",
+            "wa_message_id": wa_message_id,
+        }
+    if save_result and save_result.get("stale"):
+        return {
+            "status": "stale",
+            "message": "Giro gravado no histórico, mas o painel já tem um giro mais recente desta unidade — não sobreposto.",
+            "event_id": save_result.get("event_id"),
+            "unit_code": save_result.get("unit_code"),
+            "sent_at": save_result.get("sent_at"),
+            "current_sent_at": save_result.get("current_sent_at"),
+            "issues": issues,
+        }
 
     return {
         "status": "accepted",
